@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <AssemblyName>VSSaveEditor</AssemblyName>
+        <RootNamespace>VSSaveEditor</RootNamespace>
+        <AssemblyTitle>VS Save Editor</AssemblyTitle>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+    <ItemGroup>
+        <!-- 11.3.22, not 11.0.10: since 11.3 Avalonia.FreeDesktop depends on
+             Tmds.DBus.Protocol 0.21.3 - the patched branch of GHSA-xrw6-gwf8-vvr9
+             (11.0.10 pulled in the vulnerable 0.15.0, without the CVE-2026-39959 fix). -->
+        <PackageReference Include="Avalonia" Version="11.3.22"/>
+        <PackageReference Include="Avalonia.Desktop" Version="11.3.22"/>
+        <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.22"/>
+        <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.22"/>
+    </ItemGroup>
+    <ItemGroup>
+        <ProjectReference Include="..\VSCore\VSCore.csproj"/>
+    </ItemGroup>
+</Project>

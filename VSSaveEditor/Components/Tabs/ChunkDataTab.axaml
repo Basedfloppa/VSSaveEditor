@@ -1,0 +1,43 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.Tabs.ChunkDataTab">
+    <!-- Vertical centering of children comes from the toolbar row style (App.axaml), so it is not set here -->
+    <DockPanel>
+        <!-- Row 1: chunk search. The query is parsed by VSCore.ChunkQuery, so the tooltip lists
+             the whole grammar: coordinates, ranges, counters, a Y layer and chunk contents. -->
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6">
+            <TextBlock Text="Find chunk:" FontWeight="Bold" />
+            <TextBox x:Name="ChunkSearchBox" Width="330"
+                     Watermark="wolf · 15991 15983 · cx100..200 · ent&gt;3 · y110"
+                     ToolTip.Tip="Coordinates (15991 15983), ranges (cx100..200), counters (ent&gt;3, be&gt;0, blocks&gt;100, yc&gt;1), a layer (y110), empty, or any text found in the chunk (species, block entity, block code, field value)" />
+            <Button x:Name="ChunkSearchBtn" Content="Search" Padding="8,2" />
+            <Button x:Name="ChunkClearBtn" Content="Clear" Padding="8,2" />
+            <TextBlock x:Name="ChunkSummaryLabel" MaxWidth="380" TextTrimming="CharacterEllipsis"
+                       Foreground="{DynamicResource TextAccentBrush}" />
+        </StackPanel>
+        <!-- Row 2: pick from the results or type coordinates by hand -->
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6,0,6,4">
+            <ComboBox x:Name="ChunkPick" Width="360" PlaceholderText="Pick chunk…" />
+            <TextBlock Text="or X:" />
+            <TextBox x:Name="ChunkXBox" Width="64" Text="0" />
+            <TextBlock Text="Z:" />
+            <TextBox x:Name="ChunkZBox" Width="64" Text="0" />
+            <Button x:Name="GoChunkBtn" Content="Show" Padding="8,2" />
+            <Button x:Name="SaveCopyBtn" Content="Review &amp; apply…" Padding="8,2" IsEnabled="False"
+                    ToolTip.Tip="Show every pending change (old → new), then apply them to the loaded working copy" />
+        </StackPanel>
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Spacing="6" Margin="6">
+            <TextBlock Text="Raw hex (chunk, fallback):" FontSize="{StaticResource MonoFontSize}" />
+            <TextBox x:Name="HexEditBox" Width="320" Height="34"
+                     FontSize="{StaticResource MonoFontSize}"
+                     FontFamily="{StaticResource MonoFontFamily}" VerticalContentAlignment="Top"
+                     TextWrapping="NoWrap" AcceptsReturn="False"
+                     ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                     ToolTip.Tip="Raw chunk blob (hex). The box has a fixed width — long blobs scroll horizontally." />
+            <Button x:Name="ApplyHexBtn" Content="Apply hex" Padding="8,2" />
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="ChunkDataPanel" Spacing="4" Margin="6" />
+        </ScrollViewer>
+    </DockPanel>
+</UserControl>

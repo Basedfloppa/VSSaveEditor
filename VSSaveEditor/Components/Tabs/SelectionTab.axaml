@@ -1,0 +1,15 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.Tabs.SelectionTab">
+    <StackPanel Spacing="6" Margin="8">
+        <StackPanel Orientation="Horizontal" Spacing="6">
+            <Button x:Name="DeleteChunksBtn" Content="Delete selected chunks…"
+                    IsEnabled="False" Padding="8,2"
+                    ToolTip.Tip="Removes all Y levels of the selected chunk columns (and their map data) from the working copy; the original save is untouched, and the game regenerates them on the next load" />
+            <Button x:Name="ClearSelectionBtn" Content="Clear selection" Padding="8,2" />
+        </StackPanel>
+        <TextBlock
+            Text="Hint: left-click toggles a chunk, Shift+left-drag selects a region, Shift+right-drag (or Shift+right-click) deselects; Esc or 'Clear selection' clears everything. The selected region can be deleted from the working copy and exported as an image via Settings → Export area."
+            Foreground="{DynamicResource TextSecondaryBrush}" TextWrapping="Wrap" />
+    </StackPanel>
+</UserControl>

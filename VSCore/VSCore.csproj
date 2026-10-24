@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+    <PackageReference Include="protobuf-net" Version="3.2.30" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.3" />
+    <!-- The direct reference overrides the transitive 2.1.11 from Microsoft.Data.Sqlite: that one is still
+         inside the GHSA-2m69-gcr7-jv3q range (native SQLite without the CVE-2025-6965 fix).
+         We stay on 2.1.x: 3.x replaced SQLitePCLRaw.core and is not verified against this Microsoft.Data.Sqlite. -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.13" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Table "block code -> average colour of its texture", generated from the game assets
+         (tools/gen_block_colors.py). Embedded resource: the app needs no installed copy of the game. -->
+    <EmbeddedResource Include="BlockColors.txt" />
+    <!-- LUTs for climatic/seasonal map tinting (tools/gen_block_colors.py): without them
+         the grass/water colour cannot be reproduced — it comes from a shader, not from a texture. -->
+    <EmbeddedResource Include="ColorMaps.txt" />
+  </ItemGroup>
+</Project>

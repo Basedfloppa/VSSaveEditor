@@ -1,0 +1,9 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.Tabs.WorldTab">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <TextBlock x:Name="MetaText" TextWrapping="Wrap"
+                   Foreground="{DynamicResource TextSecondaryBrush}" Margin="8"
+                   VerticalAlignment="Top" />
+    </ScrollViewer>
+</UserControl>

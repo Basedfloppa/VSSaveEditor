@@ -1,0 +1,50 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.EntityCard">
+    <!-- The Border's DataContext is the EntityCardModel assembled in code-behind, not EntityInfo itself -->
+    <Border x:Name="Root" BorderThickness="1" Margin="0,2" Padding="5" CornerRadius="3" Background="#0720271f">
+        <StackPanel Spacing="2">
+            <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding HasTitle}">
+                <TextBlock Text="{Binding Title}" FontWeight="Bold" />
+                <TextBlock Text="{Binding KindBadge}" IsVisible="{Binding HasKind}"
+                           Foreground="{DynamicResource TextSecondaryBrush}" />
+                <TextBlock Text="{Binding SexAge}" IsVisible="{Binding HasSexAge}"
+                           Foreground="{DynamicResource TextAccentBrush}" />
+            </StackPanel>
+            <!-- Full record code (with the mod domain) - used when the title is taken by the player name -->
+            <TextBlock Text="{Binding CodeText}" IsVisible="{Binding HasCodeText}" TextWrapping="Wrap"
+                       Foreground="{DynamicResource TextSecondaryBrush}"
+                       FontSize="{StaticResource MonoFontSize}"
+                       FontFamily="{StaticResource MonoFontFamily}" />
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <TextBlock Text="{Binding Coordinates}"
+                           Foreground="{DynamicResource TextSecondaryBrush}" />
+                <TextBlock Text="{Binding Size}"
+                           Foreground="{DynamicResource TextSecondaryBrush}" />
+                <TextBlock Text="{Binding PositionText}" IsVisible="{Binding HasPositionText}"
+                           Foreground="{DynamicResource TextAccentBrush}" />
+            </StackPanel>
+
+            <!-- Editing happens in a separate window (EntityEditDialog): expanding 30 rows inside an item
+                 of a virtualized list is not allowed, it throws the list's scrolling off. -->
+            <ScrollViewer MaxHeight="160" VerticalScrollBarVisibility="Auto"
+                          IsVisible="{Binding HasFields}">
+                <TextBlock Text="{Binding Fields}" TextWrapping="Wrap"
+                           FontSize="{StaticResource MonoFontSize}"
+                           FontFamily="{StaticResource MonoFontFamily}" />
+            </ScrollViewer>
+            <TextBox Text="{Binding Note, Mode=TwoWay}" Watermark="note..." FontSize="11" Padding="2"
+                     MinHeight="0" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Edit fields" IsVisible="{Binding CanEdit}" Click="OnEdit"
+                        Padding="8,2" Margin="0,3,0,0" />
+                <TextBlock Text="pending edit — Review &amp; apply" IsVisible="{Binding IsPending}"
+                           VerticalAlignment="Center" Foreground="{DynamicResource TextAccentBrush}" />
+            </StackPanel>
+            <TextBlock Text="{Binding LoadNote}" IsVisible="{Binding HasLoadNote}" TextWrapping="Wrap"
+                       Foreground="{DynamicResource TextSecondaryBrush}" />
+            <TextBlock Text="{Binding EditError}" IsVisible="{Binding HasEditError}" TextWrapping="Wrap"
+                       Foreground="{DynamicResource TextAccentBrush}" />
+        </StackPanel>
+    </Border>
+</UserControl>

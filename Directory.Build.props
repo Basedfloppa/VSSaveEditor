@@ -1,0 +1,20 @@
+<Project>
+
+    <PropertyGroup>
+        <!-- P0-11: the package graph is pinned in packages.lock.json next to each .csproj.
+             A plain restore updates the lock file, while CI catches drift with the locked-mode flag
+             (see tools/check-deps.sh). -->
+        <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+
+        <!-- A runtime-specific publish resolves additional runtime packs. Keep those RID-specific
+             packages out of the checked-in packages.lock.json: the normal restore stays locked to
+             the reviewed graph, while publish restores into the already ignored obj/ directory. -->
+        <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != '' and '$(NuGetLockFilePath)' == ''">$(MSBuildProjectDirectory)/obj/packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+
+        <!-- Overridden by the release workflow with the tag version; the fallback keeps local builds
+             deterministic and is also what a source build reports. -->
+        <Version>0.1.0</Version>
+        <Product>VS Save Editor</Product>
+    </PropertyGroup>
+
+</Project>

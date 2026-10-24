@@ -1,0 +1,44 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.Tabs.PlayersTab">
+    <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6">
+            <TextBlock Text="Players (playerdata):" FontWeight="Bold" />
+            <TextBox x:Name="PlayerFilterBox" Width="220"
+                     Watermark="filter: uid, inventory, value…"
+                     ToolTip.Tip="Matches the uid, the inventory names and the parsed field values" />
+            <CheckBox x:Name="PlayerPendingOnlyCheck" Content="Only with pending edits" />
+            <TextBlock x:Name="PlayerCountLabel" Foreground="{DynamicResource TextAccentBrush}" />
+            <Button x:Name="ReviewBtn" Content="Review &amp; apply…" Padding="8,2"
+                    ToolTip.Tip="Show every pending change (chunks and players), then apply them to the working copy" />
+        </StackPanel>
+        <!-- List on the left, description on the right; the 2:3 ratio starts with the description wider than the list.
+             The divider can be dragged with the GridSplitter. -->
+        <Grid x:Name="PlayerLayoutGrid" ColumnDefinitions="2*,5,3*" Margin="6">
+            <ListBox x:Name="PlayerList" Grid.Column="0" MinWidth="220" />
+            <GridSplitter x:Name="PlayerSplitter" Grid.Column="1" Width="5"
+                          Background="{DynamicResource CardBorderBrush}"
+                          ResizeDirection="Columns"
+                          ResizeBehavior="PreviousAndNext"
+                          ToolTip.Tip="Drag to resize the player list" />
+            <Grid x:Name="PlayerDetailHost" Grid.Column="2" MinWidth="320">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <ScrollViewer.Styles>
+                        <!-- The title and uid are wider than the panel: without wrapping they would be clipped on the right. -->
+                        <Style Selector="TextBlock">
+                            <Setter Property="TextWrapping" Value="Wrap" />
+                        </Style>
+                    </ScrollViewer.Styles>
+                    <StackPanel x:Name="PlayerDetailPanel" Spacing="4" Margin="10,0,0,0" />
+                </ScrollViewer>
+                <!-- The empty state sits in the centre of the panel, not as a line in its top-left corner. -->
+                <TextBlock x:Name="PlayerEmptyHint" IsVisible="False"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center" TextWrapping="Wrap"
+                           MaxWidth="460" Margin="20"
+                           Foreground="{DynamicResource TextSecondaryBrush}" />
+            </Grid>
+        </Grid>
+    </DockPanel>
+</UserControl>

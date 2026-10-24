@@ -1,0 +1,25 @@
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+
+namespace VSSaveEditor.Components.Tabs;
+
+/// <summary>
+///     The "Players" tab: the playerdata list with a filter and a detail panel. The panel contents
+///     are drawn by PlayersTabService - the tab gives it the controls and raises selection events.
+/// </summary>
+public partial class PlayersTab : UserControl
+{
+    public PlayersTab()
+    {
+        InitializeComponent();
+        PlayerFilterBox.TextChanged += (_, e) => FilterChanged?.Invoke(this, e);
+        PlayerPendingOnlyCheck.IsCheckedChanged += (_, e) => PendingOnlyChanged?.Invoke(this, e);
+        PlayerList.SelectionChanged += (_, e) => PlayerPicked?.Invoke(this, e);
+        ReviewBtn.Click += (_, e) => ReviewRequested?.Invoke(this, e);
+    }
+
+    public event EventHandler<TextChangedEventArgs>? FilterChanged;
+    public event EventHandler<RoutedEventArgs>? PendingOnlyChanged;
+    public event EventHandler<SelectionChangedEventArgs>? PlayerPicked;
+    public event EventHandler<RoutedEventArgs>? ReviewRequested;
+}

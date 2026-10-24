@@ -1,0 +1,68 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:core="using:VSCore"
+             x:Class="VSSaveEditor.Components.Tabs.EntitiesTab">
+    <!-- The "Entities" tab: a flat list of all creatures and block entities in the save instead of the text dump.
+         Matches on the left, the card of the selected record on the right, with the same field editor as in a chunk. -->
+    <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6">
+            <TextBlock Text="Find:" FontWeight="Bold" />
+            <TextBox x:Name="EntityFilterBox" Width="260"
+                     Watermark="wolf, chest, onHurt, maxhealth…"
+                     ToolTip.Tip="Matches the species/type, the kind and sex-age, the code list, the parsed field names and values" />
+            <ComboBox x:Name="EntityCategoryPick" Width="150" SelectedIndex="0"
+                      ToolTip.Tip="Which records to list: everything, only creatures (field 6) or only block entities (field 8)">
+                <ComboBoxItem Content="All" />
+                <ComboBoxItem Content="Entities" />
+                <ComboBoxItem Content="Block entities" />
+            </ComboBox>
+            <Button x:Name="EntityClearBtn" Content="Clear" Padding="8,2" />
+            <!-- Width and trimming are fixed: there is one toolbar row, and a long summary would push
+                 the buttons past the right edge of the window (the layout probe catches this via "overflowing rows"). -->
+            <TextBlock x:Name="EntitySummaryLabel" MaxWidth="360" TextTrimming="CharacterEllipsis"
+                       Foreground="{DynamicResource TextAccentBrush}" />
+            <Button x:Name="CopyListBtn" Content="Copy list" Padding="8,2"
+                    ToolTip.Tip="Copy the rows currently shown" />
+            <Button x:Name="CopyDumpBtn" Content="Copy raw dump" Padding="8,2"
+                    ToolTip.Tip="Copy the full text dump of the save (same as before: tables, histograms, regions, raw blobs)" />
+        </StackPanel>
+        <!-- Common names: you see at a glance what exists in the world, and one click sends it to the filter -->
+        <WrapPanel x:Name="EntityChipsPanel" DockPanel.Dock="Top" Margin="6,0,6,4" />
+        <!-- List on the left, card on the right; the 2:3 ratio starts with the card wider than the list.
+             The divider can be dragged with the GridSplitter. -->
+        <Grid x:Name="EntityLayoutGrid" ColumnDefinitions="2*,5,3*" Margin="6">
+            <ListBox x:Name="EntityList" Grid.Column="0" MinWidth="220"
+                     FontSize="{StaticResource MonoFontSize}"
+                     FontFamily="{StaticResource MonoFontFamily}">
+                <ListBox.ItemTemplate>
+                    <DataTemplate DataType="core:EntityRow">
+                        <TextBlock Text="{Binding Display}" TextWrapping="Wrap" />
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+            <GridSplitter x:Name="EntitySplitter" Grid.Column="1" Width="5"
+                          Background="{DynamicResource CardBorderBrush}"
+                          ResizeDirection="Columns"
+                          ResizeBehavior="PreviousAndNext"
+                          ToolTip.Tip="Drag to resize the entity list" />
+            <Grid x:Name="EntityDetailHost" Grid.Column="2" MinWidth="320">
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <ScrollViewer.Styles>
+                        <!-- Long codes of mod entities wrap instead of being clipped on the right. -->
+                        <Style Selector="TextBlock">
+                            <Setter Property="TextWrapping" Value="Wrap" />
+                        </Style>
+                    </ScrollViewer.Styles>
+                    <StackPanel x:Name="EntityDetailPanel" Spacing="4" Margin="10,0,0,0" />
+                </ScrollViewer>
+                <!-- The empty state sits in the centre of the panel, not as a line in its top-left corner. -->
+                <TextBlock x:Name="EntityEmptyHint" IsVisible="False"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           TextAlignment="Center" TextWrapping="Wrap"
+                           MaxWidth="460" Margin="20"
+                           Foreground="{DynamicResource TextSecondaryBrush}" />
+            </Grid>
+        </Grid>
+    </DockPanel>
+</UserControl>

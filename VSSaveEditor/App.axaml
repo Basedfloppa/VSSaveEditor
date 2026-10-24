@@ -1,0 +1,67 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.App"
+             RequestedThemeVariant="Default">
+    <Application.Resources>
+        <ResourceDictionary>
+            <!-- Shared between XAML and code (see UiStyle): otherwise "Consolas, monospace" and 10/11 px would live in two forms -->
+            <FontFamily x:Key="MonoFontFamily">Consolas, monospace</FontFamily>
+            <x:Double x:Key="MonoFontSize">11</x:Double>
+            <ResourceDictionary.ThemeDictionaries>
+                <!-- Light theme (system in light / one of ours) -->
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#1B1B1B" />
+                    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#5B5B5B" />
+                    <SolidColorBrush x:Key="TextAccentBrush" Color="#0B5394" />
+                    <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#F4F4F4" />
+                    <SolidColorBrush x:Key="CardBorderBrush" Color="#D0D0D0" />
+                    <!-- Text on the accent fill: in the dark theme the accent is light blue, so here it is dark -->
+                    <SolidColorBrush x:Key="AccentForegroundBrush" Color="#FFFFFF" />
+                </ResourceDictionary>
+                <!-- Dark theme (system in dark): light text, muted blue accent -->
+                <ResourceDictionary x:Key="Dark">
+                    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#ECECEC" />
+                    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#A9A9A9" />
+                    <SolidColorBrush x:Key="TextAccentBrush" Color="#7FA9D9" />
+                    <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#242424" />
+                    <SolidColorBrush x:Key="CardBorderBrush" Color="#3A3A3A" />
+                    <SolidColorBrush x:Key="AccentForegroundBrush" Color="#1B1B1B" />
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+        </ResourceDictionary>
+    </Application.Resources>
+    <Application.Styles>
+        <FluentTheme />
+
+        <!-- A toolbar row is a horizontal StackPanel. Its children must be vertically centered:
+             otherwise a control shorter than the tallest in the row (label, button, field) is stretched
+             to the height of the row. This used to be VerticalAlignment="Center" on every control (about
+             40 times across the bottom drawer tabs); now it is one application-wide rule, so a new row
+             behaves the same and nothing is forgotten. A local value on a control wins over the style -
+             the hex field in "Chunk data" relies on that (VerticalContentAlignment="Top").
+             Types are listed explicitly: an Avalonia type selector matches exactly that type, not its
+             subclasses (`> Control` matches neither Button nor TextBlock), and `> *` is not in the grammar. -->
+        <Style Selector="StackPanel[Orientation=Horizontal] > TextBlock">
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="StackPanel[Orientation=Horizontal] > TextBox">
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style Selector="StackPanel[Orientation=Horizontal] > Button">
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="StackPanel[Orientation=Horizontal] > CheckBox">
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="StackPanel[Orientation=Horizontal] > ComboBox">
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="StackPanel[Orientation=Horizontal] > NumericUpDown">
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style Selector="StackPanel[Orientation=Horizontal] > ProgressBar">
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+    </Application.Styles>
+</Application>

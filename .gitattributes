@@ -1,0 +1,48 @@
+# Normalize text files to LF; binary types are detected below.
+* text=auto eol=lf
+
+# Binary assets and local evidence. These are ignored by .gitignore and must not be
+# added to the repository; the attributes keep diffs/archives from treating them as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.webp binary
+*.tif binary
+*.tiff binary
+*.zip binary
+*.7z binary
+*.rar binary
+*.tar binary
+*.gz binary
+*.tgz binary
+*.bz2 binary
+*.xz binary
+*.nupkg binary
+*.snupkg binary
+*.dll binary
+*.exe binary
+*.pdb binary
+*.so binary
+*.dylib binary
+*.a binary
+*.lib binary
+*.class binary
+*.wasm binary
+*.vcdbs binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.db-wal binary
+*.db-shm binary
+
+# Generated data tables are build inputs (text), not disposable artifacts.
+# They must stay in the repository: a clean clone cannot rebuild them without
+# the installed game assets.
+VSCore/BlockColors.txt text linguist-generated=true
+VSCore/ColorMaps.txt text linguist-generated=true
+
+# Keep local-only evidence out of source archives.
+artifacts/** export-ignore

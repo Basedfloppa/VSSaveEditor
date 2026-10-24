@@ -1,0 +1,33 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.Tabs.FindBlocksTab">
+    <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6">
+            <TextBlock Text="Blocks of this save:" FontWeight="Bold" />
+            <TextBox x:Name="FilterSearchBox" Width="190"
+                     Watermark="search: ore, cassiterite, rock-..." />
+            <Button x:Name="FilterClearBtn" Content="Clear" Padding="8,2"
+                    ToolTip.Tip="Untick every block code" />
+            <Button x:Name="RemoveBlocksBtn" Content="Remove selected…" Padding="8,2"
+                    IsEnabled="False"
+                    ToolTip.Tip="Erase the ticked blocks (their cells become air) from the working copy; the original save is never touched" />
+            <Button x:Name="ReplaceBlocksBtn" Content="Replace selected…" Padding="8,2"
+                    IsEnabled="False"
+                    ToolTip.Tip="Replace the ticked blocks with another block from this save's BlockIDs; only the palette changes, the original save is never touched" />
+            <Button x:Name="FilterBuildBtn" Content="Show on map" Padding="8,2"
+                    IsEnabled="False"
+                    ToolTip.Tip="Build the overlay: only columns containing the selected blocks stay visible" />
+            <Button x:Name="FilterPrevBtn" Content="◀" Padding="8,2"
+                    ToolTip.Tip="Previous match" />
+            <Button x:Name="FilterNextBtn" Content="▶" Padding="8,2"
+                    ToolTip.Tip="Next match" />
+            <Button x:Name="FilterExportBtn" Content="Export image…" Padding="8,2"
+                    ToolTip.Tip="Save the whole map as a high-quality image (honours the current render mode, the Layer Y slice and the block filter); scale and 'only matches' are in Settings" />
+            <CheckBox x:Name="FilterDimCheck" Content="Dim the rest" IsChecked="True"
+                      ToolTip.Tip="Off = only matches are visible" />
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="FilterListPanel" Spacing="1" Margin="6" />
+        </ScrollViewer>
+    </DockPanel>
+</UserControl>

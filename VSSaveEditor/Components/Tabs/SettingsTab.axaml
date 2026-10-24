@@ -1,0 +1,85 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.Tabs.SettingsTab">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Spacing="8" Margin="10">
+            <TextBlock Text="Render mode" FontWeight="Bold" />
+            <StackPanel x:Name="SettingsRenderPanel" Spacing="2">
+                <RadioButton Content="Heightmap (top-down)" IsChecked="True" Tag="0" />
+                <RadioButton Content="Blocks — like the in-game map" Tag="1" />
+                <RadioButton Content="Ocean depth" Tag="2" />
+            </StackPanel>
+            <TextBlock Text="LOD (detail)" FontWeight="Bold" />
+            <StackPanel x:Name="SettingsLodPanel" Spacing="2">
+                <RadioButton Content="Auto (dynamic)" IsChecked="True" Tag="0" />
+                <RadioButton Content="Full detail" Tag="1" />
+                <RadioButton Content="Fine (2×)" Tag="2" />
+                <RadioButton Content="Normal (4×)" Tag="3" />
+                <RadioButton Content="Coarse (8×)" Tag="4" />
+                <RadioButton Content="Overview (16×)" Tag="5" />
+            </StackPanel>
+            <TextBlock Text="Map" FontWeight="Bold" />
+            <CheckBox x:Name="ChunkGridCheck" Content="Chunk grid (32×32)" IsChecked="True" />
+            <CheckBox x:Name="HoverTooltipCheck" Content="Hover tooltip on the map" IsChecked="False"
+                      ToolTip.Tip="Show a small info box under the cursor (off by default)" />
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="Layer Y:" />
+                <Button x:Name="SurfaceBtn" Content="Surface" Padding="8,2"
+                        ToolTip.Tip="Back to the surface map (no slice)" />
+                <TextBlock x:Name="LayerLabel" Foreground="{DynamicResource TextAccentBrush}" />
+            </StackPanel>
+            <Slider x:Name="LayerSlider" Minimum="0" Maximum="255" TickFrequency="1"
+                    IsSnapToTickEnabled="True"
+                    ToolTip.Tip="Horizontal slice at exactly this Y: real blocks (ores, caves), air = map background. The visible part of the map is redrawn as you drag" />
+            <TextBlock
+                Text="Layer Y = horizontal slice: the map shows the real block at exactly that level (air stays background), so ores and caves are visible. Only the visible part of the map is re-rendered; on a zoomed-out view it happens after you stop dragging."
+                Foreground="{DynamicResource TextSecondaryBrush}" TextWrapping="Wrap" FontSize="11" />
+            <TextBlock Text="Map image export (PNG / JPEG / WebP)" FontWeight="Bold" />
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="Pixels per block:" />
+                <NumericUpDown x:Name="ExportScaleBox" Minimum="1" Maximum="8" Increment="1"
+                               Value="1" Width="120" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="Format:" />
+                <ComboBox x:Name="ExportFormatBox" SelectedIndex="0" Width="180">
+                    <ComboBoxItem>PNG image</ComboBoxItem>
+                    <ComboBoxItem>JPEG image</ComboBoxItem>
+                    <ComboBoxItem>WebP (lossless)</ComboBoxItem>
+                </ComboBox>
+                <TextBlock Text="JPEG quality:" Margin="12,0,0,0" />
+                <NumericUpDown x:Name="JpegQualityBox" Minimum="30" Maximum="100" Increment="1"
+                               Value="90" Width="110" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="Export area:" />
+                <ComboBox x:Name="ExportRegionBox" SelectedIndex="0" Width="220"
+                          ToolTip.Tip="'Selected chunks only' exports just the region selected on the map (left-click chunks, Shift+drag for a region)">
+                    <ComboBoxItem>Whole world</ComboBoxItem>
+                    <ComboBoxItem>Selected chunks only</ComboBoxItem>
+                </ComboBox>
+                <Button x:Name="ClearSelectionBtn" Content="Clear selection" Padding="8,2"
+                        ToolTip.Tip="Deselect chunks on the map" />
+                <TextBlock x:Name="ExportRegionLabel" Foreground="{DynamicResource TextAccentBrush}" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="Filtered export:" />
+                <ComboBox x:Name="ExportFilterBox" SelectedIndex="0" Width="330"
+                          ToolTip.Tip="How the block filter (Find blocks) is drawn in the saved image">
+                    <ComboBoxItem>Highlights over dimmed map</ComboBoxItem>
+                    <ComboBoxItem>Highlights over full map</ComboBoxItem>
+                    <ComboBoxItem>Only highlights (transparent background)</ComboBoxItem>
+                    <ComboBoxItem>Only highlights (dark background)</ComboBoxItem>
+                </ComboBox>
+            </StackPanel>
+            <CheckBox x:Name="ExportTransparentBgCheck"
+                      Content="Transparent background (no-data areas)" IsChecked="False"
+                      ToolTip.Tip="Off: no-data areas use the editor background colour, so the image matches what you see" />
+            <TextBlock x:Name="LodStatusText" Foreground="{DynamicResource TextAccentBrush}"
+                       TextWrapping="Wrap" />
+            <TextBlock
+                Text="Hotkeys: + / - zoom · F fit · arrows pan · Ctrl+F search · Ctrl+B ore overlay · Esc clear selection."
+                Foreground="{DynamicResource TextSecondaryBrush}" TextWrapping="Wrap" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

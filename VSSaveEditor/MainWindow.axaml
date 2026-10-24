@@ -1,0 +1,162 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="using:VSSaveEditor"
+        xmlns:core="using:VSCore"
+        xmlns:components="using:VSSaveEditor.Components"
+        xmlns:tabs="using:VSSaveEditor.Components.Tabs"
+        x:Class="VSSaveEditor.MainWindow"
+        Title="VS Save Editor" Width="1280" Height="800" MinWidth="900" MinHeight="600"
+        KeyDown="OnWindowKeyDown">
+
+    <!-- Layout: menu, status rows, MAP (fills the area), splitter, bottom drawer (overlay) -->
+    <Grid x:Name="LayoutRoot" RowDefinitions="Auto,Auto,3*,4,2*">
+        <Menu Grid.Row="0">
+            <MenuItem Header="_File">
+                <MenuItem Header="Open save (.vcdbs)…" Click="OnOpen" InputGesture="Ctrl+O" />
+                <MenuItem x:Name="RecentMenu" Header="Recent">
+                    <!-- The items are built in code every time the menu opens: the list changes (P1-5) -->
+                    <MenuItem Header="Clear list" Click="OnClearRecent" />
+                </MenuItem>
+                <MenuItem x:Name="SaveCopyItem" Header="Save a copy…" Click="OnSaveCopy" IsEnabled="False"
+                          InputGesture="Ctrl+Shift+S" />
+                <Separator />
+                <MenuItem Header="Exit" Click="OnExit" />
+            </MenuItem>
+            <MenuItem Header="_View">
+                <MenuItem Header="Settings" Click="OnViewSettings" />
+                <MenuItem Header="Find blocks (ore overlay)" Click="OnViewFindBlocks" />
+                <MenuItem Header="Export map image…" Click="OnExportMapImage" />
+                <Separator />
+                <MenuItem Header="Zoom in" Click="OnZoomIn" />
+                <MenuItem Header="Zoom out" Click="OnZoomOut" />
+                <MenuItem Header="Fit area" Click="OnZoomFit" />
+                <Separator />
+                <MenuItem x:Name="ShowPanelItem" Header="Hide data panel" Click="OnToggleDataPanel" />
+            </MenuItem>
+            <MenuItem Header="_Tools">
+                <MenuItem Header="Search chunks (text)" Click="OnFocusSearch" />
+            </MenuItem>
+        </Menu>
+
+        <StackPanel Grid.Row="1">
+            <!-- One status line for the whole application (P1-7). Sources write to their own channels of the
+           AppStatus model; the message with the highest priority is visible, and the live line under the cursor
+           is the fallback with the lowest priority. -->
+            <TextBlock x:Name="AppStatusText" Margin="8,8,8,2" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
+            <StackPanel Orientation="Horizontal" Spacing="8" Margin="8,0,8,6">
+                <TextBlock x:Name="ProgressLabel" IsVisible="False"
+                           Foreground="{DynamicResource TextSecondaryBrush}" />
+                <ProgressBar x:Name="LoadProgress" Width="220" Height="6" IsVisible="False" Minimum="0" Maximum="100" />
+            </StackPanel>
+        </StackPanel>
+
+        <!-- The map fills the whole free area (rows 2-4) and does NOT move when the drawer changes;
+         the drawer is declared below and drawn ON TOP of the map -->
+        <Border Grid.Row="2" Grid.RowSpan="3" BorderBrush="{DynamicResource CardBorderBrush}" BorderThickness="1"
+                Margin="8,2,8,8">
+            <Grid>
+                <local:TerrainView x:Name="Map" ClipToBounds="True" Focusable="True" />
+                <!-- The start-up recent saves list: while nothing is open the map is empty and the space
+             is used for what you start with (P1-5). Surface is set via IsVisible so that a
+             hidden panel does not capture the mouse over the map. -->
+                <Border x:Name="RecentPanel" IsVisible="False" HorizontalAlignment="Left" VerticalAlignment="Top"
+                        Margin="14" Padding="12" MaxWidth="560" CornerRadius="6"
+                        Background="{DynamicResource PanelBackgroundBrush}"
+                        BorderBrush="{DynamicResource CardBorderBrush}" BorderThickness="1"
+                        BoxShadow="0 2 12 0 #40000000" />
+                <!-- On-map tooltip - a separate layer ON TOP of the map: a hover updates only its text,
+             the map is not redrawn (Avalonia has no partial InvalidateVisual(rect)). -->
+                <Border x:Name="MapTooltip" IsVisible="False" IsHitTestVisible="False"
+                        HorizontalAlignment="Left" VerticalAlignment="Top" Margin="4"
+                        Background="#B0000000" CornerRadius="2" Padding="6,2">
+                    <TextBlock x:Name="MapTooltipText" Foreground="White" FontSize="12" />
+                </Border>
+                <!-- Mode legend: an overlay in the same cell, the map does not resize because of it (P1-6) -->
+                <ContentControl x:Name="MapLegendHost" IsVisible="False" IsHitTestVisible="False"
+                                HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="4" />
+            </Grid>
+        </Border>
+
+        <GridSplitter Grid.Row="3" x:Name="PanelSplitter" Height="6" Margin="8,0,8,0"
+                      ResizeDirection="Rows"
+                      Background="#66888888" DragCompleted="OnPanelSplitterDragCompleted"
+                      ToolTip.Tip="drag to resize the bottom drawer (it floats above the map)" />
+
+        <!-- Bottom drawer: overlay with background and shadow so it reads above the map -->
+        <Border Grid.Row="4" Margin="8,0,8,8" MinHeight="36"
+                Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource CardBorderBrush}" BorderThickness="1" CornerRadius="6"
+                BoxShadow="0 -3 14 0 #50000000" ClipToBounds="True">
+            <!-- Both *Alignment values are load-bearing: H=Left,V=Center is the theme default for Expander, not our
+                 setting (a bare Expander in a Grid lands the same way - measured with `.uisnap styles`). Without
+                 H=Stretch the drawer shrinks to the width of the tab content; without V=Stretch the block (header +
+                 tabs) drifts to the vertical centre when the drawer is stretched - measured with `tabgeom`: at
+                 a drawer height of 538 the top of the block is 34 px below the top. Stretch on both axes: the drawer takes
+                 the whole row, and the tab content grows with it. -->
+            <Expander x:Name="DataPanel"
+                      HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                      HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"
+                      Expanded="OnDataPanelToggled" Collapsed="OnDataPanelToggled">
+                <Expander.Header>
+                    <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Top">
+                        <TextBlock Text="Save data — chunks &amp; entities" />
+                        <Button x:Name="UndoBtn" Content="Undo" Click="OnUndo" IsEnabled="False" Padding="8,1"
+                                ToolTip.Tip="Undo the last pending edit (Ctrl+Z)" />
+                        <Button x:Name="RedoBtn" Content="Redo" Click="OnRedo" IsEnabled="False" Padding="8,1"
+                                ToolTip.Tip="Redo the last undone edit (Ctrl+Y or Ctrl+Shift+Z)" />
+                        <Button x:Name="HistoryBtn" Click="OnShowHistory" Padding="6,1"
+                                ToolTip.Tip="Pending edit history: newest first, undone entries greyed out">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <Border Background="{DynamicResource TextAccentBrush}" CornerRadius="8" Padding="6,0"
+                                        MinWidth="18">
+                                    <TextBlock x:Name="PendingBadgeText" Text="0" FontSize="11"
+                                               Foreground="{DynamicResource AccentForegroundBrush}"
+                                               HorizontalAlignment="Center" />
+                                </Border>
+                                <TextBlock Text="History" />
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="ReviewBtn" Content="Review &amp; apply…" Click="OnReviewAndCommit"
+                                IsEnabled="False" Padding="8,1"
+                                ToolTip.Tip="Show every pending change (old → new), then apply it to the loaded working copy" />
+                        <Button x:Name="SaveCopyNowBtn" Content="Save a copy…" Click="OnSaveCopy"
+                                IsEnabled="False" Padding="8,1"
+                                ToolTip.Tip="Write the working copy to a .vcdbs next to the original (the original is never overwritten)" />
+                        <!-- Makes it clear that the working copy is what is open; the tooltip points to the original file -->
+                        <TextBlock x:Name="WorkingCopyLabel" Text="working copy" IsVisible="False"
+                                   VerticalAlignment="Center" FontSize="11"
+                                   Foreground="{DynamicResource TextSecondaryBrush}" />
+                    </StackPanel>
+                </Expander.Header>
+                <TabControl x:Name="DataTabs">
+                    <!-- The tab contents live in Components/Tabs: layout and control wiring
+                         live there, and the window subscribes to their events (MainWindow.Tabs.cs). -->
+                    <TabItem Header="Chunks">
+                        <tabs:ChunkDataTab x:Name="ChunkDataView" />
+                    </TabItem>
+                    <TabItem Header="Entities">
+                        <tabs:EntitiesTab x:Name="EntitiesView" />
+                    </TabItem>
+                    <TabItem Header="Items">
+                        <tabs:ItemsTab x:Name="ItemsView" />
+                    </TabItem>
+                    <TabItem Header="Selection">
+                        <tabs:SelectionTab x:Name="SelectionView" />
+                    </TabItem>
+                    <TabItem Header="Players">
+                        <tabs:PlayersTab x:Name="PlayersView" />
+                    </TabItem>
+                    <TabItem Header="Find blocks">
+                        <tabs:FindBlocksTab x:Name="FindBlocksView" />
+                    </TabItem>
+                    <TabItem Header="World">
+                        <tabs:WorldTab x:Name="WorldView" />
+                    </TabItem>
+                    <TabItem Header="Settings">
+                        <tabs:SettingsTab x:Name="SettingsView" />
+                    </TabItem>
+                </TabControl>
+            </Expander>
+        </Border>
+    </Grid>
+</Window>

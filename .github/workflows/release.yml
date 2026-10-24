@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v0.1.0"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+
+jobs:
+  version:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Read and validate the tag
+        id: version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Expected a semver tag such as v0.1.0 or v0.1.0-beta.1, got '$tag'"
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building $version from tag $tag"
+
+  test:
+    name: Test
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: |
+            VSCore/packages.lock.json
+            VSSaveEditor/packages.lock.json
+            VSCore.Tests/packages.lock.json
+
+      - name: Restore the locked package graph
+        run: dotnet restore VSSaveEditor.sln --locked-mode
+
+      - name: Run tests
+        run: dotnet test VSCore.Tests/VSCore.Tests.csproj -c Release --no-restore
+
+      - name: Audit dependencies
+        run: tools/check-deps.sh
+
+  build:
+    name: Publish ${{ matrix.rid }}
+    needs: [version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            asset_ext: ""
+          - os: windows-latest
+            rid: win-x64
+            asset_ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: |
+            VSCore/packages.lock.json
+            VSSaveEditor/packages.lock.json
+
+      - name: Publish and verify one file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ needs.version.outputs.version }}"
+          $rid = "${{ matrix.rid }}"
+          $ext = "${{ matrix.asset_ext }}"
+          $out = Join-Path "artifacts/publish" $rid
+
+          dotnet publish VSSaveEditor/VSSaveEditor.csproj `
+            -c Release `
+            -r $rid `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:PublishTrimmed=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -p:Version=$version `
+            -p:ContinuousIntegrationBuild=true `
+            -o $out
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+
+          $files = @(Get-ChildItem -LiteralPath $out -File)
+          if ($files.Count -ne 1) {
+            $names = ($files | ForEach-Object Name) -join ", "
+            throw "Expected exactly one published file, got $($files.Count): $names"
+          }
+
+          $binary = $files[0]
+          if ($binary.Name -ne "VSSaveEditor$ext") {
+            throw "Unexpected published file '$($binary.Name)' (expected 'VSSaveEditor$ext')"
+          }
+          if ($binary.Length -lt (20 * 1024 * 1024)) {
+            throw "Published file is unexpectedly small: $($binary.Length) bytes"
+          }
+
+          $bytes = [IO.File]::ReadAllBytes($binary.FullName)
+          if ($IsLinux) {
+            if ($bytes[0] -ne 0x7f -or $bytes[1] -ne 0x45 -or $bytes[2] -ne 0x4c -or $bytes[3] -ne 0x46) {
+              throw "The Linux artifact is not an ELF executable"
+            }
+          } elseif ($bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+            throw "The Windows artifact is not a PE executable"
+          }
+
+          $asset = "VSSaveEditor-$version-$rid$ext"
+          $releaseDir = "artifacts/release"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          $destination = Join-Path $releaseDir $asset
+          Copy-Item -LiteralPath $binary.FullName -Destination $destination
+          if ($IsLinux) { & chmod +x $destination }
+
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$destination.sha256" -Value "$hash  $asset" -NoNewline
+          Write-Output "Published $asset ($($binary.Length) bytes, sha256 $hash)"
+
+      - name: Upload the release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.rid }}
+          path: artifacts/release/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/release
+          merge-multiple: true
+
+      - name: Verify downloaded assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f "artifacts/release/VSSaveEditor-$VERSION-linux-x64"
+          test -f "artifacts/release/VSSaveEditor-$VERSION-linux-x64.sha256"
+          test -f "artifacts/release/VSSaveEditor-$VERSION-win-x64.exe"
+          test -f "artifacts/release/VSSaveEditor-$VERSION-win-x64.exe.sha256"
+          (cd artifacts/release && sha256sum -c ./*.sha256)
+          file artifacts/release/VSSaveEditor-* || true
+          ls -lh artifacts/release
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DRAFT: ${{ github.event.inputs.draft }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/release/* --clobber
+          else
+            args=("$TAG" --title "VS Save Editor $VERSION" --target "$GITHUB_SHA" --generate-notes)
+            if [[ "$DRAFT" == "true" ]]; then
+              args+=(--draft)
+            fi
+            gh release create "${args[@]}" artifacts/release/*
+          fi
