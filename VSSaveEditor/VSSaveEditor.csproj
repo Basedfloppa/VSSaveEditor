@@ -10,10 +10,12 @@
         <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
-        <!-- Trimmed single-file builds fit the VSModDB upload limit. Partial mode keeps the
-             framework's own trim annotations; the app and core assemblies are rooted below so
-             Avalonia's reflection bindings and protobuf-net's model types keep working. -->
-        <PublishTrimmed>true</PublishTrimmed>
+        <!-- Trimming is enabled by the release publish commands (-p:PublishTrimmed=true), not
+             here. Setting it in the project makes every restore pull the SDK-versioned
+             Microsoft.NET.ILLink.Tasks package, so packages.lock.json breaks whenever the
+             10.0.x SDK patch moves. Partial mode keeps the framework's own trim annotations;
+             the app and core assemblies are rooted below so Avalonia's reflection bindings and
+             protobuf-net's model types keep working. -->
         <TrimMode>partial</TrimMode>
         <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     </PropertyGroup>
