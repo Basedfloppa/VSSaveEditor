@@ -60,7 +60,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private int _lodIndex = TerrainView.LodAuto; // current LOD mode (the radio group in Settings)
     private bool _removingBlocks; // guard against starting block removal twice
     private bool _replacingBlocks; // guard against starting block replacement twice
-    private int _renderMode = TerrainView.ModeHeight; // current render mode (the radio group in Settings)
+    private int _renderMode = TerrainView.ModeBlocks; // current render mode (the radio group in Settings)
     private VSSaveFile? _save;
     private string? _selectedSave;
     private bool _settingsLoading = true; // true while saved settings are applied - do not write them back
@@ -90,7 +90,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         // where it applies the initial map state (radio/checkbox defaults no longer arrive on their own).
         WireTabComponents();
         // RenderModeCombo/LodCombo were removed - radio groups replace them (see Settings in Components/Tabs/SettingsTab.axaml).
-        // The defaults (Heightmap, Auto) are set with IsChecked="True" on the first radios in the tab layout.
+        // The defaults (Blocks, Auto) are set with IsChecked="True" on the corresponding radios in the tab layout.
         Map.SelectedChunksChanged += UpdateSelInfo;
         // Map event subscriptions happen exactly once (they used to be registered on every save load and piled up)
         Map.HoverChanged += txt =>
@@ -1979,7 +1979,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             Map.SetTerrain(null); // clear the old map
             Map.SetAreas(null); // and its areas: until the new save is parsed, the old ones do not apply
             _areas = null;
-            UpdateLegend();
             MapTooltipText.Text = "";
             MapTooltip.IsVisible = false; // the tooltip belongs to the previous save
             var chunkCount = newSave.Chunks.Count; // count upfront (do not touch the DB from the callback)
@@ -2013,7 +2012,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             _areas = areas;
             Map.SetAreas(areas);
             Map.SetTerrain(tm);
-            UpdateLegend();
             Map.SetLodMode(_lodIndex);
             ApplyRenderMode();
             UpdateExportRegionLabel();
@@ -2123,7 +2121,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             if (!Map.ViewportIntersects(area)) return;
             Map.SetTerrain(tm, keepView: true);
             UpdateExportRegionLabel();
-            UpdateLegend();
             Status.Set(StatusChannel.App, $"Showing {area.Label(count)}");
             // The overlay filter is tied to the grid of the previous area (SetTerrain resets it):
             // rebuild it for the new one, otherwise it would silently vanish on a switch.
@@ -2222,7 +2219,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             PopulateFilterList();
             _players.Refresh(); // the "Players" tab fills together with the rest of the scan data
             _chunkView.RefreshAll(); // the open chunk card re-reads its blob from the working copy
-            UpdateLegend(); // the block histogram is ready - the "blocks" mode legend is populated
             if (_settings.OverlayEnabled && _filterCodes.Count > 0)
                 BuildFilterOverlay(); // restore the overlay after a restart
         }
@@ -2389,28 +2385,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private void ApplyRenderMode()
     {
         Map.SetRenderMode(_renderMode);
-        UpdateLegend();
-    }
-
-    /// <summary>Builds the legend for the current mode/layer: the colours come from the same palettes the map draws with (P1-6).</summary>
-    private void UpdateLegend()
-    {
-        if (MapLegendHost is null) return;
-        var tm = Map?.Terrain;
-        if (tm is null)
-        {
-            MapLegendHost.IsVisible = false;
-            MapLegendHost.Content = null;
-            return;
-        }
-
-        var top = ScanData is null
-            ? Array.Empty<(string, long)>()
-            : ScanData.WorldBlockCodeCounts.OrderByDescending(kv => kv.Value).Take(8).Select(kv => (kv.Key, kv.Value))
-                .ToArray();
-        int? layerY = _surfaceMode ? null : _layerYLast ?? (int)LayerSlider.Value;
-        MapLegendHost.Content = MapLegend.Build(this, tm, _renderMode, layerY, top);
-        MapLegendHost.IsVisible = true;
     }
 
     private void OnRenderModeSelected(int mode)
@@ -2458,7 +2432,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _layerYLast = y;
         Map.SetLayer(y);
         UpdateLayerLabel();
-        UpdateLegend();
         SaveSettings();
     }
 
@@ -2468,7 +2441,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _layerYLast = null;
         Map.SetLayer(null);
         UpdateLayerLabel();
-        UpdateLegend();
         SaveSettings();
     }
 
@@ -2596,7 +2568,6 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                            && oldArea.MinCx == target.MinCx && oldArea.MinCz == target.MinCz
                            && oldArea.MaxCx == target.MaxCx && oldArea.MaxCz == target.MaxCz;
             Map.SetTerrain(tm, keepView: sameArea);
-            UpdateLegend();
             UpdateExportRegionLabel();
             return true;
         }

@@ -28,6 +28,10 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 ### Changed
 
+- The default map mode is now **Blocks** (the in-game map colours); Heightmap and Ocean depth
+  remain available in Settings.
+- The map legend overlay was removed: it duplicated the Settings tab and could extend past the
+  map border.
 - Release builds are trimmed: each platform is now about 24 MB instead of about 50 MB, so both
   fit the 40 MB VSModDB upload limit.
 - Region wipe and the Regions tab were removed: the game regenerates a whole region, including

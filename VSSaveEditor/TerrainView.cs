@@ -70,7 +70,7 @@ public class TerrainView : Control
     private Point _lastDrag = new(double.NaN, double.NaN);
     private int _lastHoverX = int.MinValue, _lastHoverZ = int.MinValue; // the last block under the cursor (avoids a redraw)
     private DispatcherTimer? _layerTimer; // deferred Y-slice rebuild (slider smoothing)
-    private int _mode = ModeHeight;
+    private int _mode = ModeBlocks;
     private Vector _pan = new(-0, -0); // bitmap placement inside the control
     private double _ppb = 1.0; // bitmap density (== _wanted, but capped by MaxRegionPpb)
     private Point _pressPos; // where the press started on screen (click vs drag)

@@ -11,7 +11,7 @@ public sealed class AppSettings
 {
     private static readonly object WriteGate = new();
     private static Task _writeChain = Task.CompletedTask;
-    public int RenderMode { get; set; } = TerrainView.ModeHeight;
+    public int RenderMode { get; set; } = TerrainView.ModeBlocks;
     public int LodIndex { get; set; } = TerrainView.LodAuto;
     public bool ShowChunkGrid { get; set; } = true;
     public bool ShowHoverTooltip { get; set; } // tooltip over the map (off by default)

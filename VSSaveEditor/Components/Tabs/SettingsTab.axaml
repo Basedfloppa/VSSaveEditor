@@ -5,8 +5,8 @@
         <StackPanel Spacing="8" Margin="10">
             <TextBlock Text="Render mode" FontWeight="Bold" />
             <StackPanel x:Name="SettingsRenderPanel" Spacing="2">
-                <RadioButton Content="Heightmap (top-down)" IsChecked="True" Tag="0" />
-                <RadioButton Content="Blocks — like the in-game map" Tag="1" />
+                <RadioButton Content="Heightmap (top-down)" Tag="0" />
+                <RadioButton Content="Blocks — like the in-game map" IsChecked="True" Tag="1" />
                 <RadioButton Content="Ocean depth" Tag="2" />
             </StackPanel>
             <TextBlock Text="LOD (detail)" FontWeight="Bold" />

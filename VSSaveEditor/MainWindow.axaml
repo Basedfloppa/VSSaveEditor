@@ -71,9 +71,6 @@
                         Background="#B0000000" CornerRadius="2" Padding="6,2">
                     <TextBlock x:Name="MapTooltipText" Foreground="White" FontSize="12" />
                 </Border>
-                <!-- Mode legend: an overlay in the same cell, the map does not resize because of it (P1-6) -->
-                <ContentControl x:Name="MapLegendHost" IsVisible="False" IsHitTestVisible="False"
-                                HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="4" />
             </Grid>
         </Border>
 
