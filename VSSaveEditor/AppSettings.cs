@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace VSSaveEditor;
 
@@ -69,7 +70,7 @@ public sealed class AppSettings
         try
         {
             if (File.Exists(SettingsPath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
+                return JsonSerializer.Deserialize(File.ReadAllText(SettingsPath), AppSettingsJsonContext.Default.AppSettings) ?? new AppSettings();
         }
         catch
         {
@@ -84,7 +85,7 @@ public sealed class AppSettings
         try
         {
             // Serialization runs on the calling (UI) thread: the settings object is not thread-safe and the JSON is small.
-            EnqueueWrite(JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+            EnqueueWrite(JsonSerializer.Serialize(this, AppSettingsJsonContext.Default.AppSettings));
         }
         catch
         {
@@ -137,4 +138,12 @@ public sealed class AppSettings
             /* not fatal */
         }
     }
+}
+
+// Source-generated metadata keeps settings working when the app is published trimmed:
+// reflection-based System.Text.Json is not trim-safe.
+[JsonSourceGenerationOptions(WriteIndented = true)]
+[JsonSerializable(typeof(AppSettings))]
+internal sealed partial class AppSettingsJsonContext : JsonSerializerContext
+{
 }

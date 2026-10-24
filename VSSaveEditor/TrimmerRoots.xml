@@ -1,0 +1,6 @@
+<linker>
+  <!-- Avalonia resolves XAML bindings by reflection, and protobuf-net reflects over the save models.
+       Root both application assemblies so only the framework/runtime gets trimmed. -->
+  <assembly fullname="VSSaveEditor" preserve="all" />
+  <assembly fullname="VSCore" preserve="all" />
+</linker>

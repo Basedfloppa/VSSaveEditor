@@ -57,7 +57,7 @@ for rid in $rids; do
     -p:PublishSingleFile=true \
     -p:IncludeNativeLibrariesForSelfExtract=true \
     -p:EnableCompressionInSingleFile=true \
-    -p:PublishTrimmed=false \
+    -p:PublishTrimmed=true \
     -p:DebugType=None \
     -p:DebugSymbols=false \
     -p:Version="$version" \

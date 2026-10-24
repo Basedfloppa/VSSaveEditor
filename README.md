@@ -8,14 +8,9 @@
 
 VS Save Editor opens a `.vcdbs` save directly, builds a map of the world, and lets you find and edit chunks, creatures, players, inventories and blocks. Every edit goes into a working copy — the original save is never overwritten.
 
-## License
-
-VS Save Editor is released under the **MIT No Attribution (MIT-0)** license. See [LICENSE](LICENSE).
-You can use, modify and redistribute the software without attribution.
-
 ## Project status
 
-> **Pre-release.** No public version has been tagged yet. The first Linux and Windows builds will appear on the **Releases** page when `0.1.0` is ready.
+> **Public alpha.** Project is finally in a usable state, but probably full of bugs and problems, so v0.0 exists to catch any problem early.
 
 ## Why this exists
 

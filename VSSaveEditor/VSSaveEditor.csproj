@@ -9,7 +9,17 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+        <!-- Trimmed single-file builds fit the VSModDB upload limit. Partial mode keeps the
+             framework's own trim annotations; the app and core assemblies are rooted below so
+             Avalonia's reflection bindings and protobuf-net's model types keep working. -->
+        <PublishTrimmed>true</PublishTrimmed>
+        <TrimMode>partial</TrimMode>
+        <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     </PropertyGroup>
+    <ItemGroup>
+        <TrimmerRootDescriptor Include="TrimmerRoots.xml"/>
+    </ItemGroup>
     <ItemGroup>
         <!-- 11.3.22, not 11.0.10: since 11.3 Avalonia.FreeDesktop depends on
              Tmds.DBus.Protocol 0.21.3 - the patched branch of GHSA-xrw6-gwf8-vvr9

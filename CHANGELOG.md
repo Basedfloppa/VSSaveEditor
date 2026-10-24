@@ -28,6 +28,8 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 ### Changed
 
+- Release builds are trimmed: each platform is now about 24 MB instead of about 50 MB, so both
+  fit the 40 MB VSModDB upload limit.
 - Region wipe and the Regions tab were removed: the game regenerates a whole region, including
   buildings, so the result was not predictable. Chunk-column deletion remains.
 - The original “read-only MVP” was replaced by a working-copy model with explicit review and
