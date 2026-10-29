@@ -18,6 +18,8 @@ All notable changes to VS Save Editor are recorded here. The format follows
 - Item-stack search across players, creatures and containers, with navigation to the owner and
   the chunk.
 - Players tab for `playerdata`, including inventory editing by index.
+- “Search in” scope on the Chunks, Entities, Items, Players and Find-blocks tabs: search the whole
+  save, one chunk, a rectangle of chunks, the map selection or one map area.
 - Block overlay and block removal/replacement by code, editing the palette only.
 - Chunk-column deletion from the working copy.
 - Non-destructive working-copy editing, before/after review, undo/redo and edit history.

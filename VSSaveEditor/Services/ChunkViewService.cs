@@ -61,8 +61,11 @@ public sealed class ChunkViewService
     private BlockEntityRecord? _editBe;
     private EntityRecord? _editEntity;
 
-    /// <summary>The chunk (column) index for the search list: built once per scan.</summary>
+    /// <summary>The chunk (column) index for the search list: built once per scan (and scope change).</summary>
     private IReadOnlyList<ChunkColumnInfo> _columns = Array.Empty<ChunkColumnInfo>();
+
+    /// <summary>The scope the index was built for: the summary names it.</summary>
+    private SearchScope _scope = SearchScope.Everything;
 
     // edit mode state: filled in when a card renders, read by the matching Apply
     private (long pos, int field, int occ)? _editingCard;
@@ -87,11 +90,22 @@ public sealed class ChunkViewService
     private ScrollViewer? ChunkScroll => _host.Panel.FindAncestorOfType<ScrollViewer>();
 
     /// <summary>The chunk index for the search list (called after the scan is published). Empty means the save is closed.</summary>
-    public void SetChunkIndex(IReadOnlyList<ChunkColumnInfo> columns)
+    public void SetChunkIndex(IReadOnlyList<ChunkColumnInfo> columns) => SetChunkIndex(columns, SearchScope.Everything);
+
+    /// <summary>
+    ///     The index is already narrowed to the scope (<see cref="ChunkBrowser.Build(SaveScanResult, SearchScope?)" />);
+    ///     the scope only reaches the summary here, so the list says "40 match(es) in chunk 5, 7" instead of pretending
+    ///     the save has 40 chunks in total.
+    /// </summary>
+    public void SetChunkIndex(IReadOnlyList<ChunkColumnInfo> columns, SearchScope scope)
     {
         _columns = columns;
+        _scope = scope;
         RefreshChunkList();
     }
+
+    /// <summary>How many rows the current query shows — the window reports it after a scope change.</summary>
+    public int ShownCount { get; private set; }
 
     /// <summary>
     ///     Rebuilds the found chunk list for the current query. A list row shows the record
@@ -103,6 +117,9 @@ public sealed class ChunkViewService
         var query = ChunkQuery.Parse(_host.ChunkQueryText);
         var cols = ChunkBrowser.Filter(_columns, query);
         var total = ChunkBrowser.Count(_columns, query);
+        ShownCount = cols.Count;
+        // only a real rectangle adds a phrase: "the whole save" is what the summary already reads as
+        var scopeNote = _scope.HasRegion && !_scope.IsEmpty ? $" in {_scope.Label}" : "";
 
         // The row format must not change: the "entities N, be M" counters in the list depend on it.
         _host.ChunkPick.SelectedIndex = -1; // the selection would point at another row after filtering
@@ -113,14 +130,18 @@ public sealed class ChunkViewService
 
         // The parse error goes at the start of the line: otherwise it would be lost in the tail of a long summary.
         var note = query.Error is { Length: > 0 } err ? $"! {err} — " : "";
-        if (_columns.Count == 0)
+        if (_host.Scan.Data is null)
             _host.ChunkListSummary = "no data — open a save and let the scan finish";
+        else if (_scope.IsEmpty)
+            _host.ChunkListSummary = note + _scope.EmptyReason;
+        else if (_columns.Count == 0)
+            _host.ChunkListSummary = note + $"{_scope.DescribeExclusion("chunks")}";
         else if (query.IsEmpty)
             _host.ChunkListSummary = note + (total == 0
-                ? "no chunk has entities or block entities"
-                : $"{total} chunk(s) with entities/block entities (showing {cols.Count}) — type a query to narrow");
+                ? "no chunk has entities or block entities" + scopeNote
+                : $"{total} chunk(s) with entities/block entities{scopeNote} (showing {cols.Count}) — type a query to narrow");
         else
-            _host.ChunkListSummary = note + $"{total} match(es) for {query.Describe()}"
+            _host.ChunkListSummary = note + $"{total} match(es) for {query.Describe()}{scopeNote}"
                                      + (cols.Count < total ? $" (showing {cols.Count})" : "");
     }
 

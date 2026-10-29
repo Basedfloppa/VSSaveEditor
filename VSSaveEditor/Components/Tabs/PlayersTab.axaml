@@ -1,4 +1,5 @@
 <UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:components="using:VSSaveEditor.Components"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="VSSaveEditor.Components.Tabs.PlayersTab">
     <DockPanel>
@@ -12,6 +13,7 @@
             <Button x:Name="ReviewBtn" Content="Review &amp; apply…" Padding="8,2"
                     ToolTip.Tip="Show every pending change (chunks and players), then apply them to the working copy" />
         </StackPanel>
+        <components:ScopeBar x:Name="Scope" DockPanel.Dock="Top" />
         <!-- List on the left, description on the right; the 2:3 ratio starts with the description wider than the list.
              The divider can be dragged with the GridSplitter. -->
         <Grid x:Name="PlayerLayoutGrid" ColumnDefinitions="2*,5,3*" Margin="6">

@@ -9,8 +9,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SOLUTION=VSSaveEditor.sln
-# .uisnap — a separate project outside the solution, it has its own lock file
-PROJECTS=("$SOLUTION" .uisnap/uisnap.csproj)
+# .uisnap and tools/scope-probe — projects outside the solution, each with its own lock file
+PROJECTS=("$SOLUTION" .uisnap/uisnap.csproj tools/scope-probe/scope-probe.csproj)
 
 echo "== restore --locked-mode (lock files are up to date) =="
 for p in "${PROJECTS[@]}"; do

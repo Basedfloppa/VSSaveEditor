@@ -14,6 +14,7 @@ public partial class EntitiesTab : UserControl
     public EntitiesTab()
     {
         InitializeComponent();
+        Scope.ScopeRequested += (_, text) => ScopeRequested?.Invoke(this, text);
         EntityFilterBox.TextChanged += (_, _) => FilterChanged?.Invoke(this, EventArgs.Empty);
         EntityCategoryPick.SelectionChanged += (_, _) => FilterChanged?.Invoke(this, EventArgs.Empty);
         EntityClearBtn.Click += (_, e) => ClearRequested?.Invoke(this, e);
@@ -36,4 +37,7 @@ public partial class EntitiesTab : UserControl
     public EntityCategory Category => (EntityCategory)Math.Clamp(EntityCategoryPick.SelectedIndex, 0, 2);
 
     public void SetCategory(EntityCategory category) => EntityCategoryPick.SelectedIndex = (int)category;
+
+    /// <summary>The scope requested by the "Search in:" row: a column, a rectangle, an area; empty means the whole save.</summary>
+    public event EventHandler<string>? ScopeRequested;
 }

@@ -1,4 +1,5 @@
 <UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:components="using:VSSaveEditor.Components"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="VSSaveEditor.Components.Tabs.ChunkDataTab">
     <!-- Vertical centering of children comes from the toolbar row style (App.axaml), so it is not set here -->
@@ -15,6 +16,7 @@
             <TextBlock x:Name="ChunkSummaryLabel" MaxWidth="380" TextTrimming="CharacterEllipsis"
                        Foreground="{DynamicResource TextAccentBrush}" />
         </StackPanel>
+        <components:ScopeBar x:Name="Scope" DockPanel.Dock="Top" />
         <!-- Row 2: pick from the results or type coordinates by hand -->
         <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6,0,6,4">
             <ComboBox x:Name="ChunkPick" Width="360" PlaceholderText="Pick chunk…" />

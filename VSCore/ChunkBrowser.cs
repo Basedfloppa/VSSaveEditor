@@ -317,11 +317,19 @@ public static class ChunkBrowser
     public const int DefaultLimit = 400;
 
     /// <summary>Builds the (cx, cz) columns grouped from the flat list of y columns of the scan.</summary>
-    public static List<ChunkColumnInfo> Build(SaveScanResult r)
+    public static List<ChunkColumnInfo> Build(SaveScanResult r) => Build(r, null);
+
+    /// <summary>
+    ///     Builds the columns from the part of the scan inside the scope. Narrowing happens here, at index build time,
+    ///     rather than in <see cref="Filter" />: the content search and the counters then never touch a chunk outside
+    ///     the scope, and "no filter" suggests the most populated chunks <em>of the scope</em>.
+    /// </summary>
+    public static List<ChunkColumnInfo> Build(SaveScanResult r, SearchScope? scope)
     {
         var map = new Dictionary<(int X, int Z), ChunkColumnInfo>();
         foreach (var cd in r.Chunks)
         {
+            if (scope is { } s && !s.ContainsChunk(cd.ChunkX, cd.ChunkZ)) continue;
             if (!map.TryGetValue((cd.ChunkX, cd.ChunkZ), out var col))
             {
                 col = new ChunkColumnInfo { Cx = cd.ChunkX, Cz = cd.ChunkZ };

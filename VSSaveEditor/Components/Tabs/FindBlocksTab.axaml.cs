@@ -12,6 +12,7 @@ public partial class FindBlocksTab : UserControl
     public FindBlocksTab()
     {
         InitializeComponent();
+        Scope.ScopeRequested += (_, text) => ScopeRequested?.Invoke(this, text);
         FilterSearchBox.TextChanged += (_, e) => SearchChanged?.Invoke(this, e);
         FilterClearBtn.Click += (_, e) => ClearRequested?.Invoke(this, e);
         RemoveBlocksBtn.Click += (_, e) => RemoveRequested?.Invoke(this, e);
@@ -32,4 +33,7 @@ public partial class FindBlocksTab : UserControl
     public event EventHandler<RoutedEventArgs>? NextRequested;
     public event EventHandler<RoutedEventArgs>? ExportImageRequested;
     public event EventHandler<RoutedEventArgs>? DimChanged;
+
+    /// <summary>The scope requested by the "Search in:" row: a column, a rectangle, an area; empty means the whole save.</summary>
+    public event EventHandler<string>? ScopeRequested;
 }

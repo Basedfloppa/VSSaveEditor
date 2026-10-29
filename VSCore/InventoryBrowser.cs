@@ -320,25 +320,164 @@ public sealed class InventoryQuery
 /// <summary>Flat index of item stacks for the Items tab.</summary>
 public static class InventoryBrowser
 {
-    public static List<ItemStackRow> Build(SaveScanResult? r)
+    public static List<ItemStackRow> Build(SaveScanResult? r) => Build(r, null);
+
+    /// <summary>
+    ///     Stacks of the inventories inside the scope. Containers and creature backpacks are placed exactly by their
+    ///     <c>pos.x/y/z</c>; the chunk of the record is the fallback for trees without those fields.
+    ///
+    ///     Playerdata is a deliberate exception: it has no position — the backpack rides with the player — so it is kept
+    ///     only in a scope that contains no placed records at all (<see cref="SearchScope.UnplacedOnly" />) and left out
+    ///     of a chunk scope. Anything else would answer "the player's items are in this chunk" when they are not.
+    /// </summary>
+    public static List<ItemStackRow> Build(SaveScanResult? r, SearchScope? scope)
     {
         var rows = new List<ItemStackRow>(r?.ItemStackCount ?? 0);
         if (r is null) return rows;
+        var unplacedOnly = scope?.Kind == SearchScope.ScopeKind.Unplaced;
         foreach (var inv in r.Inventories)
+        {
+            if (scope is not null)
+            {
+                if (inv.OwnerKind == InventoryOwnerKind.Player)
+                {
+                    if (!unplacedOnly) continue; // the backpack travels with the player, not with the chunk
+                }
+                else if (unplacedOnly)
+                {
+                    continue;
+                }
+                else
+                {
+                    // the block position is the corner of the block; +0.5 puts the point inside the block itself
+                    var inside = inv is { X: { } x, Z: { } z }
+                        ? scope.ContainsPoint(x + 0.5, z + 0.5)
+                        : scope.ContainsChunk(inv.ChunkX, inv.ChunkZ);
+                    if (!inside) continue;
+                }
+            }
+
             foreach (var stack in inv.Items)
                 rows.Add(new ItemStackRow(inv, stack));
+        }
 
-        // Identical items must stay next to each other: by code, then by count (larger stacks
-        // first), then by owner. That way "who has the rare resource" reads top to bottom.
-        rows.Sort((a, b) =>
-        {
-            var c = string.Compare(a.Code, b.Code, StringComparison.OrdinalIgnoreCase);
-            if (c != 0) return c;
-            c = b.Count.CompareTo(a.Count);
-            if (c != 0) return c;
-            return string.Compare(a.OwnerLabel, b.OwnerLabel, StringComparison.OrdinalIgnoreCase);
-        });
+        SortRows(rows);
         return rows;
+    }
+
+    /// <summary>
+    ///     Record-level check for the "Items in scope" run: a player inventory is inside a scope without a rectangle -
+    ///     and only then, since playerdata cannot be narrowed by a chunk, a container must stand in a chunk of the scope.
+    /// </summary>
+    public static bool InventoryInRecordScope(InventoryInfo inv, SearchScope? scope)
+    {
+        if (scope is null) return true;
+        if (inv.OwnerKind == InventoryOwnerKind.Player) return !scope.HasRegion;
+        return scope.ContainsChunk(inv.ChunkX, inv.ChunkZ);
+    }
+
+    /// <summary>
+    ///     The saved <c>key:</c> prefix of one inventory, so that the scoped lists can be assembled from per-record
+    ///     loads and still have an address the "key:" filter understands. <c>-1</c> for
+    ///     <c>Position</c>/<c>Occurrence</c> when the record's blob is not in the scan - that inventory then
+    ///     cannot be opened in the editor and deliberately gets no key.
+    /// </summary>
+    public static string ScopedKey(InventoryInfo inv)
+    {
+        if (inv.OwnerKind == InventoryOwnerKind.Player) return $"p:{inv.PlayerId}:{inv.Name}";
+        var pos = inv.OwnerKind == InventoryOwnerKind.Entity
+            ? inv.Position
+            : inv.OwnerKind == InventoryOwnerKind.BlockEntity ? inv.Position : -1;
+        return pos >= 0 && inv.Occurrence >= 0
+            ? $"{(inv.OwnerKind == InventoryOwnerKind.Entity ? "e" : "b")}:{pos}:{inv.Occurrence}:{inv.Name}"
+            : "";
+    }
+
+    /// <summary>
+    ///     The "Players" source of a scope lists the players themselves: all of them — playerdata has no position, so
+    ///     there is nothing to narrow by the 2D rectangle.
+    /// </summary>
+    public static List<ItemStackRow> FilterPlayers(IEnumerable<ItemStackRow> rows)
+        => rows.Where(r => r.IsPlayer).ToList();
+
+    /// <summary>
+    ///     The "Items in scope" run: the scan keeps playerdata inventories without the player's uid (for example to find
+    ///     a player by uid, or to open the right <c>key:</c>), and <see cref="Build" /> needs rows to attach records to.
+    ///     With a scope the players' items are parsed from the save's own playerdata here, the uid comes from the row,
+    ///     and placed inventories keep the addresses the holder can open. A damaged row is skipped, as in the scan.
+    /// </summary>
+    public static List<ItemStackRow> AddPlayerInventories(List<ItemStackRow> rows, IEnumerable<VSSaveFile.PlayerRow> players,
+        BlockRegistry? blocks, ItemRegistry? items)
+    {
+        foreach (var p in players)
+        {
+            try
+            {
+                var data = PlayerDataParser.Parse(p.Data ?? Array.Empty<byte>(), p.Id, blocks, items);
+                var label = data.CustomName is { Length: > 0 } name ? name : p.Uid ?? ("player #" + p.Id);
+                foreach (var inv in data.Inventories)
+                {
+                    var info = new InventoryInfo
+                    {
+                        OwnerKind = InventoryOwnerKind.Player,
+                        OwnerLabel = label,
+                        OwnerCode = p.Uid ?? "",
+                        PlayerId = p.Id,
+                        PlayerUid = p.Uid,
+                        Position = -1,
+                        Field = -2,
+                        Occurrence = -1,
+                        HasChunk = false
+                    };
+                    AddInv(info, inv.Name ?? "inventory", inv.SlotCount, inv.Items, rows);
+                    // a backpack inside a backpack: the scan keeps the nested ones as separate inventories too
+                    foreach (var nested in inv.Nested)
+                        AddInv(info, nested.Name, nested.SlotCount, nested.Items, rows);
+                }
+            }
+            catch
+            {
+                // a damaged record must not hide the other players' items
+            }
+        }
+
+        return rows;
+    }
+
+    private static void AddInv(InventoryInfo owner, string name, int slotCount, IEnumerable<ItemStackInfo> stacks,
+        List<ItemStackRow> rows)
+    {
+        var info = new InventoryInfo
+        {
+            OwnerKind = owner.OwnerKind,
+            OwnerLabel = owner.OwnerLabel,
+            OwnerCode = owner.OwnerCode,
+            PlayerId = owner.PlayerId,
+            PlayerUid = owner.PlayerUid,
+            Position = owner.Position,
+            Field = owner.Field,
+            Occurrence = owner.Occurrence,
+            HasChunk = false,
+            Name = name,
+            SlotCount = slotCount
+        };
+        foreach (var s in stacks)
+        {
+            info.Items.Add(s);
+            rows.Add(new ItemStackRow(info, s));
+        }
+    }
+
+    /// <summary>Two indexes side by side: the players' inventories first, so identical items do not split a sort run.</summary>
+    public static void SortRows(List<ItemStackRow> rows) => rows.Sort(CompareRows);
+
+    private static int CompareRows(ItemStackRow a, ItemStackRow b)
+    {
+        var c = string.Compare(a.Code, b.Code, StringComparison.OrdinalIgnoreCase);
+        if (c != 0) return c;
+        c = b.Count.CompareTo(a.Count);
+        if (c != 0) return c;
+        return string.Compare(a.OwnerLabel, b.OwnerLabel, StringComparison.OrdinalIgnoreCase);
     }
 
     public static List<ItemStackRow> Filter(IEnumerable<ItemStackRow> rows, InventorySourceFilter source, InventoryQuery query)

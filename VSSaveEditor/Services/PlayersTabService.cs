@@ -24,6 +24,9 @@ public interface IPlayersTabHost
     TextBlock Count { get; }
     string Status { set; }
 
+    /// <summary>The part of the save this tab searches — the "Search in:" row of the tab.</summary>
+    SearchScope Scope { get; }
+
     /// <summary>The edit count and history changed - the window refreshes the Undo/Redo strip in the drawer header.</summary>
     void PendingChanged();
 
@@ -95,7 +98,13 @@ public sealed class PlayersTabService
 
         var q = (_host.Filter.Text ?? "").Trim();
         var pendingOnly = _host.PendingOnly.IsChecked == true;
-        var all = scan.Data.Players;
+        var scope = _host.Scope;
+        // Only the players' own creature is placed in the world; playerdata is not. A chunk scope therefore selects
+        // nobody here — the alternative would be listing every player "in" every chunk, which answers nothing — and
+        // the count says so instead of "0 of N" as if they were all filtered out by the text.
+        var all = scope.HasRegion
+            ? new List<PlayerScanData>()
+            : scan.Data.Players;
         _shown = all.Where(p => Matches(p, q) && (!pendingOnly || _host.Edits.TryGetPlayerBlob(p.PlayerId, out _)))
             .ToList();
 
@@ -108,9 +117,11 @@ public sealed class PlayersTabService
                            + (q.Length > 0 ? $" matching '{q}'" : "");
         if (_shown.Count == 0)
         {
-            ShowDetailNote(all.Count == 0
-                ? "This save has no playerdata rows."
-                : "No player matches the filter.");
+            ShowDetailNote(scope.HasRegion
+                ? $"Players are not placed in a chunk — playerdata has no position, so {scope.Label} contains none (only their creatures do)."
+                : all.Count == 0
+                    ? "This save has no playerdata rows."
+                    : "No player matches the filter.");
             return;
         }
 

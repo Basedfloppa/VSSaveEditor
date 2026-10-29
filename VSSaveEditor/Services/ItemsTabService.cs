@@ -17,6 +17,9 @@ public interface IItemsTabHost
 
     string FilterText { get; }
     InventorySourceFilter SourceFilter { get; }
+
+    /// <summary>The part of the save this tab searches — the "Search in:" row of the tab.</summary>
+    SearchScope Scope { get; }
     string Summary { set; }
     string Status { set; }
 
@@ -47,9 +50,15 @@ public sealed class ItemsTabService
     public int ShownCount => _shown.Count;
 
     /// <summary>The index is built once per scan and cleared when the save is closed.</summary>
-    public void SetIndex(SaveScanResult? data)
+    public void SetIndex(SaveScanResult? data) => SetIndex(data, _host.Scope);
+
+    /// <summary>
+    ///     The scoped index. Unlike the chunks and entities it takes the scope itself, not its chunk restriction:
+    ///     the player inventory index treats "unplaced" and a rectangle differently (see <see cref="InventoryBrowser.Build" />).
+    /// </summary>
+    public void SetIndex(SaveScanResult? data, SearchScope scope)
     {
-        _all = InventoryBrowser.Build(data);
+        _all = InventoryBrowser.Build(data, scope);
         _selected = null;
         _host.DetailPanel.Children.Clear();
         Refresh();

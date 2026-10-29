@@ -1,0 +1,25 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="VSSaveEditor.Components.ScopeBar">
+    <!-- One search scope per tab, shown on its own row under the toolbar. It is a row rather than a few
+         more controls in the toolbar: the toolbars already reach the right edge of a 1280 px window, and a
+         scope combo plus a rectangle editor would push them past it. The width of the label is capped for the
+         same reason: an area label names two coordinate ranges and can be longer than the whole window. -->
+    <Grid ColumnDefinitions="Auto,Auto,Auto,*,Auto" Margin="6,0,6,4">
+        <TextBlock Grid.Column="0" Text="Search in:" FontWeight="Bold" VerticalAlignment="Center" />
+        <TextBlock Grid.Column="1" x:Name="ScopeLabel" Margin="8,0,8,0" MaxWidth="300"
+                   TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                   Foreground="{DynamicResource TextAccentBrush}"
+                   Text="the whole save — every record in the save" />
+        <!-- The enter key applies the typed scope instead of closing the drawer: a scope is applied explicitly,
+             like "Search" in the Chunks tab, because a half-typed range would turn the list empty on every keystroke -->
+        <TextBox Grid.Column="2" x:Name="ScopeBox" Width="280" VerticalAlignment="Center"
+                 Watermark="cx,cz or cx1,cz1,cx2,cz2 — or pick below"
+                 ToolTip.Tip="A chunk column (15991, 15983) or a rectangle of columns (15991, 15983, 16010, 16000). Space or comma between the numbers; an area can be picked below." />
+        <StackPanel Grid.Column="3" x:Name="ScopeButtons" Orientation="Horizontal" Spacing="4"
+                    Margin="8,0,0,0" VerticalAlignment="Center" />
+        <Button Grid.Column="4" x:Name="ScopeClearBtn" Content="Whole save" Padding="8,1"
+                Margin="8,0,0,0" VerticalAlignment="Center"
+                ToolTip.Tip="Search the whole save again" />
+    </Grid>
+</UserControl>

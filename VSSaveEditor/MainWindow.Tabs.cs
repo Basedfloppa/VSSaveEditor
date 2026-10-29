@@ -126,6 +126,8 @@ public partial class MainWindow
         SettingsView.SettingsChanged += (_, _) => SaveSettings();
         SettingsView.ClearSelectionRequested += OnClearSelection;
 
+        WireScopes();
+
         // Initial map state: before the tabs were extracted the XAML loader applied it itself - the events
         // of RadioButton/CheckBox with IsChecked="True" arrived when the controls were created. Now the event
         // arrives only on a change (applying the saved settings raises it only when the radio

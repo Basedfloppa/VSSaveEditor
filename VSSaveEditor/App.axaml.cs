@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
+using Avalonia.Threading;
 
 namespace VSSaveEditor;
 
@@ -25,6 +26,14 @@ public class App : Application
             // while here it is logging and clearing stuck flags for background tasks (async Task).
             AppDomain.CurrentDomain.UnhandledException += (_, e) =>
                 Trace.TraceError("Unhandled domain exception: " + e.ExceptionObject);
+            // An exception thrown by a UI event handler closes the window unless it is caught here: a scope typed
+            // into the "Search in" row (already parse-checked before use) must land in the status line, not in a crash.
+            Dispatcher.UIThread.UnhandledException += (_, e) =>
+            {
+                e.Handled = true;
+                Trace.TraceError("Unhandled UI exception: " + e.Exception);
+                window.ReportUnhandled(e.Exception);
+            };
             TaskScheduler.UnobservedTaskException += (_, e) =>
             {
                 e.SetObserved(); // do not bring the process down over an unobserved Task

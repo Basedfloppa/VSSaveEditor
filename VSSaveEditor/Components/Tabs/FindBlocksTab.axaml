@@ -1,4 +1,5 @@
 <UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:components="using:VSSaveEditor.Components"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="VSSaveEditor.Components.Tabs.FindBlocksTab">
     <DockPanel>
@@ -26,6 +27,7 @@
             <CheckBox x:Name="FilterDimCheck" Content="Dim the rest" IsChecked="True"
                       ToolTip.Tip="Off = only matches are visible" />
         </StackPanel>
+        <components:ScopeBar x:Name="Scope" DockPanel.Dock="Top" />
         <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="FilterListPanel" Spacing="1" Margin="6" />
         </ScrollViewer>

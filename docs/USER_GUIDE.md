@@ -44,6 +44,8 @@ The **Export** controls write PNG, JPEG or lossless WebP at 1–8 pixels per blo
 | **Items** | Find who holds an item, in which container and slot, and jump to the owner or chunk. |
 | **Players** | Browse `playerdata`, edit player inventory fields, and show a player on the map when their creature exists. |
 | **Find blocks** | Remove or replace block codes across the world. |
+
+The **Chunks**, **Entities**, **Items**, **Players** and **Find blocks** tabs have a **Search in:** row that limits the search to one chunk, a rectangle or one map area — see [Search scope](#search-scope).
 | **Selection** | Delete the selected chunk columns from the working copy. |
 | **World** | Read version, seed, world size, areas and save diagnostics. |
 | **Settings** | Change map, export and display options. |
@@ -51,6 +53,33 @@ The **Export** controls write PNG, JPEG or lossless WebP at 1–8 pixels per blo
 On the **Entities**, **Items** and **Players** tabs, the list and detail card can be resized with the divider between them. The detail card starts wider than the list.
 
 ## Finding data
+
+### Search scope
+
+Each search tab has a **Search in:** row under its toolbar. It limits that tab — and only that tab — to part of the save:
+
+| What | How |
+|---|---|
+| The whole save | **Whole save** (the default). |
+| One chunk | Type `15991, 15983` (chunk X and Z) and press Enter, or click **This chunk on the map**. |
+| A rectangle of chunks | Type `15991, 15983, 16010, 16000` — `cx1, cz1, cx2, cz2`. |
+| One map area | Click **Area N of M**; a save with distant pregen patches has several. |
+
+The label next to the box names the active scope, and the status line reports how much it found. A rectangle that lies outside every area says so instead of quietly searching the whole save.
+
+A scope is two-dimensional: every Y level of the chosen chunks is inside it. Typing a scope into one tab leaves the other tabs' scopes alone, so the Chunks tab can show one chunk while Items shows the whole save.
+
+How each tab reads the scope:
+
+| Tab | Inside the scope |
+|---|---|
+| **Chunks** | Chunk columns whose own coordinates are in the rectangle. |
+| **Entities** | Creatures and block entities standing in the rectangle. |
+| **Items** | Containers and creature inventories in the rectangle. **Player inventories are only listed when the scope is the whole save** — `playerdata` has no position, and a player's backpack travels with the player, not with the chunk. |
+| **Players** | Lists nobody in a chunk scope: only the player's creature is placed in the world, and it is in the Entities tab. |
+| **Find blocks** | The block list and the "Show on map" overlay count only the blocks inside the scope; the overlay itself stays aligned with the whole map. |
+
+Every scope goes back to the whole save when another save is opened.
 
 ### Chunks
 
@@ -127,6 +156,8 @@ The **Selection** tab deletes every Y level of the selected chunk columns from t
 
 There is intentionally no command that overwrites the original file.
 
+A chunk scope is a display and search filter only. A block removal or a chunk-column deletion still works on **every ticked code in the world** and on the **selected chunks on the map**, whatever scope the tab shows.
+
 - **Undo / redo** works on pending edits. The History panel also keeps applied edits after they are applied.
 - **Save a copy…** writes a self-contained file atomically. No `-wal` or `-shm` sidecar is left behind.
 - Closing the window asks whether to save the working copy or discard it.
@@ -168,6 +199,17 @@ The game remains the final validator. The editor does not run Vintage Story's ow
 
 - [CHANGELOG.md](../CHANGELOG.md) — changes in each release.
 - [README.md](../README.md) — feature overview, supported platforms and installation.
+
+## Repository scripts
+
+Not part of the app download; they are for working on the source tree.
+
+| Script | Purpose |
+|---|---|
+| `tools/gen_block_colors.py <assets> VSCore/BlockColors.txt` | Regenerates the block colour table from an installed Vintage Story. Colours are averaged from the real textures, so mod blocks keep heuristic colours until the table is rebuilt; the script needs the game assets. |
+| `tools/check-deps.sh` | CI check: every lock file matches the resolved graph and no package has a known vulnerability. Covers the solution plus the projects outside it (`.uisnap/`, `tools/scope-probe/`). |
+| `tools/publish-release.sh`, `tools/publish-release.ps1` | Builds the same single-file linux-x64/win-x64 assets the release workflow does, into `artifacts/release/`, so a release build can be checked locally. |
+| `tools/scope-probe` | Headless check of the **Search in** scope on a real save: prints scoped versus whole-save counts and fails when a scoped row lies outside the scope. `dotnet run --project tools/scope-probe -c Release <save.vcdbs> [cx,cz]` — no window or display needed. |
 
 ## License
 

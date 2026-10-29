@@ -54,6 +54,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private CancellationTokenSource? _filterCts;
     private BlockFilterMap? _filterMap;
     private HashSet<int>? _filterMapKey; // which id set the current map was built for
+    private SearchScope? _filterMapScope; // ...and for which scope (null — the whole area)
     private int _lastCx, _lastCz; // the last shown chunk (fallback when the X/Z fields do not parse)
     private int? _layerYLast; // the last applied Y layer (for persistence)
     private int _loadEpoch; // load epoch: background tasks of older loads publish no data
@@ -484,6 +485,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     /// <summary>Updates the line about the chunk/region selection (a chunk click, Shift+drag selects a region).</summary>
     private void UpdateSelInfo()
     {
+        UpdateScopeBars(); // the "The selection" proposal follows the map selection
         var b = Map.SelectionBounds;
         DeleteChunksBtn.IsEnabled = b is not null && _save is not null && !_deletingChunks;
         UpdateExportRegionLabel();
@@ -574,13 +576,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     /// </summary>
     private void PopulateChunkPick()
     {
-        if (ScanData is null)
-        {
-            _chunkView.SetChunkIndex(Array.Empty<ChunkColumnInfo>());
-            return;
-        }
-
-        _chunkView.SetChunkIndex(ChunkBrowser.Build(ScanData));
+        RefreshChunkScope();
+        UpdateScopeBars();
     }
 
     private void OnGoChunk(object? sender, RoutedEventArgs e)
@@ -621,6 +618,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     {
         if (ChunkPick.Tag is not List<(int X, int Z, int Ent, int BE)> cols || ChunkPick.SelectedIndex < 0) return;
         var c = cols[ChunkPick.SelectedIndex];
+        Map.FocusChunk(c.X, c.Z);
         ShowChunkData(c.X, c.Z);
     }
 
@@ -635,6 +633,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _lastCx = cx;
         _lastCz = cz; // remember the valid chunk: with broken input CurrentCx/Cz must not return 0,0
         _chunkView.Show(cx, cz);
+        UpdateScopeBars(); // "This chunk on the map" follows the shown chunk
     }
 
     /// <summary>
@@ -993,7 +992,11 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     {
         if (ScanData is null || _save is null) return;
         var query = (FilterSearchBox.Text ?? "").Trim();
-        var matched = ScanData.WorldBlockCodeCounts
+        // The list is built from the scoped part of the model, not from the whole save: a code that occurs only outside
+        // the scope would be offered here and then highlight nothing on the map.
+        var counts = ScopedBlockCounts();
+        var inScope = _filterScope.HasRegion && !_filterScope.IsEmpty ? " in " + _filterScope.Label : "";
+        var matched = counts
             .OrderByDescending(kv => kv.Value)
             .Where(kv => query.Length == 0 || kv.Key.Contains(query, StringComparison.OrdinalIgnoreCase))
             .ToList();
@@ -1002,8 +1005,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
 
         FilterListPanel.Children.Clear();
         AddHeader(FilterListPanel, query.Length == 0
-            ? $"Blocks in this save: {ScanData.WorldBlockCodeCounts.Count:N0} (top {shown.Count} by count)"
-            : $"Matches for '{query}': {matched.Count:N0} (showing {shown.Count})");
+            ? $"Blocks{inScope}: {counts.Count:N0} (top {shown.Count} by count)"
+            : $"Matches for '{query}'{inScope}: {matched.Count:N0} (showing {shown.Count})");
         if (matched.Count > shown.Count)
             AddLine(FilterListPanel, $"   … {matched.Count - shown.Count:N0} more - refine your search", gray: true);
 
@@ -1369,6 +1372,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _filterCts?.Cancel();
         _filterMap = null;
         _filterMapKey = null;
+        _filterMapScope = null;
         Map.SetFilterOverlay(null, null, FilterDimCheck.IsChecked == true);
         PopulateFilterList();
         SaveSettings();
@@ -1417,10 +1421,15 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             }
 
             var save = _save;
+            // The overlay is built for the scope, not for the whole area: the scope is passed to the scanner as the
+            // set of chunks to read, while the map itself stays the area's — the overlay is aligned to it 1:1, and a
+            // smaller map would move the highlights away from the blocks they belong to.
             var grid = Map.Terrain!;
-            // cache: the same id set and the same grid - just enable the ready map
+            var scope = _filterScope.HasRegion && !_filterScope.IsEmpty ? _filterScope : null;
+            // cache: the same id set, the same grid and the same scope - just enable the ready map
             if (_filterMap is not null && _filterMapKey is not null && _filterMapKey.SetEquals(ids) &&
-                _filterMap.MinX == grid.MinX && _filterMap.MinZ == grid.MinZ && _filterMap.Width == grid.Width)
+                _filterMap.MinX == grid.MinX && _filterMap.MinZ == grid.MinZ && _filterMap.Width == grid.Width &&
+                ReferenceEquals(_filterMapScope, scope))
             {
                 Map.SetFilterOverlay(_filterMap, _filterColors, FilterDimCheck.IsChecked == true);
                 UpdateFilterStatus();
@@ -1437,11 +1446,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             var progress = new UiProgress(pct => Status.Set(StatusChannel.Filter, $"Scanning chunks... {pct}%"));
             try
             {
-                var built = await Task.Run(() => BlockFilterScanner.Build(save, grid, ids, progress, cts.Token));
+                var built = await Task.Run(() => BlockFilterScanner.Build(save, grid, ids, progress, cts.Token, scope));
                 if (cts.IsCancellationRequested) return;
                 sw.Stop();
                 _filterMap = built;
                 _filterMapKey = new HashSet<int>(ids);
+                _filterMapScope = scope;
                 Map.SetFilterOverlay(built, _filterColors, FilterDimCheck.IsChecked == true);
                 UpdateFilterStatus(sw.ElapsedMilliseconds);
                 SaveSettings();
@@ -1462,14 +1472,25 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
     }
 
+    /// <summary>Block code counters of the "Find blocks" scope; the whole save when there is no scope.</summary>
+    private Dictionary<string, long> ScopedBlockCounts()
+    {
+        if (ScanData is not { } data) return new Dictionary<string, long>();
+        if (!_filterScope.HasRegion || _filterScope.IsEmpty) return data.WorldBlockCodeCounts;
+        return data.WithinScope(_filterScope).WorldBlockCodeCounts;
+    }
+
     private void UpdateFilterStatus(long elapsedMs = 0)
     {
         var map = _filterMap;
         if (map is null)
         {
+            // the scope is named here rather than silently applied: the overlay is built for the scope, and the
+            // numbers below ("columns", "blocks") are counted inside it, not over the whole world
+            var scopeNote = _filterScope.HasRegion && !_filterScope.IsEmpty ? $" (in {_filterScope.Label})" : "";
             Status.Set(StatusChannel.Filter, _filterCodes.Count == 0
-                ? "Nothing selected - search for a code and tick it in the list below."
-                : $"Selected codes: {_filterCodes.Count}. Press Show on map.");
+                ? $"Nothing selected - search for a code and tick it in the list below{scopeNote}."
+                : $"Selected codes: {_filterCodes.Count}{scopeNote}. Press Show on map.");
             return;
         }
 
@@ -1478,6 +1499,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             .Select(kv => $"{reg?.CodeOf(kv.Key) ?? "id:" + kv.Key}: {kv.Value:N0}");
         Status.Set(StatusChannel.Filter,
             $"codes: {_filterCodes.Count} | columns: {map.HitColumns:N0} | blocks: {map.MatchCells:N0}"
+            + (_filterScope.HasRegion && !_filterScope.IsEmpty ? $" in {_filterScope.Label}" : "")
             + (elapsedMs > 0 ? $" | {elapsedMs} ms" : "")
             + (map.IdCells.Count > 0 ? " | " + string.Join(", ", top) : " | no matches"));
     }
@@ -2128,6 +2150,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             {
                 _filterMap = null;
                 _filterMapKey = null;
+                _filterMapScope = null;
                 await BuildFilterOverlayAsync();
             }
         }
@@ -2159,6 +2182,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _chunkView.ShowEmptyState();
         _players.Refresh();
         UpdatePendingStrip();
+        ResetScopes(); // a rectangle of the previous save means nothing in the next one
         _chunkView.SetChunkIndex(Array.Empty<ChunkColumnInfo>()); // the found chunk list is empty
         _entities.SetIndex(null); // the record list of the previous save must not survive its opening
         _items.SetIndex(null);    // and neither must the found item list
@@ -2213,9 +2237,9 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 $"Scan complete in {sw.ElapsedMilliseconds} ms — {activeRows} active of {data.EntityCount} entities, {data.BlockEntityCount} block entities, {data.Chunks.Count} chunks.");
             RefreshDumpForSelection(Map.SelectionBounds);
             ApplyDataPanelVisibility(); // show the panel after the scan, respecting the saved state
-            PopulateChunkPick(); // chunk index + found list
-            _entities.SetIndex(data); // the "Entities" tab: all creatures and block entities of the save
-            _items.SetIndex(data);    // the "Items" tab: inventories of players, creatures and containers
+            PopulateChunkPick(); // chunk index + found list, in the tab's scope
+            _entities.SetIndex(data, _entityScope); // the "Entities" tab: creatures and block entities of the scope
+            _items.SetIndex(data, _itemScope);       // the "Items" tab: inventories of players, creatures and containers
             PopulateFilterList();
             _players.Refresh(); // the "Players" tab fills together with the rest of the scan data
             _chunkView.RefreshAll(); // the open chunk card re-reads its blob from the working copy
@@ -2535,6 +2559,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             // be reused, otherwise "Show on map" would show matches that no longer exist.
             _filterMap = null;
             _filterMapKey = null;
+            _filterMapScope = null;
 
             var areas = await Task.Run(() => ChunkAreas.Build(save));
             if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return false;

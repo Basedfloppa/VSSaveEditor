@@ -13,6 +13,7 @@ public partial class ItemsTab : UserControl
     public ItemsTab()
     {
         InitializeComponent();
+        Scope.ScopeRequested += (_, text) => ScopeRequested?.Invoke(this, text);
         ItemFilterBox.TextChanged += (_, _) => FilterChanged?.Invoke(this, EventArgs.Empty);
         ItemSourcePick.SelectionChanged += (_, _) => FilterChanged?.Invoke(this, EventArgs.Empty);
         ItemClearBtn.Click += (_, e) => ClearRequested?.Invoke(this, e);
@@ -31,4 +32,7 @@ public partial class ItemsTab : UserControl
 
     /// <summary>The item order matches <see cref="InventorySourceFilter"/>.</summary>
     public InventorySourceFilter SourceFilter => (InventorySourceFilter)Math.Clamp(ItemSourcePick.SelectedIndex, 0, 3);
+
+    /// <summary>The scope requested by the "Search in:" row: a column, a rectangle, an area; empty means the whole save.</summary>
+    public event EventHandler<string>? ScopeRequested;
 }

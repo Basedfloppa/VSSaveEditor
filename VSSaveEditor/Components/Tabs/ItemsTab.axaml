@@ -1,4 +1,5 @@
 <UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:components="using:VSSaveEditor.Components"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:core="using:VSCore"
              x:Class="VSSaveEditor.Components.Tabs.ItemsTab">
@@ -25,6 +26,7 @@
             <Button x:Name="CopyItemsBtn" Content="Copy list" Padding="8,2"
                     ToolTip.Tip="Copy the stacks currently shown" />
         </StackPanel>
+        <components:ScopeBar x:Name="Scope" DockPanel.Dock="Top" />
         <!-- List on the left, card on the right; the 2:3 ratio starts with the card wider than the list.
              The divider can be dragged with the GridSplitter. -->
         <Grid x:Name="ItemLayoutGrid" ColumnDefinitions="2*,5,3*" Margin="6">

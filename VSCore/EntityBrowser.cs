@@ -140,11 +140,18 @@ public static class EntityBrowser
 {
     /// <summary>All addressable records of the save. Inactive entities (no kind and no attributes) are skipped:
     /// they have neither a name nor fields on the card.</summary>
-    public static List<EntityRow> Build(SaveScanResult r)
+    public static List<EntityRow> Build(SaveScanResult r) => Build(r, null);
+
+    /// <summary>
+    ///     Records of the part of the save inside the scope. A record is placed by its chunk: the scope has no
+    ///     Y borders (it is (cx,cz)), so every y column of a chunk in the scope contributes its records.
+    /// </summary>
+    public static List<EntityRow> Build(SaveScanResult r, SearchScope? scope)
     {
         var rows = new List<EntityRow>(r.EntityCount + r.BlockEntityCount);
         foreach (var c in r.Chunks)
         {
+            if (scope is { } s && !s.ContainsChunk(c.ChunkX, c.ChunkZ)) continue;
             foreach (var e in c.Entities)
                 if (e.HasInfo)
                     rows.Add(new EntityRow { Entity = e });

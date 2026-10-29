@@ -30,6 +30,9 @@ public interface IEntitiesTabHost
 
     EntityCategory Category { get; }
 
+    /// <summary>The part of the save this tab searches — the "Search in:" row of the tab.</summary>
+    SearchScope Scope { get; }
+
     /// <summary>Navigation to the record's chunk: the map focuses it and the "Chunks" tab opens it.</summary>
     void ShowChunk(int cx, int cz);
 
@@ -68,9 +71,12 @@ public sealed class EntitiesTabService
     public int TotalCount => _all.Count;
 
     /// <summary>The list index is rebuilt once per scan (and reset when the save is closed).</summary>
-    public void SetIndex(SaveScanResult? data)
+    public void SetIndex(SaveScanResult? data) => SetIndex(data, _host.Scope);
+
+    /// <summary>The scoped index: only the records of the scope, so the "of N" count is the scope's own total.</summary>
+    public void SetIndex(SaveScanResult? data, SearchScope scope)
     {
-        _all = data is null ? new List<EntityRow>() : EntityBrowser.Build(data);
+        _all = data is null ? new List<EntityRow>() : EntityBrowser.Build(data, scope.ChunkScopeOf);
         _selected = null;
         _card = null;
         _host.DetailPanel.Children.Clear();

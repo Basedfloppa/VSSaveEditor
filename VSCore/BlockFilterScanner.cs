@@ -70,8 +70,14 @@ public sealed class BlockFilterMap
 /// </summary>
 public static class BlockFilterScanner
 {
+    /// <summary>
+    ///     Builds the overlay for the grid. <paramref name="scope" /> narrows the scan to a rectangle of chunks
+    ///     (the "Find blocks" tab's "Search in"): the arrays still cover the whole grid — they are aligned with the map
+    ///     1:1, and a smaller map would draw the highlights at the wrong place — but the chunks outside it are never
+    ///     read, so the match counters and the legend describe the scope.
+    /// </summary>
     public static BlockFilterMap Build(VSSaveFile save, TerrainMap grid, IReadOnlyCollection<int> blockIds,
-        IProgress<double>? progress = null, CancellationToken ct = default)
+        IProgress<double>? progress = null, CancellationToken ct = default, SearchScope? scope = null)
     {
         var map = new BlockFilterMap
         {
@@ -96,6 +102,8 @@ public static class BlockFilterScanner
         var rows = save.ChunkRowsInWindow(grid.Area);
         var groups = rows
             .GroupBy(r => { var p = ChunkPosHelper.DecodeIndex((ulong)r.Position); return (p.X, p.Z); })
+            // the scope check is before the palette read: a chunk outside the scope is not even touched
+            .Where(g => scope is null || scope.ContainsChunk(g.Key.X, g.Key.Z))
             .ToList();
 
         long matchCells = 0;

@@ -26,6 +26,8 @@ public partial class ChunkDataTab : UserControl
         ChunkPick.SelectionChanged += (_, e) => ChunkPicked?.Invoke(this, e);
         ApplyHexBtn.Click += (_, e) => ApplyHexRequested?.Invoke(this, e);
         SaveCopyBtn.Click += (_, e) => SaveRequested?.Invoke(this, e);
+        // the scope row only reports, the window decides what a chunk/rectangle/area means for the save
+        Scope.ScopeRequested += (_, text) => ScopeRequested?.Invoke(this, text);
     }
 
     public event EventHandler<RoutedEventArgs>? SearchRequested;
@@ -34,4 +36,7 @@ public partial class ChunkDataTab : UserControl
     public event EventHandler<SelectionChangedEventArgs>? ChunkPicked;
     public event EventHandler<RoutedEventArgs>? ApplyHexRequested;
     public event EventHandler<RoutedEventArgs>? SaveRequested;
+
+    /// <summary>The scope requested by the "Search in:" row: a column, a rectangle, an area; empty means the whole save.</summary>
+    public event EventHandler<string>? ScopeRequested;
 }

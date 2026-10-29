@@ -12,6 +12,7 @@ public partial class PlayersTab : UserControl
     public PlayersTab()
     {
         InitializeComponent();
+        Scope.ScopeRequested += (_, text) => ScopeRequested?.Invoke(this, text);
         PlayerFilterBox.TextChanged += (_, e) => FilterChanged?.Invoke(this, e);
         PlayerPendingOnlyCheck.IsCheckedChanged += (_, e) => PendingOnlyChanged?.Invoke(this, e);
         PlayerList.SelectionChanged += (_, e) => PlayerPicked?.Invoke(this, e);
@@ -22,4 +23,7 @@ public partial class PlayersTab : UserControl
     public event EventHandler<RoutedEventArgs>? PendingOnlyChanged;
     public event EventHandler<SelectionChangedEventArgs>? PlayerPicked;
     public event EventHandler<RoutedEventArgs>? ReviewRequested;
+
+    /// <summary>The scope requested by the "Search in:" row: a column, a rectangle, an area; empty means the whole save.</summary>
+    public event EventHandler<string>? ScopeRequested;
 }

@@ -1,4 +1,5 @@
 <UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:components="using:VSSaveEditor.Components"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:core="using:VSCore"
              x:Class="VSSaveEditor.Components.Tabs.EntitiesTab">
@@ -26,6 +27,7 @@
             <Button x:Name="CopyDumpBtn" Content="Copy raw dump" Padding="8,2"
                     ToolTip.Tip="Copy the full text dump of the save (same as before: tables, histograms, regions, raw blobs)" />
         </StackPanel>
+        <components:ScopeBar x:Name="Scope" DockPanel.Dock="Top" />
         <!-- Common names: you see at a glance what exists in the world, and one click sends it to the filter -->
         <WrapPanel x:Name="EntityChipsPanel" DockPanel.Dock="Top" Margin="6,0,6,4" />
         <!-- List on the left, card on the right; the 2:3 ratio starts with the card wider than the list.

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <!-- A throwaway headless check of the "Search in" scope on a real save: no window, no display.
+         Run:  dotnet run (project tools/scope-probe) -c Release, passing the save path and an optional cx,cz
+         Not part of VSSaveEditor.sln: it is a probe, not a shipped project. -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <!-- Directory.Build.props turns the lock file on; the probe is not in the solution, so it
+             carries its own and CI restores it in locked mode along with the others. -->
+        <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    </PropertyGroup>
+    <ItemGroup>
+        <ProjectReference Include="../../VSCore/VSCore.csproj"/>
+    </ItemGroup>
+</Project>

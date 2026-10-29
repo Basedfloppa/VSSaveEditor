@@ -24,6 +24,44 @@ public sealed class SaveScanResult
     public long TotalSolid, TotalFluid, TotalAir;
     public int EntityCount { get; set; }
     public int BlockEntityCount { get; set; }
+
+    /// <summary>
+    ///     A copy of the result holding only the chunks inside the scope — with their entities, block entities and
+    ///     inventories — and every counter aggregated over that part.
+    ///
+    ///     It is a real copy rather than a filtered view because consumers read <see cref="WorldBlockCodeCounts" /> as
+    ///     "the whole model": the block list behind the "Find blocks" overlay would otherwise offer codes that occur
+    ///     only outside the scope. The players' inventories are kept on purpose — playerdata has no position, so there
+    ///     is no chunk to narrow it by (see <see cref="SearchScope" />). Player rows, regions, mapchunks and gamedata
+    ///     are not copied: they belong to the save, not to a chunk scope.
+    /// </summary>
+    public SaveScanResult WithinScope(SearchScope? scope)
+    {
+        scope ??= SearchScope.Everything;
+        var res = new SaveScanResult();
+        foreach (var cd in Chunks)
+        {
+            if (!scope.ContainsChunk(cd.ChunkX, cd.ChunkZ)) continue;
+            res.Chunks.Add(cd);
+            res.TotalSolid += cd.SolidCells;
+            res.TotalFluid += cd.FluidCells;
+            res.TotalAir += cd.AirCells;
+            res.EntityCount += cd.Entities.Count;
+            res.BlockEntityCount += cd.BlockEntities.Count;
+            foreach (var e in cd.Entities) res.Inventories.AddRange(e.Inventories);
+            foreach (var be in cd.BlockEntities) res.Inventories.AddRange(be.Inventories);
+            foreach (var (code, cnt) in cd.BlockCodeCounts)
+            {
+                res.WorldBlockCodeCounts.TryGetValue(code, out var v);
+                res.WorldBlockCodeCounts[code] = v + cnt;
+            }
+        }
+
+        if (!scope.HasRegion) // a chunk scope contains no playerdata at all
+            res.Inventories.AddRange(Inventories.Where(i => i.OwnerKind == InventoryOwnerKind.Player));
+        res.ItemStackCount = res.Inventories.Sum(i => i.Items.Count);
+        return res;
+    }
 }
 
 /// <summary>Save metadata (gamedata/version/seed) and the overall counters.</summary>
