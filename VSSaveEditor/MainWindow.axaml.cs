@@ -42,8 +42,13 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     // One status line for the whole application (P1-7): sources write to their own channels, the senior message wins.
     private bool _busy;
     private ChunkAreas? _areas; // areas (connected chunk groups) of the save - the map is built for one of them
+    private readonly Dictionary<ChunkArea, TerrainMap> _areaMaps = new(); // built area maps, kept for instant switching
+    private readonly Dictionary<ChunkArea, TerrainPyramid> _areaOverviews = new(); // cheap overviews when a full map is too large
+    private TerrainNeeds _terrainNeeds = TerrainNeeds.All; // fields of the current render mode
     private ChunkArea? _areaLoading; // which area is being built now (guard against a duplicate request)
     private ChunkArea? _areaQueued; // a request that arrived during a build: run it after the current one
+    private ChunkArea? _preloadBuilding; // the area the background preload is building right now
+    private Task<TerrainMap>? _preloadTask; // ...its task, so a pan to that area waits for it instead of starting a twin build
     private bool _applying; // an apply of edits to the working copy is running
     private bool _closeConfirmed; // the user already confirmed closing (a second Closing does not ask again)
     private string? _savedCopyPath; // the last file the working copy was saved to
@@ -2000,6 +2005,10 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             LoadProgress.Value = 0;
             Map.SetTerrain(null); // clear the old map
             Map.SetAreas(null); // and its areas: until the new save is parsed, the old ones do not apply
+            _areaMaps.Clear();
+            _areaOverviews.Clear();
+            Map.SetAreaMaps(_areaMaps);
+            Map.SetAreaOverviews(_areaOverviews);
             _areas = null;
             MapTooltipText.Text = "";
             MapTooltip.IsVisible = false; // the tooltip belongs to the previous save
@@ -2019,7 +2028,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 // Areas first (chunk positions only - cheap), then the map of the MAIN area:
                 // a save with chunks at both ends of the world cannot be built as one map (P1-21).
                 areas = await Task.Run(() => ChunkAreas.Build(newSave));
-                tm = await Task.Run(() => TerrainMap.BuildInArea(newSave, areas.Main, progress));
+                _terrainNeeds = TerrainMap.NeedsForMode(_renderMode);
+                tm = await Task.Run(() => TerrainMap.BuildInArea(newSave, areas.Main, progress, _terrainNeeds, _renderMode));
             }
             catch (Exception ex)
             {
@@ -2033,10 +2043,18 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
 
             _areas = areas;
             Map.SetAreas(areas);
+            _areaMaps.Clear();
+            _areaOverviews.Clear();
+            if (tm.Area is { } mainArea) _areaMaps[mainArea] = tm;
+            Map.SetAreaMaps(_areaMaps);
+            Map.SetAreaOverviews(_areaOverviews);
             Map.SetTerrain(tm);
             Map.SetLodMode(_lodIndex);
             ApplyRenderMode();
             UpdateExportRegionLabel();
+            // The render mode can change while the area is being built; do not leave the new mode
+            // drawing a map that lacks its water/rain arrays.
+            if (tm.Needs != TerrainMap.NeedsForMode(_renderMode)) _ = EnsureTerrainNeedsAsync();
             // Slider bounds cover the whole Y range for which the save has data (a slice is interesting in
             // caves below the surface too), not just the relief span. We take the range across ALL areas:
             // the slider must not jump when the area switches.
@@ -2088,6 +2106,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
 
             // full scan of the save data in the background (does not block the UI)
             RunScanAsync(newSave, epoch);
+            // Warm the other areas in the background: switching to them must not mean "wait for a build".
+            _ = PreloadAreasAsync(newSave, areas, epoch);
         }
         catch (Exception ex)
         {
@@ -2108,8 +2128,77 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     {
         if (areas.Areas.Count <= 1) return "";
         var cur = tm.Area;
-        return $"Areas: {areas.Areas.Count} chunk group(s) — showing {cur?.Label(areas.Areas.Count) ?? "?"}; " +
-               "the rest are built when you scroll to them\n";
+        return $"Areas: {areas.Areas.Count} build tile(s) — showing {cur?.Label(areas.Areas.Count) ?? "?"}; " +
+               "the neighbouring tiles are preloaded in the background\n";
+    }
+
+    /// <summary>Builds the other tiles ahead of time. The budget keeps a many-tile save from caching
+    /// the whole world; tiles over it are built on first visit, as before.</summary>
+    private async Task PreloadAreasAsync(VSSaveFile save, ChunkAreas areas, int epoch)
+    {
+        long used = _areaMaps.Values.Sum(m => (long)m.Width * m.Height);
+        // The 16M target turns the 3.9 GB test save into 21 tiles totalling 131M columns, so this
+        // budget caches them all. Without the target the first two areas alone were 66M + 76M and
+        // the old 80M budget built the neighbour only to throw it away.
+        const long budgetCells = 160_000_000;
+        // Preload the nearest neighbours first: the list is ordered by size, not by distance, so on a
+        // save with several patches the first useful switch could otherwise wait behind a huge far one.
+        var main = Map.Terrain?.Area ?? areas.Main;
+        var queue = areas.Areas
+            .Where(a => !ReferenceEquals(a, main) && !_areaMaps.ContainsKey(a))
+            .OrderBy(a => main is null ? a.Index : a.DistanceTo(main.CentreX, main.CentreZ))
+            .ToList();
+        foreach (var area in queue)
+        {
+            if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            if (ReferenceEquals(area, Map.Terrain?.Area) || _areaMaps.ContainsKey(area)) continue;
+            if (main is null || ReferenceEquals(Map.Terrain?.Area, main))
+                Status.Set(StatusChannel.App, $"Preloading {area.Label(areas.Areas.Count)}…");
+            TerrainMap map;
+            var buildTask = Task.Run(() => TerrainMap.BuildInArea(save, area, progress: null, _terrainNeeds, _renderMode));
+            _preloadBuilding = area;
+            _preloadTask = buildTask;
+            try { map = await buildTask; }
+            catch { continue; }
+            finally
+            {
+                if (ReferenceEquals(_preloadBuilding, area))
+                {
+                    _preloadBuilding = null;
+                    _preloadTask = null;
+                }
+            }
+            if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            if (used + area.BlockCells <= budgetCells)
+            {
+                _areaMaps[area] = map;
+                used += area.BlockCells;
+                Map.SetAreaMaps(_areaMaps);
+            }
+            else if (map.Pyramid is { } pyramid)
+            {
+                // The full map is too large to keep, but its coarse pyramid is 4–16 MB and gives the
+                // whole-map overview without pinning another 60–80M-column array set.
+                _areaOverviews[area] = pyramid;
+                Map.SetAreaOverviews(_areaOverviews);
+            }
+        }
+    }
+
+    private async Task PublishAreaAsync(TerrainMap tm, ChunkArea area, int count)
+    {
+        Map.SetTerrain(tm, keepView: true);
+        UpdateExportRegionLabel();
+        Status.Set(StatusChannel.App, $"Showing {area.Label(count)}");
+        // The overlay filter is tied to the grid of the previous area (SetTerrain resets it):
+        // rebuild it for the new one, otherwise it would silently vanish on a switch.
+        if (_filterMap is not null)
+        {
+            _filterMap = null;
+            _filterMapKey = null;
+            _filterMapScope = null;
+            await BuildFilterOverlayAsync();
+        }
     }
 
     /// <summary>
@@ -2123,36 +2212,77 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         var save = _save;
         if (save is null) return;
         if (ReferenceEquals(Map.Terrain?.Area, area)) return; // already shown
+        if (!Map.IsAreaStillWanted(area)) return; // queued request that the viewport has already left
+        if (ReferenceEquals(_areaLoading, area) || ReferenceEquals(_areaQueued, area)) return; // duplicate ping
         if (_areaLoading is not null)
         {
             _areaQueued = area;
             return;
         }
+        // A preloaded/built map is published immediately: no second build, no visible blank.
+        if (_areaMaps.TryGetValue(area, out var cached))
+        {
+            await PublishAreaAsync(cached, area, _areas?.Areas.Count ?? 1);
+            return;
+        }
+
+        var count = _areas?.Areas.Count ?? 1;
+        // The background preload may be building exactly this area. Wait for that task instead of
+        // starting a second 10-second build of the same 20k chunks (the old code did both).
+        var preloadTask = _preloadTask;
+        if (preloadTask is not null && ReferenceEquals(_preloadBuilding, area))
+        {
+            _areaLoading = area;
+            var preloadEpoch = _loadEpoch;
+            Status.Set(StatusChannel.App, $"Waiting for {area.Label(count)}…");
+            try
+            {
+                var tm = await preloadTask;
+                if (preloadEpoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+                if (!_areaMaps.ContainsKey(area))
+                {
+                    _areaMaps[area] = tm;
+                    _areaOverviews.Remove(area);
+                    Map.SetAreaMaps(_areaMaps);
+                    Map.SetAreaOverviews(_areaOverviews);
+                }
+                if (!Map.IsAreaStillWanted(area)) return;
+                await PublishAreaAsync(_areaMaps[area], area, count);
+            }
+            catch (Exception ex)
+            {
+                Status.Set(StatusChannel.App, $"Failed to build area: {ex.Message}", priority: AppStatus.PriorityError);
+            }
+            finally
+            {
+                _areaLoading = null;
+                if (_areaQueued is { } next)
+                {
+                    _areaQueued = null;
+                    _ = LoadAreaAsync(next);
+                }
+            }
+            return;
+        }
 
         _areaLoading = area;
         var epoch = _loadEpoch;
-        var count = _areas?.Areas.Count ?? 1;
         try
         {
             var progress = new UiProgress(pct => Status.Set(StatusChannel.App,
                 $"Building map of area {area.Index + 1} of {count}… {pct}%"));
-            var tm = await Task.Run(() => TerrainMap.BuildInArea(save, area, progress));
+            var tm = await Task.Run(() => TerrainMap.BuildInArea(save, area, progress, _terrainNeeds, _renderMode));
             if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return; // the save changed while we were building
+            // Keep the map even when the viewport has already left: coming back is instant, and a
+            // preload may need it as an extra layer.
+            _areaMaps[area] = tm;
+            _areaOverviews.Remove(area);
+            Map.SetAreaMaps(_areaMaps);
+            Map.SetAreaOverviews(_areaOverviews);
             // While we were building, the user may have moved back: do not swap in an area they
             // have already left (a request for the current area will come with the next map movement).
-            if (!Map.ViewportIntersects(area)) return;
-            Map.SetTerrain(tm, keepView: true);
-            UpdateExportRegionLabel();
-            Status.Set(StatusChannel.App, $"Showing {area.Label(count)}");
-            // The overlay filter is tied to the grid of the previous area (SetTerrain resets it):
-            // rebuild it for the new one, otherwise it would silently vanish on a switch.
-            if (_filterMap is not null)
-            {
-                _filterMap = null;
-                _filterMapKey = null;
-                _filterMapScope = null;
-                await BuildFilterOverlayAsync();
-            }
+            if (!Map.ViewportIntersects(area) || !Map.IsAreaStillWanted(area)) return;
+            await PublishAreaAsync(tm, area, count);
         }
         catch (Exception ex)
         {
@@ -2228,7 +2358,9 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         try
         {
             // save is passed explicitly: opening another save will not close this object under our feet
-            var data = await Task.Run(() => SaveScanner.Scan(save, progress));
+            // captureRaw:false — the full blob of every chunk is not retained; the cards re-read the
+            // working copy on demand (ChunkViewService/PlayersTabService have a DB fallback).
+            var data = await Task.Run(() => SaveScanner.Scan(save, progress, captureRaw: false));
             if (loadEpoch != _loadEpoch) return; // a stale load
             if (!_scan.TryPublish(scan, data)) return; // a stale scan
             sw.Stop();
@@ -2418,6 +2550,48 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         ApplyRenderMode();
         UpdateLayerLabel();
         SaveSettings();
+        // Blocks maps do not carry water depth, and water maps do not carry the rain surface/shadow.
+        // Switching between those families needs one rebuild of the CURRENT area; the cache of the
+        // other areas is dropped so they are not shown with missing fields.
+        _ = EnsureTerrainNeedsAsync();
+    }
+
+    /// <summary>Rebuilds the current area when the selected mode needs arrays the cached map lacks.
+    /// The previous picture stays on screen until the new map is published (keepView).</summary>
+    private async Task EnsureTerrainNeedsAsync()
+    {
+        var save = _save;
+        var area = Map.Terrain?.Area;
+        if (save is null || area is null) return;
+        var needs = TerrainMap.NeedsForMode(_renderMode);
+        if ((Map.Terrain?.Needs ?? TerrainNeeds.None) == needs) return;
+
+        var epoch = _loadEpoch;
+        var count = _areas?.Areas.Count ?? 1;
+        Status.Set(StatusChannel.App, $"Rebuilding map for {TerrainView.ModeName(_renderMode)}…");
+        try
+        {
+            var progress = new UiProgress(pct => Status.Set(StatusChannel.App,
+                $"Rebuilding map for {TerrainView.ModeName(_renderMode)}… {pct}%"));
+            var tm = await Task.Run(() => TerrainMap.BuildInArea(save, area, progress, needs, _renderMode));
+            if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            if (needs != TerrainMap.NeedsForMode(_renderMode)
+                || !ReferenceEquals(Map.Terrain?.Area, area)) return; // mode/area changed while building
+            _terrainNeeds = needs;
+            _areaMaps.Clear();
+            _areaOverviews.Clear();
+            _areaMaps[area] = tm;
+            Map.SetAreaMaps(_areaMaps);
+            Map.SetAreaOverviews(_areaOverviews);
+            Map.SetTerrain(tm, keepView: true);
+            UpdateExportRegionLabel();
+            Status.Set(StatusChannel.App, $"Showing {area.Label(count)} — {TerrainView.ModeName(_renderMode)}");
+            if (_areas is { } areas) _ = PreloadAreasAsync(save, areas, epoch);
+        }
+        catch (Exception ex)
+        {
+            Status.Set(StatusChannel.App, $"Failed to rebuild map for mode: {ex.Message}", priority: AppStatus.PriorityError);
+        }
     }
 
     private void OnHoverTooltipChanged(object? sender, RoutedEventArgs e)
@@ -2585,10 +2759,16 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                     LoadProgress.Value = pct;
                     Status.Set(StatusChannel.App, $"Rebuilding the map of the working copy… {pct}%");
                 });
-                tm = await Task.Run(() => TerrainMap.BuildInArea(save, target, progress));
+                _terrainNeeds = TerrainMap.NeedsForMode(_renderMode);
+                tm = await Task.Run(() => TerrainMap.BuildInArea(save, target, progress, _terrainNeeds, _renderMode));
                 if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return false;
             }
 
+            _areaMaps.Clear();
+            _areaOverviews.Clear();
+            if (target is not null && tm is not null) _areaMaps[target] = tm;
+            Map.SetAreaMaps(_areaMaps);
+            Map.SetAreaOverviews(_areaOverviews);
             var sameArea = oldArea is not null && target is not null
                            && oldArea.MinCx == target.MinCx && oldArea.MinCz == target.MinCz
                            && oldArea.MaxCx == target.MaxCx && oldArea.MaxCz == target.MaxCz;
@@ -2618,13 +2798,16 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
+        // A water-mode export needs WaterDepth; a blocks export needs the rain surface/shadow. If the
+        // current mode changed while the area was cached, build the missing fields before reading pixels.
+        await EnsureTerrainNeedsAsync();
         if (Map.Terrain is not { } tm)
         {
             Status.Set(StatusChannel.App, "World map is not ready yet.");
             return;
         }
 
-        // Export area: the whole world or the chunk region selected on the map (in blocks)
+        // Export area: the whole area or the chunk region selected on the map (in blocks)
         MapRegion? region = null;
         if (_settings.ExportRegionMode == 1)
         {

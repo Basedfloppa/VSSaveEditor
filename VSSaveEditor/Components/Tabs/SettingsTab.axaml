@@ -55,7 +55,7 @@
                 <TextBlock Text="Export area:" />
                 <ComboBox x:Name="ExportRegionBox" SelectedIndex="0" Width="220"
                           ToolTip.Tip="'Selected chunks only' exports just the region selected on the map (left-click chunks, Shift+drag for a region)">
-                    <ComboBoxItem>Whole world</ComboBoxItem>
+                    <ComboBoxItem>Whole area</ComboBoxItem>
                     <ComboBoxItem>Selected chunks only</ComboBoxItem>
                 </ComboBox>
                 <Button x:Name="ClearSelectionBtn" Content="Clear selection" Padding="8,2"

@@ -16,11 +16,11 @@ VS Save Editor opens a `.vcdbs` save directly, builds a map of the world, and le
 
 A world inspection and preparation tool for server owners, modpack maintainers and world designers — for auditing, tuning and preparing a world, not as a shortcut through gameplay.
 
-- **Build a map of a server world.** Render the whole save as a top-down map, switch to a Y level to see caves and ores, and export PNG, JPEG or WebP.
+- **Build a map of a server world.** Render the world as a top-down map, switch to a Y level to see caves and ores, and export PNG, JPEG or WebP. Large saves normally open on the tile containing spawn; pan to build or reveal the other build tiles.
 - **Map a road network.** Search for the block code used by your roads, highlight every matching column, and export a clean map.
 - **Find a lost pet.** Filter creatures by name, species or mod, read its coordinates, and open the chunk.
 - **Audit resource and spawn distribution.** Highlight ore blocks and list creatures by type and location to verify worldgen, spawn balance and modded placement.
-- **Remove a mod safely.** Find every block from the mod's domain, remove or replace it, review the diff, and save a copy before uninstalling the mod.
+- **Remove a mod safely.** Find the block codes left by the mod, remove or replace them, review the diff, and save a copy before uninstalling the mod.
 
 You can also find which chest or player holds an item, edit a player's inventory, or change a creature's health and position.
 
@@ -36,7 +36,7 @@ Opening a save creates a temporary working copy; the original `.vcdbs` is only r
 
 ## Install
 
-Download the asset for your platform from **Releases** (once the first tag is published):
+Download the asset for your platform from **Releases** once the first public release (0.1.0) is available. The `v0.0.x` tags are development tags, not published release assets:
 
 | Platform | Asset |
 |---|---|

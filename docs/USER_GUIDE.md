@@ -15,17 +15,19 @@ by, or connected to Anego Studios or the Vintage Story team.
 
 1. Start VS Save Editor.
 2. Choose **Open…** (`Ctrl+O`), pick a `.vcdbs` file, or choose a recent world from the start panel.
-3. Wait for the background scan. The map appears first; chunk, entity and item indexes fill in as the scan finishes.
+3. Wait for the background scan. The map tile appears first; chunk, entity and item indexes fill in as the scan finishes.
 
 Opening a world creates a disposable **working copy**. The original `.vcdbs` is opened read-only and is never the target of an edit.
 
 ## The map
 
+Large saves are split into **build tiles** of up to 16 million columns each. The map opens on the tile containing the world centre (normally the spawn); neighbouring tiles are preloaded in the background and, at overview zoom, are drawn as separate overview layers. A tile that is not cached yet is built when you pan to it: the status line shows **Preloading…**, **Waiting for area N of M…** or **Building map of area N of M…**.
+
 | Action | Result |
 |---|---|
 | Drag | Pan the map. |
 | Mouse wheel | Zoom in or out. |
-| **Fit** | Frame the currently selected area or the whole world. |
+| **Fit area** | Frame the active build tile — the one currently shown, not every distant pregen patch. |
 | Render mode | Switch between the game-like **Blocks** view and other available modes. |
 | **Y slice** | Show the real block at one Y level. Air stays in the background, so caves and ores become visible. |
 | **Block overlay** | Search the save's own block list, tick codes, and highlight matching columns. |
@@ -33,7 +35,7 @@ Opening a world creates a disposable **working copy**. The original `.vcdbs` is 
 
 Click a chunk to select it. `Shift+LMB` selects a rectangular region; `Shift+RMB` removes chunks from the selection.
 
-The **Export** controls write PNG, JPEG or lossless WebP at 1–8 pixels per block. You can export the current view, the whole area, or only selected chunks, with the current render mode, Y slice and overlay applied.
+The **Settings → Map image export** controls (also **View → Export map image…**) write PNG, JPEG or lossless WebP at 1–8 pixels per block. You can export the active map area (**Whole area**) or only selected chunks, with the current render mode, Y slice and overlay applied. There is no “current view” export: the image always covers a whole build tile or the selection.
 
 ## Tabs
 
@@ -42,13 +44,13 @@ The **Export** controls write PNG, JPEG or lossless WebP at 1–8 pixels per blo
 | **Chunks** | Find a chunk by coordinates, counters or content; inspect its blocks and records. |
 | **Entities** | Find creatures and block entities, inspect their fields, and jump to their chunk. |
 | **Items** | Find who holds an item, in which container and slot, and jump to the owner or chunk. |
+| **Selection** | Delete the selected chunk columns from the working copy. |
 | **Players** | Browse `playerdata`, edit player inventory fields, and show a player on the map when their creature exists. |
 | **Find blocks** | Remove or replace block codes across the world. |
-
-The **Chunks**, **Entities**, **Items**, **Players** and **Find blocks** tabs have a **Search in:** row that limits the search to one chunk, a rectangle or one map area — see [Search scope](#search-scope).
-| **Selection** | Delete the selected chunk columns from the working copy. |
 | **World** | Read version, seed, world size, areas and save diagnostics. |
 | **Settings** | Change map, export and display options. |
+
+The **Chunks**, **Entities**, **Items**, **Players** and **Find blocks** tabs have a **Search in:** row that limits the search to one chunk, a rectangle, the map selection or one map area — see [Search scope](#search-scope).
 
 On the **Entities**, **Items** and **Players** tabs, the list and detail card can be resized with the divider between them. The detail card starts wider than the list.
 
@@ -63,7 +65,8 @@ Each search tab has a **Search in:** row under its toolbar. It limits that tab �
 | The whole save | **Whole save** (the default). |
 | One chunk | Type `15991, 15983` (chunk X and Z) and press Enter, or click **This chunk on the map**. |
 | A rectangle of chunks | Type `15991, 15983, 16010, 16000` — `cx1, cz1, cx2, cz2`. |
-| One map area | Click **Area N of M**; a save with distant pregen patches has several. |
+| The map selection | Tick chunks on the map, then click **The selection (N chunk(s))**. |
+| One map area | Click **Area N of M**; a save with distant pregen patches or a large connected patch has several build tiles. |
 
 The label next to the box names the active scope, and the status line reports how much it found. A rectangle that lies outside every area says so instead of quietly searching the whole save.
 
@@ -77,7 +80,7 @@ How each tab reads the scope:
 | **Entities** | Creatures and block entities standing in the rectangle. |
 | **Items** | Containers and creature inventories in the rectangle. **Player inventories are only listed when the scope is the whole save** — `playerdata` has no position, and a player's backpack travels with the player, not with the chunk. |
 | **Players** | Lists nobody in a chunk scope: only the player's creature is placed in the world, and it is in the Entities tab. |
-| **Find blocks** | The block list and the "Show on map" overlay count only the blocks inside the scope; the overlay itself stays aligned with the whole map. |
+| **Find blocks** | The block list and the "Show on map" overlay count only the blocks inside the scope; the overlay itself stays aligned with the current map area. |
 
 Every scope goes back to the whole save when another save is opened.
 
@@ -122,7 +125,7 @@ chunk:16012,16001
 count>=10
 ```
 
-Terms are combined with AND. A malformed `chunk:` term is reported in the summary without clearing the list. **This chunk** limits the result to the chunk currently shown on the map.
+Terms are combined with AND. A malformed `chunk:` term is reported in the summary without clearing the list. Use the **Search in:** row, or the **This chunk** button, to limit the result to the chunk currently shown on the map.
 
 **Show chunk on map** jumps to the stack's chunk. **Open owner** opens the player or container record.
 
@@ -189,7 +192,7 @@ The game remains the final validator. The editor does not run Vintage Story's ow
 
 | Problem | What to try |
 |---|---|
-| The map is empty after opening | Wait for the scan to finish, then use **Fit**. A world with only unloaded chunks may have little to draw. |
+| The map is empty after opening | Wait for the active map tile to finish building, then pan to a populated tile or use **Fit area**. A world with only unloaded chunks may have little to draw. |
 | The save will not open | Close the game or server that is using it. Check that the file is a `.vcdbs` world, not a backup or an unrelated SQLite database. |
 | Edits are missing in the game | Open the file written by **Save a copy…**, not the original. Deleted chunks are regenerated by the game. |
 | A field cannot be edited | It may be part of an unrecognized payload. Use **Raw payload (hex)** on the record, or leave it unchanged. |

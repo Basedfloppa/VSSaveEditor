@@ -3,15 +3,44 @@ using System.Text;
 
 namespace VSCore;
 
+/// <summary>
+/// What a map has to carry. A blocks-mode map never reads the water thickness or the rain surface of a
+/// height/depth map, so those arrays (and the per-column decoder work for them) are skipped entirely.
+/// </summary>
+[Flags]
+public enum TerrainNeeds
+{
+    None = 0,
+    /// <summary>WaterDepth (bathymetry and the water colour of the heightmap).</summary>
+    Water = 1,
+    /// <summary>MapY/MapBlock: the rain-impermeable surface used by the in-game blocks map.</summary>
+    RainSurface = 2,
+    /// <summary>In-game map lighting (slope + blur).</summary>
+    Shadow = 4,
+    /// <summary>Chisel/MicroBlock material scan.</summary>
+    Chisel = 8,
+    Blocks = RainSurface | Shadow | Chisel,
+    WaterModes = Water,
+    All = Water | RainSurface | Shadow | Chisel
+}
+
 /// <summary>Result of building the terrain map: surface and bottom bound per column (top-down).</summary>
 public sealed class TerrainMap
 {
     public int MinX, MinZ, Width, Height;
-    public int[] SurfaceY;        // absolute surface Y (0 = no data)
-    public int[] BottomY;         // absolute bottom bound of the column (0 = none)
-    public ushort[] TopBlock;     // block id at the surface
-    public int[] WaterDepth;      // real thickness of the water body under the surface (in blocks) for water; otherwise 0
+    public int[] SurfaceY = Array.Empty<int>();   // absolute surface Y (0 = no data)
+    public int[] BottomY = Array.Empty<int>();    // absolute bottom bound of the column (0 = none)
+    public ushort[] TopBlock = Array.Empty<ushort>(); // block id at the surface
+    /// <summary>Real thickness of the water body under the surface (in blocks) for water; otherwise 0.
+    /// null in a blocks-mode build: the in-game map does not use it.</summary>
+    public int[]? WaterDepth;
     public int MaxSurface, MinSurface;
+
+    /// <summary>Which optional arrays/computations this map was built with.</summary>
+    public TerrainNeeds Needs { get; private init; } = TerrainNeeds.All;
+
+    /// <summary>Coarse pre-coloured overview (null for small maps or when the exact map is cheap enough).</summary>
+    public TerrainPyramid? Pyramid { get; private set; }
 
     /// <summary>The Y the game draws the map by: the first rain-IMPERMEABLE block from the top.
     /// Not the same as <see cref="SurfaceY"/>: grass/flowers have rainPermeable=true and the game does not
@@ -80,13 +109,22 @@ public sealed class TerrainMap
         return true;
     }
 
-    /// <summary>Limit of the map area in columns. A column costs four arrays —
-    /// int+int+ushort+int = 14 bytes. It is needed because W and H come from the 22-bit X/Z of a chunk
+    /// <summary>Limit of the map area in columns. A blocks-mode column costs surface/bottom/top plus
+    /// rain-map arrays and shadow (~15 bytes); the water modes add the water depth (4 bytes) and no
+    /// longer allocate the rain-map arrays, so a column is ~19 bytes only when every field is requested. It is needed because W and H come from the 22-bit X/Z of a chunk
     /// (up to 4 Mi blocks each), and two chunks at opposite ends of the world give W×H ~10¹³ columns,
     /// which overflows int and ends in an OOM. The threshold guards against absurdity, not a memory budget:
     /// the largest real save among those checked ("Captured d3e82bd6") yields 79,265,792 columns
     /// (7,552×10,496, ~1.1 GiB of arrays), so 256 Mi is a ~3× margin and still far from 10¹³.</summary>
     public const long MaxCells = 256L * 1024 * 1024;
+
+    /// <summary>What a render mode needs. Blocks is the default and the cheapest; the water modes
+    /// need the water column, which the blocks map never reads.</summary>
+    public static TerrainNeeds NeedsForMode(int mode) => mode switch
+    {
+        TerrainColorizer.ModeBlocks => TerrainNeeds.Blocks,
+        _ => TerrainNeeds.WaterModes,
+    };
 
     /// <summary>Area size check BEFORE allocation: a comprehensible error instead of an OOM
     /// (width/height in blocks).</summary>
@@ -107,196 +145,143 @@ public sealed class TerrainMap
     public static TerrainMap Build(VSSaveFile save, IProgress<double>? progress = null)
         => BuildInArea(save, ChunkAreas.Build(save).Main, progress);
 
+    /// <summary>Builds one area for a render mode, skipping the arrays that mode never reads.</summary>
+    public static TerrainMap BuildForMode(VSSaveFile save, ChunkArea? area, int mode,
+        IProgress<double>? progress = null)
+        => BuildInArea(save, area, progress, NeedsForMode(mode), mode);
+
     /// <summary>
     ///     Map of one area: rows of other areas are not read from the DB and not decoded at all.
-    ///     In a two-area save that is 16,144 rows instead of 155,584 — both in memory and in time
-    ///     (the flat array of phase 1 is sized by the rows: 132 MB against 1.27 GB).
+    ///     In a two-area save that is 16,144 rows instead of 155,584 — both in memory and in time.
+    ///     The columns are max-merged directly into the result arrays, so no whole-map staging array is needed.
     /// </summary>
-    public static TerrainMap BuildInArea(VSSaveFile save, ChunkArea? area, IProgress<double>? progress = null)
+    public static TerrainMap BuildInArea(VSSaveFile save, ChunkArea? area, IProgress<double>? progress = null,
+        TerrainNeeds needs = TerrainNeeds.All, int overviewMode = TerrainColorizer.ModeBlocks)
     {
-        var rows = save.ChunkRowsInWindow(area);
-        int n = rows.Count;
-        int total = Math.Max(1, n);
+        // Positions first, blobs later: the build needs the bounds and the Y range, and only then fetches
+        // the chunks of one Y layer. The old code materialised every blob of the area (518 MiB on the
+        // large save) before decoding, which stayed reachable until the GC decided otherwise.
+        var positions = save.ChunkPositionsInWindow(area);
+        int n = positions.Count;
         var reg = save.BlockRegistry;
+        if (n == 0) return EmptyMap(save, area, 0, 0, needs);
 
-        // Chiselled blocks (Chisel/MicroBlock): their material lives in the block entity, not in the block id.
-        // We scan only if such codes exist in the save at all — otherwise there is zero overhead.
-        bool scanChisel = reg.AnyCodeContains("chisel") || reg.AnyCodeContains("microblock");
-        var chisel = new ConcurrentDictionary<long, long>();
-
-        // Phase 1 (parallel): decode + scan of every chunk into a compact flat array of ulong[1024] per chunk.
-        // The columns of each chunk are independent, so parallelism gives ~xN. Merging the surfaces of a column
-        // (a column may live in several cy chunks) is done afterwards, sequentially, straight into the arrays.
-        // Rain permeability by block id: the hot column-scan loop needs an array,
-        // not a dictionary lookup by code string per block (otherwise 32 lookups per column).
-        var rainPerm = new bool[Math.Max(1, reg.Count)];
-        for (int id = 1; id < rainPerm.Length; id++)
-            rainPerm[id] = BlockColors.IsRainPermeable(reg.CodeOf((ushort)id));
-
-        int[] cxA = new int[n], czA = new int[n], cyA = new int[n];
-        ulong[] flat = new ulong[(long)n * 1024];   // 0 => no data for this column
-        int done = 0;
-        var opts = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
-        Parallel.For(0, n, opts, idx =>
-        {
-            var ch = rows[idx];
-            var (cx, cy, cz) = ChunkPosHelper.DecodeIndex((ulong)ch.Position);
-            cxA[idx] = cx; czA[idx] = cz; cyA[idx] = cy;
-            if (scanChisel) ScanChisel(ch.Data, reg, chisel);
-            ushort[] blocks;
-            try { blocks = ChunkBlockDecoder.DecodeChunkBlocksMergedOnePass(ch.Data); }
-            catch { return; }
-            long fb = (long)idx * 1024;
-            for (int x = 0; x < 32; x++)
-                for (int z = 0; z < 32; z++)
-                {
-                    int baseIdx = x + z * 32;
-                    int top = -1, bottom = 0, rainTop = 0;
-                    ushort rainId = 0;
-                    for (int y = 31; y >= 0; y--)
-                    {
-                        ushort id = blocks[baseIdx + 1024 * y];
-                        if (id == 0) continue;
-                        if (top < 0) top = y;
-                        bottom = y;
-                        if (rainId == 0 && id < rainPerm.Length && !rainPerm[id])
-                        {
-                            rainId = id;
-                            rainTop = y;
-                        }
-                    }
-                    if (top < 0) continue;
-                    ushort topId = blocks[baseIdx + 1024 * top];
-                    int wd = 0;
-                    if (BlockColorPalette.IsWater(reg.CodeOf(topId)))
-                        for (int yy = top; yy >= 0; yy--)
-                        {
-                            if (BlockColorPalette.IsWater(reg.CodeOf(blocks[baseIdx + 1024 * yy]))) wd++;
-                            else break;
-                        }
-                    // hash bit(63) | top_local[62..58] | bottom_local[57..53] | cy[52..50] | topId[49..34] | wd[33..29]
-                    // | rainTop_local[28..24] | rainId[23..8]. The cy field is not read when merging,
-                    // so it was left unoccupied — the rain fields sit in the free lower bits.
-                    ulong v = 1UL << 63
-                        | ((ulong)top << 58) | ((ulong)bottom << 53) | ((ulong)cy << 50)
-                        | ((ulong)topId << 34) | ((ulong)wd << 29)
-                        | ((ulong)rainTop << 24) | ((ulong)rainId << 8);
-                    flat[fb + baseIdx] = v;
-                }
-            int p = Interlocked.Increment(ref done);
-            if (progress != null && (p % 16 == 0 || p == n)) progress.Report((double)p / total);
-        });
-
-        // Phase 2a: world bounds — a parallel min/max reduction over the columns that have data.
-        int minX = int.MaxValue, minZ = int.MaxValue, maxX = int.MinValue, maxZ = int.MinValue;
-        var boundsLock = new object();
-        Parallel.For(0, n, opts,
-            () => (minX: int.MaxValue, minZ: int.MaxValue, maxX: int.MinValue, maxZ: int.MinValue),
-            (i, _, acc) =>
-            {
-                int wxBase = cxA[i] * 32, wzBase = czA[i] * 32;
-                long fb = (long)i * 1024;
-                for (int col = 0; col < 1024; col++)
-                {
-                    if ((flat[fb + col] >> 63) == 0) continue;
-                    int wx = wxBase + (col & 31), wz = wzBase + (col >> 5);
-                    if (wx < acc.minX) acc.minX = wx; if (wx > acc.maxX) acc.maxX = wx;
-                    if (wz < acc.minZ) acc.minZ = wz; if (wz > acc.maxZ) acc.maxZ = wz;
-                }
-                return acc;
-            },
-            acc =>
-            {
-                lock (boundsLock)
-                {
-                    if (acc.minX < minX) minX = acc.minX;
-                    if (acc.minZ < minZ) minZ = acc.minZ;
-                    if (acc.maxX > maxX) maxX = acc.maxX;
-                    if (acc.maxZ > maxZ) maxZ = acc.maxZ;
-                }
-            });
-        // The Y range that has data: from the cy of the decoded chunks. Computed before the bounds check
-        // so that an "empty" map (see EmptyMap) also knows its Y range.
+        int minCx = int.MaxValue, maxCx = int.MinValue, minCz = int.MaxValue, maxCz = int.MinValue;
         int minCy = int.MaxValue, maxCy = int.MinValue;
         for (int i = 0; i < n; i++)
         {
-            int cy = cyA[i];
-            if (cy < minCy) minCy = cy;
-            if (cy > maxCy) maxCy = cy;
+            var (cx, cy, cz) = ChunkPosHelper.DecodeIndex((ulong)positions[i]);
+            if (cx < minCx) minCx = cx; if (cx > maxCx) maxCx = cx;
+            if (cz < minCz) minCz = cz; if (cz > maxCz) maxCz = cz;
+            if (cy < minCy) minCy = cy; if (cy > maxCy) maxCy = cy;
         }
-        if (n == 0) { minCy = 0; maxCy = 0; }
 
-        // All chunks of the area decoded to air (or there is no data): minX > maxX is not a "world
-        // of zero size" but an absence of data. Without a separate branch W×H would be computed from int.MaxValue/
-        // int.MinValue (overflow), producing random bounds and indexing of empty arrays.
-        if (n == 0 || minX > maxX || minZ > maxZ) return EmptyMap(save, area, minCy, maxCy);
-
-        int W = maxX - minX + 1, H = maxZ - minZ + 1;
+        int minX = minCx * 32, minZ = minCz * 32;
+        int W = checked((maxCx - minCx + 1) * 32), H = checked((maxCz - minCz + 1) * 32);
         EnsureAreaFits(W, H);   // W×H may be ~10¹³: checked BEFORE the allocation
         int cells = (int)((long)W * H);
+
+        // Per-id lookup tables for the fused decoder: the hot loop must not call CodeOf/IsWater per cell.
+        // The tables are allocated only for the fields the requested mode actually reads.
+        bool needWater = (needs & TerrainNeeds.Water) != 0;
+        bool needRain = (needs & TerrainNeeds.RainSurface) != 0;
+        bool scanChisel = (needs & TerrainNeeds.Chisel) != 0
+                          && (reg.AnyCodeContains("chisel") || reg.AnyCodeContains("microblock"));
+        // A 64 KiB palette table is always built: sea level (climate tint) is derived from water tops even
+        // in blocks mode, where the per-column water depth itself is skipped.
+        var water = new bool[ushort.MaxValue + 1];
+        for (int id = 0; id < water.Length; id++) water[id] = BlockColorPalette.IsWater(reg.CodeOf(id));
+        var rainPerm = needRain ? new bool[Math.Max(1, reg.Count)] : Array.Empty<bool>();
+        if (needRain)
+            for (int id = 1; id < rainPerm.Length; id++) rainPerm[id] = BlockColors.IsRainPermeable(reg.CodeOf((ushort)id));
+        var chisel = new ConcurrentDictionary<long, long>();
+
         var tm = new TerrainMap
         {
             MinX = minX, MinZ = minZ, Width = W, Height = H,
             SurfaceY = new int[cells],
             BottomY = new int[cells],
             TopBlock = new ushort[cells],
-            WaterDepth = new int[cells],
-            MapY = new ushort[cells],
-            MapBlock = new ushort[cells],
+            WaterDepth = needWater ? new int[cells] : null,
+            MapY = needRain ? new ushort[cells] : null,
+            MapBlock = needRain ? new ushort[cells] : null,
+            Needs = needs,
             MaxSurface = int.MinValue, MinSurface = int.MaxValue,
             MinWorldY = minCy * 32, MaxWorldY = maxCy * 32 + 31,
             Area = area
         };
         // a "no data" sentinel for the max merge (otherwise a real surface at y=0 would look like an empty one)
         for (int i = 0; i < tm.SurfaceY.Length; i++) tm.SurfaceY[i] = int.MinValue;
-
-        // Phase 2b: merging the column candidates. Chunks are grouped by (cx,cz): such a 32×32 block
-        // owns its columns exclusively, so the groups are processed in parallel without races,
-        // and inside a group the max merge by cy gives exactly the same result as a sequential pass.
-        var byColumn = new Dictionary<long, List<int>>(Math.Max(4, n));
         for (int i = 0; i < n; i++)
         {
-            long key = ((long)cxA[i] << 32) | (uint)czA[i];
-            if (!byColumn.TryGetValue(key, out var list)) byColumn[key] = list = new List<int>(4);
-            list.Add(i);
-            tm.PresentChunks.Add((cxA[i], czA[i]));   // real chunks (any cy)
+            var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)positions[i]);
+            tm.PresentChunks.Add((cx, cz));
         }
-        Parallel.ForEach(byColumn.Values, opts, list =>
+
+        int done = 0, anyData = 0;
+        var opts = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+        // position = x | z<<27 | y<<54: sorting is by Y first, then Z, then X. A whole cy layer is
+        // therefore one contiguous primary-key range, and the rows of a layer never share a (cx,cz)
+        // column, so they can write the max-merged columns directly and in parallel. The previous
+        // page-of-groups attempt sliced across Y and read almost the whole save per page.
+        var wanted = new HashSet<long>(positions);
+        long zSpan = ((long)ChunkPosHelper.ChunkMask << 27) | ChunkPosHelper.ChunkMask;
+        for (int cy = minCy; cy <= maxCy; cy++)
         {
-            foreach (int i in list)
-            {
-                int wxBase = cxA[i] * 32, wzBase = czA[i] * 32, cyBase = cyA[i] * 32;
-                long fb = (long)i * 1024;
-                for (int col = 0; col < 1024; col++)
+            long lo = (long)(uint)cy << 54;
+            long hi = lo | zSpan;
+            var all = save.ReadChunkRowsRange(lo, hi, area);
+            var page = new List<VSSaveFile.ChunkRow>(all.Count);
+            foreach (var row in all) if (wanted.Contains(row.Position)) page.Add(row);
+
+            Parallel.For(0, page.Count, opts,
+                () => new ChunkColumnSummary[1024],
+                (i, _, summary) =>
                 {
-                    ulong v = flat[fb + col];
-                    if ((v >> 63) == 0) continue;
-                    int top = (int)((v >> 58) & 31), bottom = (int)((v >> 53) & 31);
-                    int topId = (int)((v >> 34) & 0xFFFF), wd = (int)((v >> 29) & 31);
-                    int rainTop = (int)((v >> 24) & 31), rainId = (int)((v >> 8) & 0xFFFF);
-                    int wx = wxBase + (col & 31), wz = wzBase + (col >> 5);
-                    int wy = cyBase + top;
-                    int idx = (wz - minZ) * W + (wx - minX);
-                    if (wy > tm.SurfaceY[idx])
+                    var row = page[i];
+                    var blob = row.Data;
+                    if (blob is null || blob.Length == 0) return summary;
+                    if (scanChisel) ScanChisel(blob, reg, chisel);
+                    try { ChunkBlockDecoder.DecodeChunkSummary(blob, summary, water, rainPerm, needWater, needRain: needRain); }
+                    catch { return summary; }
+                    var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+                    int cyBase = cy * 32, wxBase = cx * 32, wzBase = cz * 32;
+                    bool any = false;
+                    for (int col = 0; col < 1024; col++)
                     {
-                        tm.SurfaceY[idx] = wy;
-                        tm.BottomY[idx] = cyBase + bottom;
-                        tm.TopBlock[idx] = (ushort)topId;
-                        tm.WaterDepth[idx] = wd;
-                    }
-                    // Merge by cy: we take the topmost non-permeable block of the column.
-                    if (rainId != 0)
-                    {
-                        int rainWy = cyBase + rainTop;
-                        if (rainWy > tm.MapY[idx])
+                        var s = summary[col];
+                        if (s.TopY == 0) continue;
+                        int wx = wxBase + (col & 31), wz = wzBase + (col >> 5);
+                        int idx = (wz - minZ) * W + (wx - minX);
+                        int wy = cyBase + s.TopY - 1;
+                        if (wy > tm.SurfaceY[idx])
                         {
-                            tm.MapY[idx] = (ushort)rainWy;
-                            tm.MapBlock[idx] = (ushort)rainId;
+                            tm.SurfaceY[idx] = wy;
+                            tm.BottomY[idx] = cyBase + s.BottomY - 1;
+                            tm.TopBlock[idx] = s.TopId;
+                            if (tm.WaterDepth is not null) tm.WaterDepth[idx] = s.WaterDepth;
+                            any = true;
+                        }
+                        if (s.RainY != 0 && tm.MapY is not null && tm.MapBlock is not null)
+                        {
+                            int rainWy = cyBase + s.RainY - 1;
+                            if (rainWy > tm.MapY[idx])
+                            {
+                                tm.MapY[idx] = (ushort)rainWy;
+                                tm.MapBlock[idx] = s.RainId;
+                            }
                         }
                     }
-                }
-            }
-        });
+                    if (any) Volatile.Write(ref anyData, 1);
+                    return summary;
+            },
+                _ => { });
+            done += page.Count;
+            if (progress != null) progress.Report((double)done / Math.Max(1, n));
+        }
+        progress?.Report(1.0);
+        if (Volatile.Read(ref anyData) == 0) return EmptyMap(save, area, minCy, maxCy, needs);
+
         // normalise empty cells (SurfaceY=0 = no data) + relief bounds from the final columns
         int len = tm.SurfaceY.Length;
         for (int i = 0; i < len; i++)
@@ -310,21 +295,17 @@ public sealed class TerrainMap
         if (chisel.Count > 0)
             foreach (var kv in chisel) tm.ChiselMaterial[kv.Key] = (int)(uint)kv.Value;
 
-        tm.Registry = save.BlockRegistry.Count > 0 ? save.BlockRegistry : null;
+        tm.Registry = reg.Count > 0 ? reg : null;
         tm.YearRel = save.DetectYearRel() ?? 0.25;
-        tm.SeaLevel = EstimateSeaLevel(tm, save.DetectSpawnY() ?? 0);
-        tm.Shadow = BuildShadow(tm);
+        tm.SeaLevel = EstimateSeaLevel(tm, save.DetectSpawnY() ?? 0, water);
+        if ((needs & TerrainNeeds.Shadow) != 0) tm.Shadow = BuildShadow(tm);
         // Y slices: voxels are read from the save on demand (only the visible area).
         tm.Voxels = new SaveVoxelSource(save.ReadChunk);
+        tm.Pyramid = TerrainPyramid.Build(tm, overviewMode);
         return tm;
     }
 
-    /// <summary>
-    ///     A map without data: 1×1 with zeroed arrays. Needed for "the save has no chunks" and for an area
-    ///     where all chunks decoded to air: otherwise the bounds would be computed from int.Min/MaxValue
-    ///     (int overflow yields random numbers), and the views would index empty arrays.
-    /// </summary>
-    private static TerrainMap EmptyMap(VSSaveFile save, ChunkArea? area, int minCy, int maxCy)
+    private static TerrainMap EmptyMap(VSSaveFile save, ChunkArea? area, int minCy, int maxCy, TerrainNeeds needs = TerrainNeeds.All)
     {
         var tm = new TerrainMap
         {
@@ -335,10 +316,11 @@ public sealed class TerrainMap
             SurfaceY = new int[1],
             BottomY = new int[1],
             TopBlock = new ushort[1],
-            WaterDepth = new int[1],
-            MapY = new ushort[1],
-            MapBlock = new ushort[1],
-            Shadow = new byte[1] { 128 },
+            WaterDepth = (needs & TerrainNeeds.Water) != 0 ? new int[1] : null,
+            MapY = (needs & TerrainNeeds.RainSurface) != 0 ? new ushort[1] : null,
+            MapBlock = (needs & TerrainNeeds.RainSurface) != 0 ? new ushort[1] : null,
+            Shadow = (needs & TerrainNeeds.Shadow) != 0 ? new byte[1] { 128 } : null,
+            Needs = needs,
             YearRel = save.DetectYearRel() ?? 0.25,
             SeaLevel = save.DetectSpawnY() is int sy and > 0 ? sy : 110,
             MinSurface = 0,
@@ -355,17 +337,21 @@ public sealed class TerrainMap
     /// <summary>Sea level as the mode of the water surface: in 1.22 the world height is 512 and the sea level
     /// is not 110 but depends on the world; without this the tint would be computed for the wrong altitude and grass
     /// would drift to brown. If there is no water — 110 (the game default).</summary>
-    private static int EstimateSeaLevel(TerrainMap tm, int spawnY)
+    private static int EstimateSeaLevel(TerrainMap tm, int spawnY, ReadOnlySpan<bool> waterIds)
     {
-        if (tm.MapY is null || tm.WaterDepth is null) return 110;
         int maxY = Math.Max(tm.MaxWorldY, 1);
         var hist = new int[maxY + 1];
         int total = 0;
-        for (int i = 0; i < tm.MapY.Length; i++)
+        for (int i = 0; i < tm.SurfaceY.Length; i++)
         {
-            if (tm.WaterDepth[i] <= 0) continue;
-            int y = tm.MapY[i];
-            if (y <= maxY) { hist[y]++; total++; }
+            // With no water-depth array (blocks mode) the top block is the only source of "this is water".
+            // This is one table lookup per column, not the per-column water run.
+            int top = tm.TopBlock[i];
+            bool water = tm.WaterDepth is { } wd && (uint)i < (uint)wd.Length ? wd[i] > 0
+                : top > 0 && top < waterIds.Length && waterIds[top];
+            if (!water) continue;
+            int y = tm.MapY is { } my ? my[i] : tm.SurfaceY[i];
+            if (y > 0 && y <= maxY) { hist[y]++; total++; }
         }
         int best = 0, bestCount = 0;
         for (int y = 0; y <= maxY; y++)
@@ -385,6 +371,7 @@ public sealed class TerrainMap
     /// </summary>
     private static byte[] BuildShadow(TerrainMap tm)
     {
+        if (tm.MapY is null) return Array.Empty<byte>();
         int W = tm.Width, H = tm.Height, len = W * H;
         var raw = new byte[len];
         for (int z = 0; z < H; z++)

@@ -71,6 +71,7 @@ public class TerrainView : Control
     private int _lastHoverX = int.MinValue, _lastHoverZ = int.MinValue; // the last block under the cursor (avoids a redraw)
     private DispatcherTimer? _layerTimer; // deferred Y-slice rebuild (slider smoothing)
     private int _mode = ModeBlocks;
+    private TerrainColorCache? _colorCache;
     private Vector _pan = new(-0, -0); // bitmap placement inside the control
     private double _ppb = 1.0; // bitmap density (== _wanted, but capped by MaxRegionPpb)
     private Point _pressPos; // where the press started on screen (click vs drag)
@@ -158,6 +159,54 @@ public class TerrainView : Control
     /// </summary>
     public ChunkAreas? Areas { get; private set; }
 
+    /// <summary>Maps of the other areas, built ahead of time (or on first visit). The view draws them
+    /// as separate overview layers while zoomed out, so two nearby areas no longer replace each other.</summary>
+    private readonly Dictionary<ChunkArea, TerrainMap> _areaMaps = new();
+    private readonly Dictionary<ChunkArea, TerrainPyramid> _areaOverviews = new();
+    private readonly List<ExtraLayer> _extraLayers = new();
+    private readonly Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer> _extraCache = new();
+
+    private sealed class ExtraLayer
+    {
+        public ChunkArea Area = null!;
+        public TerrainMap? Map;
+        public MapFrame Frame;
+        public byte[] Pixels = Array.Empty<byte>();
+        public WriteableBitmap? Bitmap;
+        public (ChunkArea Area, double Ppb, int Mode, int Layer) Key;
+    }
+
+    /// <summary>Whether an area map is already available (the window can publish it without rebuilding).</summary>
+    public bool HasAreaMap(ChunkArea area) => _areaMaps.ContainsKey(area);
+
+    /// <summary>Diagnostics: how many extra area overview layers are currently in the drawing list.</summary>
+    public int ExtraAreaLayers => _extraLayers.Count;
+
+    /// <summary>Replaces the set of cached area maps. The current Terrain stays the interactive one;
+    /// all other maps whose bbox is visible become extra overview layers.</summary>
+    public void SetAreaMaps(IReadOnlyDictionary<ChunkArea, TerrainMap> maps)
+    {
+        _areaMaps.Clear();
+        foreach (var kv in maps) _areaMaps[kv.Key] = kv.Value;
+        _extraLayers.Clear();
+        _extraCache.Clear();
+        if (Terrain is not null) RebuildBitmap();
+        InvalidateVisual();
+    }
+
+    /// <summary>Low-resolution overviews of areas whose full maps are deliberately not cached (the
+    /// preload budget): a save with several 60–80M-column areas would otherwise show only the current
+    /// one at a whole-world zoom.</summary>
+    public void SetAreaOverviews(IReadOnlyDictionary<ChunkArea, TerrainPyramid> overviews)
+    {
+        _areaOverviews.Clear();
+        foreach (var kv in overviews) _areaOverviews[kv.Key] = kv.Value;
+        _extraLayers.Clear();
+        _extraCache.Clear();
+        if (Terrain is not null) RebuildBitmap();
+        InvalidateVisual();
+    }
+
     /// <summary>
     ///     The viewport reached an area whose map is not built: the window must build it and
     ///     hand it back through <see cref="SetTerrain(TerrainMap?, bool)"/> with keepView = true (otherwise
@@ -168,6 +217,10 @@ public class TerrainView : Control
     public void SetAreas(ChunkAreas? areas)
     {
         Areas = areas;
+        _areaMaps.Clear();
+        _areaOverviews.Clear();
+        _extraLayers.Clear();
+        _extraCache.Clear();
         InvalidateVisual();
     }
 
@@ -271,6 +324,7 @@ public class TerrainView : Control
     {
         if (LayerY == y) return;
         LayerY = y;
+        _colorCache = null; // colours depend on the Y layer (slice colours and the mask colour)
         // A Y slice requires decoding the chunks of the visible area. Zoomed in that is dozens of chunks
         // (instant), zoomed out it is thousands, so a "wide" view is not rebuilt on every
         // slider value but after a short pause: otherwise dragging the slider queues
@@ -306,6 +360,7 @@ public class TerrainView : Control
     {
         if (_mode == mode) return;
         _mode = mode;
+        _colorCache = null; // the shade/semantics are mode-specific
         RebuildBitmap();
         InvalidateVisual();
     }
@@ -348,6 +403,7 @@ public class TerrainView : Control
     public void SetTerrain(TerrainMap? tm, bool keepView)
     {
         Terrain = tm;
+        _colorCache = null; // belongs to the previous map (or to no map)
         _layerTimer?.Stop(); // the deferred slice belongs to the previous save
         Filter = null; // the match map is tied to the grid of the previous map (area)
         if (!keepView)
@@ -368,6 +424,7 @@ public class TerrainView : Control
         if (tm is null)
         {
             _bmp = null;
+            _extraLayers.Clear();
             _userZoomed = false;
             _lastHoverX = _lastHoverZ = int.MinValue;
             InvalidateVisual();
@@ -505,6 +562,20 @@ public class TerrainView : Control
         return area.MaxX >= vx0 && area.MinX <= vx1 && area.MaxZ >= vz0 && area.MinZ <= vz1;
     }
 
+    /// <summary>The area the viewport would choose right now (the same rule as CheckAreaRequest).</summary>
+    public ChunkArea? PreferredArea()
+    {
+        if (Areas is not { Areas.Count: > 1 } areas) return Terrain?.Area;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        return areas.AreaForViewport(vx0, vz0, vx1, vz1, Terrain?.Area);
+    }
+
+    /// <summary>Whether a map built for <paramref name="area"/> should still be published. A build can take
+    /// seconds; publishing it after the user has moved to another area (or into the void) swaps in a map they
+    /// have already left and hides the piece that was on screen. Intersection alone is not enough — a wide
+    /// viewport may intersect several areas at once.</summary>
+    public bool IsAreaStillWanted(ChunkArea area) => ReferenceEquals(PreferredArea(), area);
+
     /// <summary>Does the visible part of the world intersect the built map? If not, only the background is on screen.</summary>
     private bool ViewportShowsData()
     {
@@ -541,6 +612,110 @@ public class TerrainView : Control
         _focusZ = vh >= h ? minZ + h / 2.0 : Math.Clamp(_focusZ, minZ, maxZ);
     }
 
+    /// <summary>
+    /// Renders the other cached areas as independent overview layers. Only LOD is used: at detail
+    /// level the viewport is small and the primary area covers it; the extra layers exist for the
+    /// zoomed-out view where several distant patches are visible at once.
+    /// </summary>
+    private List<ExtraLayer> BuildExtraLayers(TerrainMap primary, double ppb, int? layer, int mode,
+        double vx0, double vz0, double vx1, double vz1,
+        IReadOnlyDictionary<ChunkArea, TerrainMap> areaMaps,
+        IReadOnlyDictionary<ChunkArea, TerrainPyramid> areaOverviews,
+        IReadOnlyDictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer> cacheSnapshot)
+    {
+        var result = new List<ExtraLayer>();
+        // At detail level the primary area fills the viewport; extras are a zoomed-out feature.
+        // Do NOT require areaMaps: a large neighbour may have only a pyramid cached (its full map
+        // was released by the preload budget), and that pyramid is exactly what should be drawn.
+        if (ppb > 1) return result;
+        foreach (var (area, map) in areaMaps)
+        {
+            if (ReferenceEquals(map, primary)) continue;
+            var key = (area, ppb, mode, layer ?? int.MinValue);
+            if (cacheSnapshot.TryGetValue(key, out var cached) && cached.Bitmap is not null)
+            {
+                result.Add(cached);
+                continue;
+            }
+            if (map.MinX + map.Width - 1 < vx0 || map.MinX > vx1 || map.MinZ + map.Height - 1 < vz0 || map.MinZ > vz1) continue;
+            // A large area at ppb close to 1 would produce a second full-size bitmap; skip it.
+            // A cached coarse pyramid turns another area into a small blit instead of a full-area
+            // per-column LOD pass (which was repeated on every pan/zoom).
+            if (layer is null && map.Pyramid is { } py && py.Mode == mode
+                && py.SuitableFor(ppb, (int)Math.Ceiling(map.Width * ppb), (int)Math.Ceiling(map.Height * ppb)))
+            {
+                var overviewFrame = new MapFrame(map.MinX, map.MinZ, map.Width, map.Height, py.Width, py.Height,
+                    py.Width / (double)map.Width, py.Height / (double)map.Height,
+                    _zoom, _focusX, _focusZ, 1.0, new Vector());
+                result.Add(new ExtraLayer { Area = area, Map = map, Frame = overviewFrame, Pixels = py.Pixels, Key = key });
+                continue;
+            }
+            if ((double)map.Width * map.Height * ppb * ppb > 4_000_000) continue;
+            int w = Math.Max(1, (int)Math.Ceiling(map.Width * ppb));
+            int h = Math.Max(1, (int)Math.Ceiling(map.Height * ppb));
+            byte[] px;
+            try { px = ComputeRegion(map, ppb, map.MinX, map.MinZ, map.Width, map.Height, layer, mode, null, applyFilter: false); }
+            catch { continue; }
+            if (px.Length == 0) continue;
+            var frame = new MapFrame(map.MinX, map.MinZ, map.Width, map.Height, w, h,
+                w / (double)map.Width, h / (double)map.Height,
+                _zoom, _focusX, _focusZ, 1.0, new Vector());
+            result.Add(new ExtraLayer { Area = area, Map = map, Frame = frame, Pixels = px, Key = key });
+        }
+        // Areas without a cached full map still have a pre-coloured pyramid: show it as a coarse layer.
+        foreach (var (area, py) in areaOverviews)
+        {
+            if (ReferenceEquals(area, primary.Area) || areaMaps.ContainsKey(area) || py.Mode != mode) continue;
+            var key = (area, ppb, mode, int.MinValue);
+            if (cacheSnapshot.TryGetValue(key, out var cached) && cached.Bitmap is not null)
+            {
+                result.Add(cached);
+                continue;
+            }
+            if (area.MaxX < vx0 || area.MinX > vx1 || area.MaxZ < vz0 || area.MinZ > vz1) continue;
+            int pw = area.WidthBlocks, ph = area.HeightBlocks;
+            if (!py.SuitableFor(ppb, (int)Math.Ceiling(pw * ppb), (int)Math.Ceiling(ph * ppb))) continue;
+            var overviewFrame = new MapFrame(area.MinX, area.MinZ, pw, ph, py.Width, py.Height,
+                py.Width / (double)pw, py.Height / (double)ph,
+                _zoom, _focusX, _focusZ, 1.0, new Vector());
+            result.Add(new ExtraLayer { Area = area, Map = null, Frame = overviewFrame, Pixels = py.Pixels, Key = key });
+        }
+        return result;
+    }
+
+    private void PublishExtraLayers(List<ExtraLayer> layers)
+    {
+        _extraLayers.Clear();
+        foreach (var layer in layers)
+        {
+            if (layer.Bitmap is not null)
+            {
+                _extraLayers.Add(layer);
+                continue;
+            }
+            var bmp = new WriteableBitmap(new PixelSize(layer.Frame.BmpW, layer.Frame.BmpH),
+                new Vector(96, 96), PixelFormat.Bgra8888, AlphaFormat.Premul);
+            using var fb = bmp.Lock();
+            unsafe
+            {
+                var dst = (byte*)fb.Address;
+                int rowBytes = layer.Frame.BmpW * 4;
+                fixed (byte* p = layer.Pixels)
+                {
+                    var src = p;
+                    for (var y = 0; y < layer.Frame.BmpH; y++)
+                    {
+                        Buffer.MemoryCopy(src, dst + (long)y * fb.RowBytes, rowBytes, rowBytes);
+                        src += rowBytes;
+                    }
+                }
+            }
+            layer.Bitmap = bmp;
+            _extraLayers.Add(layer);
+            _extraCache[layer.Key] = layer;
+        }
+    }
+
     private void RebuildBitmap()
     {
         var tm = Terrain;
@@ -559,6 +734,40 @@ public class TerrainView : Control
         }
 
         var ppb = EffectivePpb();
+        // Coarse overview: one pre-coloured pyramid pixel per CellSize×CellSize block cell. At this
+        // density the exact per-column LOD pass would visit the same blocks only to average them into
+        // the same few pixels; the pyramid makes the whole-map view a bitmap blit.
+        if (LayerY is null && Filter is null && tm.Pyramid is { } pyramid && pyramid.Mode == _mode
+            && pyramid.SuitableFor(ppb, (int)Math.Ceiling(tm.Width * ppb), (int)Math.Ceiling(tm.Height * ppb)))
+        {
+            _ppb = ppb;
+            _zoom = _wanted / Math.Max(1e-9, ppb);
+            _regionLeft = tm.MinX;
+            _regionTop = tm.MinZ;
+            _regionW = tm.Width;
+            _regionH = tm.Height;
+            double srcPpbX = pyramid.Width / (double)tm.Width;
+            double srcPpbY = pyramid.Height / (double)tm.Height;
+            var overviewFrame = new MapFrame(tm.MinX, tm.MinZ, tm.Width, tm.Height, pyramid.Width, pyramid.Height,
+                srcPpbX, srcPpbY, _zoom, _focusX, _focusZ,
+                TopLevel.GetTopLevel(this)?.RenderScaling ?? 1.0, new Vector());
+            _rebuildGen++; // cancel a pending exact rebuild so it cannot replace the overview with a stale frame
+            _rebuildPending = false;
+            // Other cached areas must be shown in the same overview frame; their pyramids are blits too.
+            var (evx0, evz0, evx1, evz1) = VisibleWorld();
+            var extras = BuildExtraLayers(tm, ppb, null, _mode, evx0, evz0, evx1, evz1,
+                new Dictionary<ChunkArea, TerrainMap>(_areaMaps),
+                new Dictionary<ChunkArea, TerrainPyramid>(_areaOverviews),
+                new Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer>(_extraCache));
+            SetBusy(false);
+            PublishBitmap(pyramid.Pixels, overviewFrame);
+            PublishExtraLayers(extras);
+            LodStatus = $"LOD: overview {pyramid.CellSize}×{pyramid.CellSize} (coarse)";
+            LodStatusChanged?.Invoke(LodStatus);
+            InvalidateVisual();
+            return;
+        }
+
         _ppb = ppb;
         _zoom = _wanted / _ppb; // screen pixels per block = _ppb*_zoom = _wanted
 
@@ -609,6 +818,23 @@ public class TerrainView : Control
         var gen = ++_rebuildGen;
         var layer = LayerY;
         var mode = _mode;
+        // The colour cache is keyed by (map, mode, layer). It is created on the UI thread (a zeroed uint[]
+        // commits pages lazily) and captured by the background task, so a newer rebuild cannot swap it
+        // under a running one. Only the detailed view (ppb >= 1) uses it: the whole-map LOD pass visits
+        // every column of the world, and caching that would allocate/fill the full 99 MB array during
+        // the first open for a picture the user usually zooms into immediately.
+        TerrainColorCache? colorCache = null;
+        if (ppb < 1) _colorCache = null; // the LOD pass does not use it; do not hold 99 MB for a whole-map view
+        if (ppb >= 1)
+        {
+            colorCache = _colorCache;
+            if (colorCache is null || !ReferenceEquals(colorCache.Source, tm)
+                || colorCache.Mode != mode || colorCache.Layer != layer)
+            {
+                colorCache = new TerrainColorCache(tm, mode, layer);
+                _colorCache = colorCache;
+            }
+        }
         var ppbLocal = _ppb;
         var regLeft = left;
         var regTop = top;
@@ -618,17 +844,23 @@ public class TerrainView : Control
         var bmpH = h;
         // A frame captures both the content and the transform - it is published atomically
         var frame = new MapFrame(left, top, rw, rh, w, h, ppbLocal, _zoom, _focusX, _focusZ, rs, _pan);
+        var (vy0x, vy0z, vy1x, vy1z) = VisibleWorld();
+        var areaMapsSnapshot = new Dictionary<ChunkArea, TerrainMap>(_areaMaps);
+        var overviewSnapshot = new Dictionary<ChunkArea, TerrainPyramid>(_areaOverviews);
+        var extraCacheSnapshot = new Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer>(_extraCache);
         Task.Run(() =>
         {
             byte[] px;
             try
             {
-                px = ComputeRegion(tm, ppbLocal, regLeft, regTop, regW, regH, layer, mode);
+                px = ComputeRegion(tm, ppbLocal, regLeft, regTop, regW, regH, layer, mode, colorCache);
             }
             catch
             {
                 px = Array.Empty<byte>();
             }
+            var extras = BuildExtraLayers(tm, ppbLocal, layer, mode, vy0x, vy0z, vy1x, vy1z,
+                areaMapsSnapshot, overviewSnapshot, extraCacheSnapshot);
 
             Dispatcher.UIThread.Post(() =>
             {
@@ -640,6 +872,7 @@ public class TerrainView : Control
                 } // stale
 
                 if (px.Length > 0) PublishBitmap(px, frame);
+                PublishExtraLayers(extras);
                 if (_rebuildPending)
                 {
                     _rebuildPending = false;
@@ -721,25 +954,29 @@ public class TerrainView : Control
     ///     that the frame lacks (otherwise there would be "holes"); while a background rebuild runs we allow
     ///     it so zoom/drag do not stick.
     /// </summary>
-    private (double zoom, double panX, double panY, double focusX, double focusZ, double ppbOnScreen)
-        DisplayTransform(MapFrame f)
+    private (double zoomX, double zoomY, double panX, double panY, double focusX, double focusZ,
+        double ppbX, double ppbY) DisplayTransform(MapFrame f)
     {
         var canSoft = _bmp is not null && (IsRebuilding || RegionCoversWorldVisible(f));
-        if (!canSoft) return (f.Zoom, f.Pan.X, f.Pan.Y, f.FocusX, f.FocusZ, f.Ppb * f.Zoom);
-        var zoom = _wanted / f.Ppb;
-        return (zoom,
-            ViewportW / 2 / zoom - (_focusX - f.Left) * f.Ppb,
-            ViewportH / 2 / zoom - (_focusZ - f.Top) * f.Ppb,
-            _focusX, _focusZ, _wanted);
+        if (!canSoft)
+            return (f.Zoom, f.Zoom, f.Pan.X, f.Pan.Y, f.FocusX, f.FocusZ,
+                f.Ppb * f.Zoom, f.PpbY * f.Zoom);
+        var zoomX = _wanted / f.Ppb;
+        var zoomY = _wanted / f.PpbY;
+        return (zoomX, zoomY,
+            ViewportW / 2 / zoomX - (_focusX - f.Left) * f.Ppb,
+            ViewportH / 2 / zoomY - (_focusZ - f.Top) * f.PpbY,
+            _focusX, _focusZ, _wanted, _wanted);
     }
 
     /// <summary>The world point at the viewport centre for the DISPLAYED frame (used for consistency checks and hints).</summary>
     public (double wx, double wz) DisplayCenterWorld()
     {
         if (_bmp is null || _frame is not { } f) return (_focusX, _focusZ);
-        var (zoom, panX, panY, _, _, _) = DisplayTransform(f);
+        var (zoomX, zoomY, panX, panY, _, _, _, _) = DisplayTransform(f);
         double cx = ViewportW / 2, cy = ViewportH / 2;
-        return (f.Left + (cx / zoom - panX) / f.Ppb, f.Top + (cy / zoom - panY) / f.Ppb);
+        return (f.Left + (cx / zoomX - panX) / f.Ppb,
+            f.Top + (cy / zoomY - panY) / f.PpbY);
     }
 
     /// <summary>
@@ -813,8 +1050,11 @@ public class TerrainView : Control
     ///     (see <see cref="TerrainColorizer.SliceColor" />), and air stays transparent (= the map background).
     ///     Voxels are read on demand, only for the visible area (<see cref="TerrainMap.Voxels" />).
     /// </summary>
-    private byte[] ComputeRegion(TerrainMap tm, double ppb, int left, int top, int rw, int rh, int? layerY, int mode)
+    private byte[] ComputeRegion(TerrainMap tm, double ppb, int left, int top, int rw, int rh, int? layerY, int mode,
+        TerrainColorCache? colorCache, bool applyFilter = true)
     {
+        // Extra area layers are drawn without the active-area filter: the filter grid belongs to Terrain.
+        var filter = applyFilter ? Filter : null;
         var W = tm.Width;
         double range = tm.MaxSurface - tm.MinSurface;
         if (range <= 0) range = 1;
@@ -835,13 +1075,13 @@ public class TerrainView : Control
                     int wx = left + x, wz = top + z;
                     byte R = 0, G = 0, B = 0;
                     var draw = false;
-                    if (Filter is not null)
+                    if (filter is not null)
                     {
-                        var fi = FilterGridIndex(wx, wz);
-                        if (fi >= 0 && Filter.Count[fi] > 0)
+                        var fi = FilterGridIndex(filter, wx, wz);
+                        if (fi >= 0 && filter.Count[fi] > 0)
                         {
-                            var c = FilterColor(Filter.TopBlock[fi]);
-                            var boost = Math.Min(70, Filter.Count[fi] * 14); // saturation by the number of blocks in the column
+                            var c = FilterColor(filter.TopBlock[fi]);
+                            var boost = Math.Min(70, filter.Count[fi] * 14); // saturation by the number of blocks in the column
                             R = (byte)Math.Min(255, c.R + boost);
                             G = (byte)Math.Min(255, c.G + boost);
                             B = (byte)Math.Min(255, c.B + boost);
@@ -860,25 +1100,44 @@ public class TerrainView : Control
                     {
                         if (slice)
                         {
-                            var (sr, sg, sb, has) = TerrainColorizer.SliceColor(tm, wx, layerY!.Value, wz, mode, range);
-                            if (has)
+                            bool has;
+                            if (colorCache is not null)
                             {
-                                R = sr;
-                                G = sg;
-                                B = sb;
-                                draw = true;
-                            } // air at the level is background (alpha 0)
+                                var packed = TerrainColorizer.SliceColorCached(tm, i, wx, layerY!.Value, wz, mode, range, colorCache);
+                                has = TerrainColorCache.HasBlock(packed);
+                                R = TerrainColorCache.R(packed);
+                                G = TerrainColorCache.G(packed);
+                                B = TerrainColorCache.B(packed);
+                            }
+                            else
+                            {
+                                var (sr, sg, sb, h) = TerrainColorizer.SliceColor(tm, wx, layerY!.Value, wz, mode, range);
+                                has = h;
+                                R = sr; G = sg; B = sb;
+                            }
+                            if (has) draw = true; // air at the level is background (alpha 0)
                         }
                         else if (tm.SurfaceY[i] > 0)
                         {
-                            var v = tm.SurfaceY[i];
-                            var (r0, g0, b0) = TerrainColorizer.ColumnColor(tm, i, v, layerY, mode, range);
-                            var sh = TerrainColorizer.ExtraShade(tm, i, mode);
-                            if (Filter is not null && _filterDimOthers)
-                                sh *= 0.35; // dim the base map under the overlay
-                            R = (byte)Math.Clamp(r0 * sh, 0, 255);
-                            G = (byte)Math.Clamp(g0 * sh, 0, 255);
-                            B = (byte)Math.Clamp(b0 * sh, 0, 255);
+                            if (colorCache is null || (filter is not null && _filterDimOthers))
+                            {
+                                // The cache stores the already-clamped ShadedContribution; dimming it after
+                                // the clamp is not the same as the old clamp(c * shade * 0.35). Keep the
+                                // exact path while the "dim others" overlay is on (and when there is no cache).
+                                var c = TerrainColorizer.ColumnColor(tm, i, tm.SurfaceY[i], layerY, mode, range);
+                                var sh = TerrainColorizer.ExtraShade(tm, i, mode);
+                                if (filter is not null && _filterDimOthers) sh *= 0.35;
+                                R = (byte)Math.Clamp(c.R * sh, 0, 255);
+                                G = (byte)Math.Clamp(c.G * sh, 0, 255);
+                                B = (byte)Math.Clamp(c.B * sh, 0, 255);
+                            }
+                            else
+                            {
+                                var packed = TerrainColorizer.ColumnColorCached(tm, i, tm.SurfaceY[i], layerY, mode, range, colorCache);
+                                R = TerrainColorCache.R(packed);
+                                G = TerrainColorCache.G(packed);
+                                B = TerrainColorCache.B(packed);
+                            }
                             draw = true;
                         }
                     }
@@ -925,28 +1184,35 @@ public class TerrainView : Control
                         var i = (z - tm.MinZ) * W + (x0 - tm.MinX);
                         for (var x = x0; x < x1; x++)
                         {
-                            if (Filter is not null)
+                            if (filter is not null)
                             {
-                                var fi = FilterGridIndex(x, z);
-                                if (fi >= 0 && Filter.Count[fi] > 0)
+                                var fi = FilterGridIndex(filter, x, z);
+                                if (fi >= 0 && filter.Count[fi] > 0)
                                 {
-                                    if (!hitAny) hitColor = FilterColor(Filter.TopBlock[fi]);
+                                    if (!hitAny) hitColor = FilterColor(filter.TopBlock[fi]);
                                     hitAny = true;
-                                    hitCells += Filter.Count[fi];
+                                    hitCells += filter.Count[fi];
                                 }
                             }
 
                             if (slice)
                             {
                                 // at the Y level only count columns that have a block: air is background
-                                var (sr, sg, sb, has) =
-                                    TerrainColorizer.SliceColor(tm, x, layerY!.Value, z, mode, range);
-                                if (has)
+                                if (colorCache is not null)
                                 {
-                                    rS += sr;
-                                    gS += sg;
-                                    bS += sb;
-                                    seen++;
+                                    var packed = TerrainColorizer.SliceColorCached(tm, i, x, layerY!.Value, z, mode, range, colorCache);
+                                    if (TerrainColorCache.HasBlock(packed))
+                                    {
+                                        rS += TerrainColorCache.R(packed);
+                                        gS += TerrainColorCache.G(packed);
+                                        bS += TerrainColorCache.B(packed);
+                                        seen++;
+                                    }
+                                }
+                                else
+                                {
+                                    var (sr, sg, sb, has) = TerrainColorizer.SliceColor(tm, x, layerY!.Value, z, mode, range);
+                                    if (has) { rS += sr; gS += sg; bS += sb; seen++; }
                                 }
 
                                 i++;
@@ -967,15 +1233,21 @@ public class TerrainView : Control
                             }
                             else
                             {
-                                var c = TerrainColorizer.ColumnColor(tm, i, v, layerY, mode, range);
-                                var sh = TerrainColorizer.ExtraShade(tm, i, mode);
-                                // The clamp lives inside ShadedContribution: without it the sum overflows the byte
-                                // (shade up to 1.48 × snow 251 > 255) and (byte)(rS/seen) wraps around -
-                                // white snow turns black while yellow flowers stay bright.
-                                var add = TerrainColorizer.ShadedContribution(c, sh);
-                                rS += add.R;
-                                gS += add.G;
-                                bS += add.B;
+                                // The cache stores ShadedContribution: already clamped before summing, which is
+                                // mandatory (shade up to 1.48 × snow 251 > 255 would wrap the average byte).
+                                if (colorCache is not null)
+                                {
+                                    var packed = TerrainColorizer.ColumnColorCached(tm, i, v, layerY, mode, range, colorCache);
+                                    rS += TerrainColorCache.R(packed);
+                                    gS += TerrainColorCache.G(packed);
+                                    bS += TerrainColorCache.B(packed);
+                                }
+                                else
+                                {
+                                    var c = TerrainColorizer.ColumnColor(tm, i, v, layerY, mode, range);
+                                    var add = TerrainColorizer.ShadedContribution(c, TerrainColorizer.ExtraShade(tm, i, mode));
+                                    rS += add.R; gS += add.G; bS += add.B;
+                                }
                             }
 
                             i++;
@@ -991,7 +1263,7 @@ public class TerrainView : Control
                         G = (byte)Math.Min(255, hitColor.G + boost);
                         B = (byte)Math.Min(255, hitColor.B + boost);
                     }
-                    else if (Filter is not null && !_filterDimOthers)
+                    else if (filter is not null && !_filterDimOthers)
                     {
                         R = FilterBackground.R;
                         G = FilterBackground.G;
@@ -1019,7 +1291,7 @@ public class TerrainView : Control
                             B = (byte)(bS / seen);
                         }
 
-                        if (Filter is not null && _filterDimOthers) // dim the base map under the overlay
+                        if (filter is not null && _filterDimOthers) // dim the base map under the overlay
                         {
                             R = (byte)(R * 0.35);
                             G = (byte)(G * 0.35);
@@ -1073,15 +1345,46 @@ public class TerrainView : Control
     }
 
     /// <summary>Column index in the filter grid (-1 = out of bounds / no filter).</summary>
-    private int FilterGridIndex(int wx, int wz)
+    private int FilterGridIndex(int wx, int wz) => FilterGridIndex(Filter, wx, wz);
+
+    private int FilterGridIndex(BlockFilterMap? f, int wx, int wz)
     {
-        var f = Filter;
         if (f is null) return -1;
         if (wx < f.MinX || wz < f.MinZ || wx >= f.MinX + f.Width || wz >= f.MinZ + f.Height) return -1;
         return (wz - f.MinZ) * f.Width + (wx - f.MinX);
     }
 
     // ===================== RENDERING =====================
+
+    /// <summary>Draws cached non-primary areas. Their frames always cover the whole area at the current
+    /// LOD density, so a pan/zoom only scales the ready bitmap; the primary area is drawn afterwards.
+    /// The transform is derived from the PRIMARY frame, not from the live focus: while an exact frame is
+    /// frozen during a rebuild, using the live focus shifted every extra area relative to the primary map.</summary>
+    private void DrawExtraLayers(DrawingContext dc, MapFrame primaryFrame)
+    {
+        var (primaryZoomX, primaryZoomY, primaryPanX, primaryPanY, _, _, _, _) = DisplayTransform(primaryFrame);
+        double screenPpbX = primaryFrame.Ppb * primaryZoomX;
+        double screenPpbY = primaryFrame.PpbY * primaryZoomY;
+        if (!(screenPpbX > 0) || !(screenPpbY > 0)
+            || double.IsInfinity(screenPpbX) || double.IsInfinity(screenPpbY)) return;
+        foreach (var layer in _extraLayers)
+        {
+            if (layer.Bitmap is null) continue;
+            var f = layer.Frame;
+            double zoomX = screenPpbX / f.Ppb;
+            double zoomY = screenPpbY / f.PpbY;
+            if (!(zoomX > 0) || !(zoomY > 0) || double.IsInfinity(zoomX) || double.IsInfinity(zoomY)) continue;
+            // Place the extra bitmap through the PRIMARY frame's screen mapping. This keeps every area
+            // in the same coordinate system even when the primary frame is frozen during a rebuild.
+            // Translation is in pre-scale units (the matrix scales it), hence the division by zoom.
+            double screenX0 = primaryPanX * primaryZoomX + (f.Left - primaryFrame.Left) * screenPpbX;
+            double screenY0 = primaryPanY * primaryZoomY + (f.Top - primaryFrame.Top) * screenPpbY;
+            double panX = screenX0 / zoomX;
+            double panY = screenY0 / zoomY;
+            using (dc.PushTransform(Matrix.CreateTranslation(panX, panY) * Matrix.CreateScale(zoomX, zoomY)))
+                dc.DrawImage(layer.Bitmap, new Rect(0, 0, layer.Bitmap.PixelSize.Width, layer.Bitmap.PixelSize.Height));
+        }
+    }
 
     public override void Render(DrawingContext dc)
     {
@@ -1102,13 +1405,14 @@ public class TerrainView : Control
             DrawCenteredText(dc, "Rendering the map…");
             return;
         }
-        var (dispZoom, dispPanX, dispPanY, _, _, _) = DisplayTransform(frame);
-        var m = Matrix.CreateTranslation(dispPanX, dispPanY) * Matrix.CreateScale(dispZoom, dispZoom);
+        DrawExtraLayers(dc, frame);
+        var (dispZoomX, dispZoomY, dispPanX, dispPanY, _, _, _, _) = DisplayTransform(frame);
+        var m = Matrix.CreateTranslation(dispPanX, dispPanY) * Matrix.CreateScale(dispZoomX, dispZoomY);
         using (dc.PushTransform(m))
         {
             dc.DrawImage(_bmp, new Rect(0, 0, _bmp.PixelSize.Width, _bmp.PixelSize.Height));
 
-            var cellPx = 32.0 * frame.Ppb; // chunk size in bitmap pixels
+            var cellPx = 32.0 * Math.Max(frame.Ppb, frame.PpbY); // chunk size in bitmap pixels
             // draw the grid only when chunks are legible; zoomed far out the cells merge, so skip it
             if (_showChunkGrid && Terrain.PresentChunks.Count > 0 && cellPx >= 3.0)
             {
@@ -1126,9 +1430,9 @@ public class TerrainView : Control
                     double gx0 = cx * 32.0, gy0 = cz * 32.0;
                     if (gx0 + 32 < x0b || gx0 > x1b || gy0 + 32 < y0b || gy0 > y1b) continue; // outside the region
                     var x0 = Math.Clamp((gx0 - frame.Left) * frame.Ppb, 0, bw);
-                    var y0 = Math.Clamp((gy0 - frame.Top) * frame.Ppb, 0, bh);
+                    var y0 = Math.Clamp((gy0 - frame.Top) * frame.PpbY, 0, bh);
                     var x1 = Math.Clamp((gx0 + 32.0 - frame.Left) * frame.Ppb, 0, bw);
-                    var y1 = Math.Clamp((gy0 + 32.0 - frame.Top) * frame.Ppb, 0, bh);
+                    var y1 = Math.Clamp((gy0 + 32.0 - frame.Top) * frame.PpbY, 0, bh);
                     dc.DrawLine(GridPen, new Point(x0, y0), new Point(x1, y0));
                     dc.DrawLine(GridPen, new Point(x1, y0), new Point(x1, y1));
                     dc.DrawLine(GridPen, new Point(x1, y1), new Point(x0, y1));
@@ -1146,9 +1450,9 @@ public class TerrainView : Control
                     double gx0 = cx * 32.0, gy0 = cz * 32.0;
                     if (gx0 + 32 < x0b || gx0 > x1b || gy0 + 32 < y0b || gy0 > y1b) continue; // outside the region
                     var x0 = (gx0 - frame.Left) * frame.Ppb;
-                    var y0 = (gy0 - frame.Top) * frame.Ppb;
+                    var y0 = (gy0 - frame.Top) * frame.PpbY;
                     var x1 = (gx0 + 32.0 - frame.Left) * frame.Ppb;
-                    var y1 = (gy0 + 32.0 - frame.Top) * frame.Ppb;
+                    var y1 = (gy0 + 32.0 - frame.Top) * frame.PpbY;
                     dc.FillRectangle(SelFill, new Rect(x0, y0, x1 - x0, y1 - y0));
                     dc.DrawRectangle(SelPen, new Rect(x0, y0, x1 - x0, y1 - y0));
                 }
@@ -1343,8 +1647,8 @@ public class TerrainView : Control
     {
         if (_bmp is null || _frame is not { } f)
             return (_focusX + (sx - ViewportW / 2) / _wanted, _focusZ + (sy - ViewportH / 2) / _wanted);
-        var (_, _, _, dfx, dfz, dppb) = DisplayTransform(f);
-        return (dfx + (sx - ViewportW / 2) / dppb, dfz + (sy - ViewportH / 2) / dppb);
+        var (_, _, _, _, dfx, dfz, dppbX, dppbY) = DisplayTransform(f);
+        return (dfx + (sx - ViewportW / 2) / dppbX, dfz + (sy - ViewportH / 2) / dppbY);
     }
 
     private double WorldX(double px)
@@ -1365,11 +1669,20 @@ public class TerrainView : Control
     private readonly struct MapFrame
     {
         public readonly int Left, Top, RegionW, RegionH, BmpW, BmpH;
-        public readonly double Ppb, Zoom, FocusX, FocusZ, Rs;
+        /// <summary>Bitmap pixels per block on X and Y. A pyramid's output size is rounded up on
+        /// each axis independently (e.g. 2336×25600 with CellSize 13 gives 180×1970), so using one
+        /// density for both axes stretched the layer and put distant areas at the wrong Z.</summary>
+        public readonly double Ppb, PpbY, Zoom, FocusX, FocusZ, Rs;
         public readonly Vector Pan;
 
         public MapFrame(int left, int top, int rw, int rh, int bw, int bh,
             double ppb, double zoom, double focusX, double focusZ, double rs, Vector pan)
+            : this(left, top, rw, rh, bw, bh, ppb, ppb, zoom, focusX, focusZ, rs, pan)
+        {
+        }
+
+        public MapFrame(int left, int top, int rw, int rh, int bw, int bh,
+            double ppb, double ppbY, double zoom, double focusX, double focusZ, double rs, Vector pan)
         {
             Left = left;
             Top = top;
@@ -1378,6 +1691,7 @@ public class TerrainView : Control
             BmpW = bw;
             BmpH = bh;
             Ppb = ppb;
+            PpbY = ppbY;
             Zoom = zoom;
             FocusX = focusX;
             FocusZ = focusZ;

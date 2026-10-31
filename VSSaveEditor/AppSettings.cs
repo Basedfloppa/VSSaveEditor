@@ -37,7 +37,7 @@ public sealed class AppSettings
     } // MapFilterRender: 0 = dimmed map + highlight, 1 = full map, 2 = matches only (transparent), 3 = matches only (dark background)
 
     public bool ExportTransparentBg { get; set; } // transparent background instead of the editor background colour (areas without data)
-    public int ExportRegionMode { get; set; } // 0 = whole world, 1 = selected chunks only
+    public int ExportRegionMode { get; set; } // 0 = whole area, 1 = selected chunks only
 
     // ---- last dialog folders: no need to open the same directory from scratch every time ----
     public string? LastOpenDir { get; set; } // last opened/loaded .vcdbs

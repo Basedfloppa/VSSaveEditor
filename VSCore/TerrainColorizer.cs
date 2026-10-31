@@ -50,13 +50,14 @@ public static class TerrainColorizer
         {
             // Bathymetry: only the ocean is informative, land is a neutral background.
             if (!BlockColorPalette.IsWater(code)) return ((byte)120, (byte)124, (byte)110);
-            return DepthColor(Math.Max(0, tm.WaterDepth[i]));
+            int depth = tm.WaterDepth is { } wd && (uint)i < (uint)wd.Length ? Math.Max(0, wd[i]) : 0;
+            return DepthColor(depth);
         }
         if (layerY is int l)
             return tm.BottomY[i] > 0 && tm.BottomY[i] <= l && l <= tm.SurfaceY[i] ? ((byte)150, (byte)150, (byte)30) : ((byte)210, (byte)210, (byte)235);
         if (BlockColorPalette.IsWater(code))
         {
-            int depth = Math.Max(0, tm.WaterDepth[i]);
+            int depth = tm.WaterDepth is { } wd && (uint)i < (uint)wd.Length ? Math.Max(0, wd[i]) : 0;
             double d = Math.Clamp(depth / 7.0, 0, 1);
             return ((byte)Mix(64, 12, d), (byte)Mix(155, 55, d), (byte)Mix(225, 130, d));
         }
@@ -69,6 +70,36 @@ public static class TerrainColorizer
         }
         double t = (v - tm.MinSurface) / range;
         return ((byte)(90 + t * 160), (byte)(175 - t * 90), (byte)(45 + t * 130));
+    }
+
+    /// <summary>
+    /// Cached surface colour: ColumnColor + ExtraShade, clamped exactly like the renderer did
+    /// (ShadedContribution). The cache is filled lazily per visible column, so a large save pays only
+    /// for what was actually shown.
+    /// </summary>
+    public static uint ColumnColorCached(TerrainMap tm, int i, int v, int? layer, int mode,
+        double range, TerrainColorCache cache)
+    {
+        uint packed = cache.Get(i);
+        if (packed != 0) return packed;
+        var c = ColumnColor(tm, i, v, layer, mode, range);
+        var sh = ExtraShade(tm, i, mode);
+        var add = ShadedContribution(c, sh);
+        packed = TerrainColorCache.Pack(true, (byte)add.R, (byte)add.G, (byte)add.B);
+        cache.Set(i, packed);
+        return packed;
+    }
+
+    /// <summary>Cached Y-slice colour (also memoises "air at this level" via the Has bit).</summary>
+    public static uint SliceColorCached(TerrainMap tm, int i, int wx, int wy, int wz, int mode,
+        double range, TerrainColorCache cache)
+    {
+        uint packed = cache.Get(i);
+        if (packed != 0) return packed;
+        var (r, g, b, has) = SliceColor(tm, wx, wy, wz, mode, range);
+        packed = TerrainColorCache.Pack(has, r, g, b);
+        cache.Set(i, packed);
+        return packed;
     }
 
     /// <summary>

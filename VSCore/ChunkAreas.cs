@@ -5,12 +5,15 @@ using System.Linq;
 namespace VSCore;
 
 /// <summary>
-/// The rectangle of a connected group of (cx,cz) columns — a world "area" that the map shows
-/// in its own window. A save may contain several such groups: a typical case is a pregen
-/// started away from spawn, which adds a patch of chunks at the edge of the map.
+/// One build tile of (cx,cz) columns — a world "area" that the map shows in its own window.
+/// A connected group of chunks is cut into such tiles when its bounding box exceeds
+/// <see cref="ChunkAreas.TargetCells"/>; a save may also contain several distant groups (a pregen
+/// started away from spawn, for example).
 /// One map for all groups cannot be built: the bounding box of two patches at opposite edges
-/// of a 512000×512000 world is ~6.6e10 columns, i.e. hundreds of GiB (see <see cref="TerrainMap.MaxCells"/>),
-/// so the map is built for one area and the others are loaded when the user scrolls further.
+/// of a 512000×512000 world is ~6.6e10 columns, i.e. hundreds of GiB (see <see cref="TerrainMap.MaxCells"/>).
+/// Each connected group is therefore cut into build tiles of at most <see cref="TargetCells"/>
+/// columns; the tile under the viewport is the active map and the neighbouring tiles are preloaded
+/// and drawn as overview layers.
 /// </summary>
 public sealed class ChunkArea
 {
@@ -29,7 +32,7 @@ public sealed class ChunkArea
     public int Rows { get; init; }
 
     /// <summary>The area containing the world centre (where spawn is) — that is the one that opens first.
-    /// Set by <see cref="ChunkAreas.Build(IReadOnlyCollection{long}, (int, int)?)"/> after sorting.</summary>
+    /// Set by <see cref="ChunkAreas.Build(IReadOnlyCollection{long}, (int, int)?, long)"/> after sorting.</summary>
     public bool IsMain { get; set; }
 
     public int MinX => MinCx * 32;
@@ -64,8 +67,10 @@ public sealed class ChunkArea
 }
 
 /// <summary>
-/// All areas (connected groups of chunks) of a save plus the map panning domain.
-/// Built from chunk positions (no data is read) — a fraction of a second even for 155,000 rows.
+/// All build tiles of a save plus the map panning domain. Connected groups are split at
+/// <see cref="TargetCells"/> so that no single map has to allocate the full bounding box of a
+/// sprawling patch. Built from chunk positions (no data is read) — a fraction of a second even
+/// for 155,000 rows.
 /// </summary>
 public sealed class ChunkAreas
 {
@@ -105,13 +110,27 @@ public sealed class ChunkAreas
     public int TotalColumns { get; }
     public int TotalRows { get; }
 
-    public static ChunkAreas Build(VSSaveFile save)
-        => Build(save.ChunkPositions, save.DetectWorldSize());
+    public static ChunkAreas Build(VSSaveFile save, long targetCells = TargetCells)
+        => Build(save.ChunkPositions, save.DetectWorldSize(), targetCells);
+
+    /// <summary>
+    ///     Build target for one area: 16 Mi columns. This is deliberately much smaller than
+    ///     <see cref="TerrainMap.MaxCells"/> (256 Mi): the hard limit only prevents an OOM, while a
+    ///     smaller target keeps the first map quick and limits the empty padding of a sparse group.
+    ///     On the 3.9 GB test save this turns a 66 Mi-column first area into an ~11.7 Mi start tile and
+    ///     reduces the total bounding-box area of all areas by about a third (203 Mi -> 131 Mi).
+    /// </summary>
+    public const long TargetCells = 16L * 1024 * 1024;
 
     /// <summary>Clusters chunk columns into connected groups (8 neighbours) and splits the groups
-    /// whose bounding box does not fit into <see cref="TerrainMap.MaxCells"/>.</summary>
-    public static ChunkAreas Build(IReadOnlyCollection<long> chunkPositions, (int Width, int Length)? worldSize)
+    /// whose bounding box is larger than <paramref name="targetCells"/> (16 Mi by default). A group
+    /// is never left above <see cref="TerrainMap.MaxCells"/> unless it is a single column.</summary>
+    public static ChunkAreas Build(IReadOnlyCollection<long> chunkPositions, (int Width, int Length)? worldSize,
+        long targetCells = TargetCells)
     {
+        // A target above the hard allocation guard would let SplitToFit produce an area that
+        // TerrainMap.BuildInArea then rejects; a non-positive target would recurse to single chunks.
+        targetCells = Math.Clamp(targetCells, 1, TerrainMap.MaxCells);
         var rowCount = new Dictionary<long, int>(Math.Max(16, chunkPositions.Count / 2));
         int minY = int.MaxValue, maxY = int.MinValue;
         foreach (var p in chunkPositions)
@@ -173,7 +192,7 @@ public sealed class ChunkAreas
 
         var windows = new List<ChunkArea>();
         foreach (var g in groups.Values)
-        foreach (var w in SplitToFit(g))
+        foreach (var w in SplitToFit(g, targetCells))
             windows.Add(w);
 
         // The start area is the one holding the world centre (the server spawn); if the world size is unknown
@@ -231,19 +250,33 @@ public sealed class ChunkAreas
     }
 
     /// <summary>
-    ///     Which area to show when the viewport looks at such a rectangle (in blocks).
-    ///     We take the one nearest to the viewport centre among those intersecting it: the "centre is inside
-    ///     the area" rule would flicker at the border, and "any intersecting one" would pick by order.
-    ///     The current area is kept as long as it intersects the viewport itself and is no farther than the chosen one.
+    ///     Which area drives interaction when the viewport looks at such a rectangle (in blocks).
+    ///     The area under the viewport CENTRE wins; this is what lets a second area be requested while the
+    ///     first is still partly visible. In the void between areas the current area is kept while it is on
+    ///     screen, otherwise the nearest intersecting area is chosen; null means there is nothing to switch to.
     /// </summary>
     public ChunkArea? AreaForViewport(double minX, double minZ, double maxX, double maxZ, ChunkArea? current)
     {
         double cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+
+        // The area under the viewport CENTRE is the one that drives interaction (hover, selection,
+        // export). Keeping the old area merely because a corner of its bbox is still visible made the
+        // second area wait until the first one was completely gone — so a wide view never requested it.
+        if (current is not null && current.ContainsBlock(cx, cz)) return current;
+        var atCentre = AreaAt(cx, cz);
+        if (atCentre is not null) return atCentre;
+
+        // The centre is in the void: keep the current area while it is still on screen; the other
+        // visible areas are drawn from their cached maps (and can be requested separately).
+        if (current is not null && current.MaxX >= minX && current.MinX <= maxX
+            && current.MaxZ >= minZ && current.MinZ <= maxZ)
+            return current;
+
         ChunkArea? best = null;
         double bestD = double.MaxValue;
         foreach (var a in _areas)
         {
-            if (a.MaxX < minX || a.MinX > maxX || a.MaxZ < minZ || a.MinZ > maxZ) continue; // no intersection
+            if (a.MaxX < minX || a.MinX > maxX || a.MaxZ < minZ || a.MinZ > maxZ) continue;
             double d = a.DistanceTo(cx, cz);
             bool better = d < bestD - 1e-9 ||
                           (Math.Abs(d - bestD) <= 1e-9 && best is not null && a.Columns > best.Columns);
@@ -253,19 +286,11 @@ public sealed class ChunkAreas
                 best = a;
             }
         }
+        if (best is not null) return best;
 
-        if (best is null) return null;
-        if (current is not null && !ReferenceEquals(best, current))
-        {
-            // do not switch if the current area is exactly as near: otherwise at the junction
-            // of two large bboxes it would switch back and forth on every pixel of panning
-            double dc = current.DistanceTo(cx, cz);
-            if (current.MaxX >= minX && current.MinX <= maxX && current.MaxZ >= minZ && current.MinZ <= maxZ &&
-                dc <= bestD + 1e-9)
-                return current;
-        }
-
-        return best;
+        // Nothing intersects (the viewport is in empty space): there is nothing to switch to;
+        // CheckAreaRequest treats null as "keep showing the current map / the void hint".
+        return null;
     }
 
     private static double Dist2(double dx, double dz) => dx * dx + dz * dz;
@@ -276,18 +301,19 @@ public sealed class ChunkAreas
     public static (int Cx, int Cz) UnpackColumn(long key) => ((int)(key >> 32), (int)(uint)key);
 
     /// <summary>
-    ///     Splits a group of columns so that the bounding box of every part fits into
-    ///     <see cref="TerrainMap.MaxCells"/>. We cut at the widest hole in the occupied coordinates
+    ///     Splits a group of columns so that the bounding box of every part is at most
+    ///     <paramref name="maxCells"/> columns (normally <see cref="TargetCells"/>, never above
+    ///     <see cref="TerrainMap.MaxCells"/>). We cut at the widest hole in the occupied coordinates
     ///     (that separates "genuine" patches), and in a solid stretch — at the weighted median,
     ///     so that a degenerate part does not appear.
     /// </summary>
-    private static List<ChunkArea> SplitToFit(List<(int Cx, int Cz, int Rows)> group)
+    private static List<ChunkArea> SplitToFit(List<(int Cx, int Cz, int Rows)> group, long maxCells)
     {
         if (group.Count == 0) return new List<ChunkArea>();
         int minCx = group.Min(e => e.Cx), maxCx = group.Max(e => e.Cx);
         int minCz = group.Min(e => e.Cz), maxCz = group.Max(e => e.Cz);
         long cells = (long)(maxCx - minCx + 1) * 32 * ((maxCz - minCz + 1) * 32);
-        if (cells <= TerrainMap.MaxCells || group.Count == 1)
+        if (cells <= maxCells || group.Count == 1)
             return new List<ChunkArea>
             {
                 new()
@@ -347,8 +373,8 @@ public sealed class ChunkAreas
                 }
             };
 
-        var result = SplitToFit(left);
-        result.AddRange(SplitToFit(right));
+        var result = SplitToFit(left, maxCells);
+        result.AddRange(SplitToFit(right, maxCells));
         return result;
     }
 }

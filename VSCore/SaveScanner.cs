@@ -5,7 +5,7 @@ namespace VSCore;
 
 // ============================= DATA MODEL =============================
 
-/// <summary>Result of a full save scan: structured data of all tables + the raw blobs.</summary>
+/// <summary>Result of a full save scan: structured data of all tables (+ the raw blobs when requested).</summary>
 public sealed class SaveScanResult
 {
     public MetaScanData Meta { get; } = new();
@@ -85,6 +85,10 @@ public sealed class ChunkScanData
     public List<EntityInfo> Entities { get; } = new();
     public List<BlockEntityInfo> BlockEntities { get; } = new();
     public RawBlob? Raw { get; set; }
+
+    /// <summary>Length of the chunk blob in the table. Kept even when <see cref="Raw"/> is not captured
+    /// (the app scans with captureRaw:false), so size-based filters and the dump stay meaningful.</summary>
+    public int DataLength { get; set; }
 }
 
 /// <summary>Entity/player (entity) from field 6 of the chunk blob.</summary>
@@ -222,7 +226,9 @@ public sealed class RawBlob
 /// <summary>
 /// Walks all tables of the save and collects ALL the data: blocks/liquids per chunk,
 /// entities/players (field6), block entities (field8), worldgen/geology (mapregion),
-/// seed/version (gamedata), characters (playerdata) — plus the raw bytes of every blob.
+/// seed/version (gamedata), characters (playerdata). The raw bytes of every blob are opt-in
+/// (<c>captureRaw</c>): the editor reads a blob from the working copy on demand, and keeping a copy
+/// of every chunk blob costs hundreds of MB on a large save for a feature that is used on click.
 /// </summary>
 public static class SaveScanner
 {
@@ -233,7 +239,7 @@ public static class SaveScanner
         "oxygen", "entityDead", "deathReason", "emotionstates", "totalHoursDead"
     };
 
-    public static SaveScanResult Scan(VSSaveFile save, IProgress<double>? progress = null, bool captureRaw = true)
+    public static SaveScanResult Scan(VSSaveFile save, IProgress<double>? progress = null, bool captureRaw = false)
     {
         var res = new SaveScanResult();
         var reg = save.BlockRegistry;
@@ -266,19 +272,34 @@ public static class SaveScanner
         }
 
         // ---- Chunks (blocks/liquids/entities/block entities) ----
-        var rows = save.ChunkRowsWithData;
-        int n = rows.Count;
+        // Positions first, then pages of blobs: retaining every chunk blob (518 MiB on the large save)
+        // made the scan peak depend on the save size instead of on the model it actually builds.
+        var positions = save.ChunkPositions;
+        int n = positions.Count;
         var chunks = new ChunkScanData[n];
-        int total = Math.Max(1, n), done = 0;
+        int total = Math.Max(1, n), done = 0, start = 0;
+        long last = long.MinValue;
+        const int PageSize = 4096;
         var po = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) };
-        Parallel.For(0, n, po, idx =>
+        while (start < n)
         {
-            var cd = new ChunkScanData();
-            ProcessChunk(rows[idx].Position, rows[idx].Data, reg, itemReg, cd, captureRaw);
-            chunks[idx] = cd;
-            int d = Interlocked.Increment(ref done);
-            if (progress != null && (d % 32 == 0 || d == n)) progress.Report((double)d / total);
-        });
+            var page = save.ReadChunkRowsPage(last, PageSize);
+            if (page.Count == 0) break;
+            // capture the page index range; the lambda must not see the loop's moving `start`
+            int pageStart = start;
+            Parallel.For(0, page.Count, po, idx =>
+            {
+                var row = page[idx];
+                var cd = new ChunkScanData();
+                ProcessChunk(row.Position, row.Data, reg, itemReg, cd, captureRaw);
+                chunks[pageStart + idx] = cd;
+                int d = Interlocked.Increment(ref done);
+                if (progress != null && (d % 32 == 0 || d == n)) progress.Report((double)d / total);
+            });
+            start += page.Count;
+            last = page[^1].Position;
+        }
+        progress?.Report(1.0);
 
         // ---- Aggregation ----
         foreach (var cd in chunks)
@@ -384,55 +405,51 @@ public static class SaveScanner
         ChunkScanData cd, bool captureRaw)
     {
         cd.Position = position;
+        cd.DataLength = blob.Length;
         var (cx, cy, cz) = ChunkPosHelper.DecodeIndex((ulong)position);
         cd.ChunkX = cx; cd.ChunkY = cy; cd.ChunkZ = cz;
         cd.WorldX = cx * 32; cd.WorldY = cy * 32; cd.WorldZ = cz * 32;
 
-        byte[]? solids = null, fluids = null;
         var occ6 = 0; // the order of field 6 here matches WalkTop — that is how an edit is addressed
         var occ8 = 0; // the same for field 8 (block entities): without the ordinal they cannot be opened in the editor
-        foreach (var f in PbReader.ReadMessage(blob, maxDepth: 1, maxFields: 5000))
+        // A span walker, not PbReader.ReadMessage: the latter copies every len-delimited payload and
+        // recursively parses it, so it copied each block field (and every plane inside it) per chunk.
+        // Only the entity/block-entity payloads are materialised now; blocks are decoded in place.
+        var r = new PbSpanReader(blob, maxFields: 5000);
+        while (r.MoveNext())
         {
-            if (f.WireType != 2 || f.Bytes is null) continue;
-            switch (f.Field)
+            if (r.WireType != 2) continue;
+            switch (r.Field)
             {
-                case 1: solids = f.Bytes; break;
-                case 16: fluids = f.Bytes; break;
                 case 6:
-                    cd.Entities.Add(ParseEntity(f.Bytes, cx, cy, cz, position, occ6++, reg, itemReg));
+                    cd.Entities.Add(ParseEntity(r.Bytes.ToArray(), cx, cy, cz, position, occ6++, reg, itemReg));
                     break;
                 case 8:
-                    cd.BlockEntities.Add(ParseBlockEntity(f.Bytes, cx, cy, cz, position, occ8++, reg, itemReg));
+                    cd.BlockEntities.Add(ParseBlockEntity(r.Bytes.ToArray(), cx, cy, cz, position, occ8++, reg, itemReg));
                     break;
             }
         }
         if (captureRaw && blob.Length > 0) cd.Raw = MakeRaw("chunk", position, null, blob);
 
-        // block statistics (solids field1 + liquids field16)
-        ushort[] s = solids is { Length: >= 4 }
-            ? ChunkBlockDecoder.DecodeBlocksCompressed(solids)
-            : new ushort[ChunkBlockDecoder.CellsPerChunk];   // no block data — the whole chunk is air
-        ushort[]? fl = fluids is { Length: > 0 } ? SafeLiquids(fluids) : null;
-        for (int i = 0; i < s.Length; i++)
+        // Block statistics (solids field1 + liquids field16) in one fused pass: no 32 768-cell arrays,
+        // no per-cell CodeOf/Dictionary<string,long>. The string dictionary is touched once per distinct
+        // id in the chunk; the per-thread histogram is reset through the touched list.
+        var hist = _idHistogram ??= new long[ushort.MaxValue + 1];
+        var touched = _histTouched ??= new List<int>(256);
+        touched.Clear();
+        ChunkBlockDecoder.DecodeChunkHistogram(blob, hist, touched, out cd.SolidCells, out cd.FluidCells, out cd.AirCells);
+        foreach (var id in touched)
         {
-            if (s[i] != 0) { cd.SolidCells++; Bump(reg, cd.BlockCodeCounts, s[i]); }
-            else if (fl is not null && fl[i] != 0) { cd.FluidCells++; Bump(reg, cd.BlockCodeCounts, fl[i]); }
-            else cd.AirCells++;
+            var code = reg.CodeOf(id) ?? "id:" + id;
+            cd.BlockCodeCounts.TryGetValue(code, out var v);
+            cd.BlockCodeCounts[code] = v + hist[id];
+            hist[id] = 0;
         }
     }
 
-    private static ushort[]? SafeLiquids(byte[] fluids)
-    {
-        try { return ChunkBlockDecoder.DecodeBlocksCompressed(fluids); }
-        catch { return null; }
-    }
-
-    private static void Bump(BlockRegistry reg, Dictionary<string, long> map, ushort id)
-    {
-        var code = reg.CodeOf(id) ?? "id:" + id;
-        map.TryGetValue(code, out var v);
-        map[code] = v + 1;
-    }
+    /// <summary>Per-thread id histogram reused across chunks (512 KiB once per worker).</summary>
+    [ThreadStatic] private static long[]? _idHistogram;
+    [ThreadStatic] private static List<int>? _histTouched;
 
     private static EntityInfo ParseEntity(byte[] b, int cx, int cy, int cz, long position, int occurrence,
         BlockRegistry blocks, ItemRegistry items)

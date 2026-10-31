@@ -301,8 +301,34 @@ namespace VSCore.Tests
             Assert.True(areas.Areas.Count > 1, $"expected a split, got {areas.Areas.Count} windows");
             Assert.Equal(20001, areas.Areas.Sum(a => a.Columns));
             Assert.Equal(20001, areas.Areas.Sum(a => a.Rows));
-            Assert.All(areas.Areas, a => Assert.True(a.BlockCells <= TerrainMap.MaxCells,
-                $"window {a.MinCx}..{a.MaxCx} does not fit: {a.BlockCells} columns"));
+            Assert.All(areas.Areas, a => Assert.True(a.BlockCells <= ChunkAreas.TargetCells,
+                $"window {a.MinCx}..{a.MaxCx} is larger than the build target: {a.BlockCells} columns"));
+        }
+
+        [Fact]
+        public void DenseCluster_SplitsToTheBuildTarget_WithoutLosingOrDuplicatingColumns()
+        {
+            // 200×200 chunks = 6,400×6,400 blocks = 40.96M columns. This is below the hard 256M
+            // allocation guard but four times the 16M build target, so the old splitter kept it as one
+            // area. It must now become several tiles, and every chunk must belong to exactly one tile.
+            var positions = new List<long>(200 * 200);
+            for (int cx = 0; cx < 200; cx++)
+            for (int cz = 0; cz < 200; cz++)
+                positions.Add((long)ChunkPosHelper.ToIndex(cx, 0, cz));
+
+            var areas = ChunkAreas.Build(positions, null);
+
+            Assert.True(areas.Areas.Count >= 3, $"expected a finer split, got {areas.Areas.Count} windows");
+            Assert.Equal(positions.Count, areas.Areas.Sum(a => a.Columns));
+            Assert.Equal(positions.Count, areas.Areas.Sum(a => a.Rows));
+            Assert.All(areas.Areas, a => Assert.True(a.BlockCells <= ChunkAreas.TargetCells,
+                $"window {a.MinCx}..{a.MaxCx} is larger than the build target: {a.BlockCells} columns"));
+
+            foreach (var (cx, cz, _) in positions.Select(p => ChunkPosHelper.DecodeIndex((ulong)p)))
+            {
+                int owners = areas.Areas.Count(a => a.ContainsChunk(cx, cz));
+                Assert.Equal(1, owners);
+            }
         }
 
         [Fact]
@@ -348,9 +374,20 @@ namespace VSCore.Tests
                 // the viewport sits in the void between the groups: no intersections, nothing to switch to
                 Assert.Null(areas.AreaForViewport(1_200_000, 1_200_000, 1_200_100, 1_200_100, main));
 
-                // the viewport covers both groups: the one closer to the viewport center wins
-                // (the center of the giant rectangle lies closer to the "corner")
+                // the viewport covers both groups: without a current area the closer one wins
                 Assert.Same(corner, areas.AreaForViewport(corner.MinX, corner.MinZ, main.MaxX, main.MaxZ, null));
+                // ...but a map that is already displayed is kept until it leaves the viewport:
+                // switching here would replace the visible piece with the other one
+                Assert.Same(main, areas.AreaForViewport(corner.MinX, corner.MinZ, main.MaxX, main.MaxZ, main));
+                Assert.Same(corner, areas.AreaForViewport(corner.MinX, corner.MinZ, main.MaxX, main.MaxZ, corner));
+
+                // a wide viewport can contain both groups while its CENTRE is over one of them:
+                // that area must take over immediately, because the other one is drawn as an extra layer.
+                const double half = 300_000;
+                Assert.Same(corner, areas.AreaForViewport(corner.CentreX - half, corner.CentreZ - half,
+                    corner.CentreX + half, corner.CentreZ + half, main));
+                Assert.Same(main, areas.AreaForViewport(main.CentreX - half, main.CentreZ - half,
+                    main.CentreX + half, main.CentreZ + half, corner));
             }
             finally { File.Delete(db); }
         }

@@ -270,7 +270,7 @@ public sealed class ChunkQuery
             0 => c.Entities,
             1 => c.BlockEntities,
             3 => c.Columns.Count,
-            4 => c.Columns.Sum(x => (long)(x.Raw?.Length ?? 0)),
+            4 => c.Columns.Sum(x => (long)(x.Raw?.Length ?? x.DataLength)),
             _ => c.SolidCells + c.FluidCells
         };
     }

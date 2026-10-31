@@ -14,6 +14,13 @@ public sealed record ChunkInfo(long Position, int DataLength);
 public sealed class VSSaveFile : IDisposable
 {
     private readonly SqliteConnection _conn;
+
+    /// <summary>Guards the single read connection. Microsoft.Data.Sqlite does not allow one connection to be
+    /// used by two threads at once; the background scan and an area build (or a chunk card) overlap all the
+    /// time, and before this lock the second reader either failed or waited until the scan finished — which
+    /// is exactly the "one area and then nothing" behaviour on a large save. Reads are short (a page of
+    /// chunk rows or one blob), so a plain lock is enough and keeps memory flat.</summary>
+    private readonly object _ioLock = new();
     private BlockRegistry? _blockRegistry;
     private ItemRegistry? _itemRegistry;
 
@@ -378,29 +385,35 @@ public sealed class VSSaveFile : IDisposable
         catch { /* cleanup must not get in the way of startup */ }
     }
 
-    /// <summary>Resolution (schema_name.table_name) of the save tables.</summary>
-    public IReadOnlyList<string> TableNames
+    /// <summary>Runs one short read on the shared connection under the connection lock.</summary>
+    private T ReadDb<T>(Func<SqliteConnection, T> read)
     {
-        get
-        {
-            var list = new List<string>();
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_sequence' ORDER BY name;";
-            using var r = cmd.ExecuteReader();
-            while (r.Read()) list.Add(r.GetString(0));
-            return list;
-        }
+        lock (_ioLock) return read(_conn);
     }
+
+    /// <summary>Resolution (schema_name.table_name) of the save tables.</summary>
+    public IReadOnlyList<string> TableNames => ReadDb(conn =>
+    {
+        var list = new List<string>();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_sequence' ORDER BY name;";
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) list.Add(r.GetString(0));
+        return list;
+    });
 
     private List<T> ReadRows<T>(string table, Func<long, int, T> map)
     {
         EnsureSafeTableName(table);
-        var list = new List<T>();
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = $"SELECT position, length(data) FROM \"{table}\" ORDER BY position;";
-        using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(map(r.GetInt64(0), (int)(r.IsDBNull(1) ? 0 : r.GetInt64(1))));
-        return list;
+        return ReadDb(conn =>
+        {
+            var list = new List<T>();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"SELECT position, length(data) FROM \"{table}\" ORDER BY position;";
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) list.Add(map(r.GetInt64(0), (int)(r.IsDBNull(1) ? 0 : r.GetInt64(1))));
+            return list;
+        });
     }
 
     public List<MapRegionInfo> MapRegions => ReadRows("mapregion", (p, l) => new MapRegionInfo(p, l));
@@ -409,36 +422,38 @@ public sealed class VSSaveFile : IDisposable
     public int CountRows(string table)
     {
         EnsureSafeTableName(table);
-        using var c = _conn.CreateCommand();
-        c.CommandText = $"SELECT count(*) FROM \"{table}\";";
-        return Convert.ToInt32(c.ExecuteScalar());
+        return ReadDb(conn =>
+        {
+            using var c = conn.CreateCommand();
+            c.CommandText = $"SELECT count(*) FROM \"{table}\";";
+            return Convert.ToInt32(c.ExecuteScalar());
+        });
     }
 
     public struct PlayerRow { public long Id; public string? Uid; public byte[] Data; }
     /// <summary>Rows of the playerdata table (characters) with raw data.</summary>
-    public List<PlayerRow> PlayerRows
+    public List<PlayerRow> PlayerRows => ReadDb(conn =>
     {
-        get
-        {
-            var list = new List<PlayerRow>();
-            using var c = _conn.CreateCommand();
-            c.CommandText = "SELECT playerid, playeruid, data FROM playerdata;";
-            using var r = c.ExecuteReader();
-            while (r.Read())
-                list.Add(new PlayerRow
-                {
-                    Id = r.GetInt64(0),
-                    Uid = r.IsDBNull(1) ? null : r.GetString(1),
-                    Data = r.IsDBNull(2) ? Array.Empty<byte>() : (byte[])r.GetValue(2)
-                });
-            return list;
-        }
-    }
+        var list = new List<PlayerRow>();
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT playerid, playeruid, data FROM playerdata;";
+        using var r = c.ExecuteReader();
+        while (r.Read())
+            list.Add(new PlayerRow
+            {
+                Id = r.GetInt64(0),
+                Uid = r.IsDBNull(1) ? null : r.GetString(1),
+                Data = r.IsDBNull(2) ? Array.Empty<byte>() : (byte[])r.GetValue(2)
+            });
+        return list;
+    });
 
-    public long? GamedataLength
+    public long? GamedataLength => ReadDb(conn =>
     {
-        get { using var c = _conn.CreateCommand(); c.CommandText = "SELECT length(data) FROM gamedata WHERE savegameid=1;"; return (long?)c.ExecuteScalar(); }
-    }
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT length(data) FROM gamedata WHERE savegameid=1;";
+        return (long?)c.ExecuteScalar();
+    });
 
     public struct ChunkRow { public long Position; public byte[] Data; }
     /// <summary>Chunks with data (for building the terrain map).</summary>
@@ -449,10 +464,10 @@ public sealed class VSSaveFile : IDisposable
     ///     Chunk blobs outside the window are not read from the DB at all: without the filter, a window for one
     ///     area would pull the data of the whole save into memory (155,584 rows against 16,144 in a two-area save).
     /// </summary>
-    public List<ChunkRow> ChunkRowsInWindow(ChunkArea? area)
+    public List<ChunkRow> ChunkRowsInWindow(ChunkArea? area) => ReadDb(conn =>
     {
         var list = new List<ChunkRow>();
-        using var c = _conn.CreateCommand();
+        using var c = conn.CreateCommand();
         c.CommandText = "SELECT position, data FROM chunk ORDER BY position;";
         using var r = c.ExecuteReader();
         while (r.Read())
@@ -472,62 +487,132 @@ public sealed class VSSaveFile : IDisposable
         }
 
         return list;
-    }
+    });
+
+    /// <summary>Positions of the chunk rows of an area (no blobs are read). Used by the paged map build:
+    /// it needs the bounds and the groups first, then fetches the blobs a page at a time.</summary>
+    public List<long> ChunkPositionsInWindow(ChunkArea? area) => ReadDb(conn =>
+    {
+        var list = new List<long>();
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT position FROM chunk ORDER BY position;";
+        using var r = c.ExecuteReader();
+        while (r.Read())
+        {
+            long position = r.GetInt64(0);
+            if (area is not null)
+            {
+                var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)position);
+                if (!area.ContainsChunk(cx, cz)) continue;
+            }
+            list.Add(position);
+        }
+        return list;
+    });
+
+    /// <summary>Chunk rows in an inclusive position range. Positions are primary-key ordered, so a page of
+    /// complete (cx,cz) groups is one indexed range scan; blobs outside the requested page are never materialised.</summary>
+    public List<ChunkRow> ReadChunkRowsRange(long fromPosition, long toPosition, ChunkArea? area = null) => ReadDb(conn =>
+    {
+        var list = new List<ChunkRow>();
+        using var c = conn.CreateCommand();
+        if (area is null)
+        {
+            c.CommandText = "SELECT position, data FROM chunk WHERE position >= @lo AND position <= @hi ORDER BY position;";
+        }
+        else
+        {
+            // Filter the area in SQL, before SQLite materialises the blob column. A page is one Y layer,
+            // but that layer may contain several areas; without this condition every area build read the
+            // blobs of all the others (and held the shared read lock while doing it).
+            c.CommandText = "SELECT position, data FROM chunk WHERE position >= @lo AND position <= @hi "
+                            + "AND ((position >> 27) & @mask) BETWEEN @minCz AND @maxCz "
+                            + "AND (position & @mask) BETWEEN @minCx AND @maxCx ORDER BY position;";
+            c.Parameters.AddWithValue("@mask", (long)ChunkPosHelper.ChunkMask);
+            c.Parameters.AddWithValue("@minCx", area.MinCx);
+            c.Parameters.AddWithValue("@maxCx", area.MaxCx);
+            c.Parameters.AddWithValue("@minCz", area.MinCz);
+            c.Parameters.AddWithValue("@maxCz", area.MaxCz);
+        }
+        c.Parameters.AddWithValue("@lo", fromPosition);
+        c.Parameters.AddWithValue("@hi", toPosition);
+        using var r = c.ExecuteReader();
+        while (r.Read())
+            list.Add(new ChunkRow
+            {
+                Position = r.GetInt64(0),
+                Data = r.IsDBNull(1) ? Array.Empty<byte>() : (byte[])r.GetValue(1)
+            });
+        return list;
+    });
+
+    /// <summary>A page of chunk rows after <paramref name="afterPosition"/> (exclusive), ordered by position.
+    /// Used by the scan so it does not retain every blob of the save at once.</summary>
+    public List<ChunkRow> ReadChunkRowsPage(long afterPosition, int limit) => ReadDb(conn =>
+    {
+        var list = new List<ChunkRow>(Math.Max(1, limit));
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT position, data FROM chunk WHERE position > @after ORDER BY position LIMIT @n;";
+        c.Parameters.AddWithValue("@after", afterPosition);
+        c.Parameters.AddWithValue("@n", Math.Max(1, limit));
+        using var r = c.ExecuteReader();
+        while (r.Read())
+            list.Add(new ChunkRow
+            {
+                Position = r.GetInt64(0),
+                Data = r.IsDBNull(1) ? Array.Empty<byte>() : (byte[])r.GetValue(1)
+            });
+        return list;
+    });
 
     /// <summary>Positions of all `chunk` rows (no data is read) — the map areas are computed from them.</summary>
-    public List<long> ChunkPositions
+    public List<long> ChunkPositions => ReadDb(conn =>
     {
-        get
-        {
-            var list = new List<long>();
-            using var c = _conn.CreateCommand();
-            c.CommandText = "SELECT position FROM chunk ORDER BY position;";
-            using var r = c.ExecuteReader();
-            while (r.Read()) list.Add(r.GetInt64(0));
-            return list;
-        }
-    }
+        var list = new List<long>();
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT position FROM chunk ORDER BY position;";
+        using var r = c.ExecuteReader();
+        while (r.Read()) list.Add(r.GetInt64(0));
+        return list;
+    });
 
     /// <summary>Rows of the mapchunk table (the client map) with data.</summary>
-    public List<ChunkRow> MapchunkRowsWithData
+    public List<ChunkRow> MapchunkRowsWithData => ReadDb(conn =>
     {
-        get
-        {
-            var list = new List<ChunkRow>();
-            using var c = _conn.CreateCommand();
-            c.CommandText = "SELECT position, data FROM mapchunk ORDER BY position;";
-            using var r = c.ExecuteReader();
-            while (r.Read()) list.Add(new ChunkRow { Position = r.GetInt64(0), Data = r.IsDBNull(1) ? Array.Empty<byte>() : (byte[])r.GetValue(1) });
-            return list;
-        }
-    }
+        var list = new List<ChunkRow>();
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT position, data FROM mapchunk ORDER BY position;";
+        using var r = c.ExecuteReader();
+        while (r.Read()) list.Add(new ChunkRow { Position = r.GetInt64(0), Data = r.IsDBNull(1) ? Array.Empty<byte>() : (byte[])r.GetValue(1) });
+        return list;
+    });
 
-    public byte[]? ReadRegion(long position)
+    public byte[]? ReadRegion(long position) => ReadDb(conn =>
     {
-        using var c = _conn.CreateCommand();
+        using var c = conn.CreateCommand();
         c.CommandText = "SELECT data FROM mapregion WHERE position=@p;";
         c.Parameters.AddWithValue("@p", position);
         var o = c.ExecuteScalar();
         return o is byte[] b ? b : (o is null ? null : System.Text.Encoding.Default.GetBytes(o.ToString()!));
-    }
+    });
 
     /// <summary>Raw bytes of a particular chunk (for the structural view/editing).</summary>
-    public byte[]? ReadChunk(long position)
+    public byte[]? ReadChunk(long position) => ReadDb(conn =>
     {
-        using var c = _conn.CreateCommand();
+        using var c = conn.CreateCommand();
         c.CommandText = "SELECT data FROM chunk WHERE position=@p;";
         c.Parameters.AddWithValue("@p", position);
         var o = c.ExecuteScalar();
         return o as byte[];
-    }
+    });
 
-    public byte[]? ReadGamedata()
+    public byte[]? ReadGamedata() => ReadDb(conn =>
     {
-        using var c = _conn.CreateCommand();
+        using var c = conn.CreateCommand();
         c.CommandText = "SELECT data FROM gamedata WHERE savegameid=1;";
         var o = c.ExecuteScalar();
         return o as byte[];
-    }
+    });
 
     /// <summary>
     ///     World size in blocks (worldWidth/worldLength from gamedata). Needed not for drawing but for
@@ -664,9 +749,9 @@ public sealed class VSSaveFile : IDisposable
     }
 
     /// <summary>VS version: we look for the string in field 12 of the first chunk (confirmed in practice — "1.22.6").</summary>
-    public string? DetectVersion()
+    public string? DetectVersion() => ReadDb(conn =>
     {
-        using var c = _conn.CreateCommand();
+        using var c = conn.CreateCommand();
         c.CommandText = "SELECT data FROM chunk LIMIT 1;";
         var o = c.ExecuteScalar();
         if (o is not byte[] b) return null;
@@ -681,7 +766,7 @@ public sealed class VSSaveFile : IDisposable
             }
         }
         return null;
-    }
+    });
 
     /// <summary>
     /// Copies the save and deletes from the COPY ALL rows of the selected chunks (all Y) in the `chunk`
@@ -910,7 +995,7 @@ public sealed class VSSaveFile : IDisposable
 
     public void Dispose()
     {
-        _conn.Dispose();
+        lock (_ioLock) _conn.Dispose();
         if (_workingDir is { Length: > 0 } dir)
         {
             _workingDir = null;
