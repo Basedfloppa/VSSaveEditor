@@ -86,6 +86,9 @@ namespace VSCore.Tests
         }
 
         private static string MakeSave(byte[] chunkBlob, ulong position, bool withGamedata = false)
+            => MakeSave(new[] { (chunkBlob, position) }, withGamedata);
+
+        private static string MakeSave((byte[] Blob, ulong Position)[] chunks, bool withGamedata = false)
         {
             var dbPath = Path.Combine(Path.GetTempPath(), "flt_" + Guid.NewGuid().ToString("N") + ".vcdbs");
             var cs = new SqliteConnectionStringBuilder { DataSource = dbPath }.ToString();
@@ -97,19 +100,22 @@ namespace VSCore.Tests
                 Exec(con, "CREATE TABLE mapregion(position INTEGER PRIMARY KEY, data BLOB);");
                 Exec(con, "CREATE TABLE gamedata(savegameid INTEGER PRIMARY KEY, data BLOB);");
                 Exec(con, "CREATE TABLE playerdata(playerid INTEGER PRIMARY KEY AUTOINCREMENT, playeruid TEXT, data BLOB);");
-                using (var ins = con.CreateCommand())
+                using var ins = con.CreateCommand();
+                ins.CommandText = "INSERT INTO chunk(position,data) VALUES($p,$d);";
+                var p = ins.Parameters.Add("$p", SqliteType.Integer);
+                var d = ins.Parameters.Add("$d", SqliteType.Blob);
+                foreach (var (blob, position) in chunks)
                 {
-                    ins.CommandText = "INSERT INTO chunk(position,data) VALUES($p,$d);";
-                    ins.Parameters.AddWithValue("$p", (long)position);
-                    ins.Parameters.AddWithValue("$d", chunkBlob);
+                    p.Value = (long)position;
+                    d.Value = blob;
                     ins.ExecuteNonQuery();
                 }
                 if (withGamedata)
                 {
-                    using var ins = con.CreateCommand();
-                    ins.CommandText = "INSERT INTO gamedata(savegameid,data) VALUES(1,$d);";
-                    ins.Parameters.AddWithValue("$d", Gamedata());
-                    ins.ExecuteNonQuery();
+                    using var g = con.CreateCommand();
+                    g.CommandText = "INSERT INTO gamedata(savegameid,data) VALUES(1,$d);";
+                    g.Parameters.AddWithValue("$d", Gamedata());
+                    g.ExecuteNonQuery();
                 }
             }
             return dbPath;
@@ -159,6 +165,101 @@ namespace VSCore.Tests
                 var tm = TerrainMap.Build(save);
                 Assert.Equal(0, BlockFilterScanner.Build(save, tm, new[] { OreId }).HitColumns);
                 Assert.Equal(0, BlockFilterScanner.Build(save, tm, Array.Empty<int>()).HitColumns);
+            }
+            finally { File.Delete(dbPath); }
+        }
+
+        [Fact]
+        public void Scoped_filter_keeps_the_map_grid_and_counts_only_the_scope()
+        {
+            // Two chunks in the same area; the overlay grid must still cover the whole area (so the
+            // highlights sit on their blocks), while matches outside the scope are not counted or read.
+            int first = 3 + 7 * 32 + 5 * 1024;
+            int second = 4 + 9 * 32 + 5 * 1024;
+            var dbPath = MakeSave(new[]
+            {
+                (MakeChunkBlob(OreId, first), ChunkPosHelper.ToIndex(0, 0, 0)),
+                (MakeChunkBlob(OreId, second), ChunkPosHelper.ToIndex(1, 0, 0))
+            });
+            try
+            {
+                using var save = VSSaveFile.OpenReadOnly(dbPath);
+                var tm = TerrainMap.Build(save);
+                var all = BlockFilterScanner.Build(save, tm, new[] { OreId });
+                Assert.Equal(2, all.HitColumns);
+                Assert.Equal(2, all.MatchCells);
+
+                var scoped = BlockFilterScanner.Build(save, tm, new[] { OreId },
+                    scope: SearchScope.ForColumn(0, 0));
+                Assert.Equal(tm.MinX, scoped.MinX);
+                Assert.Equal(tm.MinZ, scoped.MinZ);
+                Assert.Equal(tm.Width, scoped.Width);
+                Assert.Equal(tm.Height, scoped.Height);
+                Assert.Equal(1, scoped.HitColumns);
+                Assert.Equal(1, scoped.MatchCells);
+                Assert.True(scoped.Has(3, 7));
+                Assert.False(scoped.Has(36, 9)); // in chunk (1,0), outside the scope
+                Assert.Equal(1, scoped.IdCells[OreId]);
+            }
+            finally { File.Delete(dbPath); }
+        }
+
+        [Fact]
+        public void Whole_save_overlay_covers_every_chunk_area()
+        {
+            int first = 3 + 7 * 32 + 5 * 1024;
+            int second = 3 + 7 * 32 + 6 * 1024;
+            var dbPath = MakeSave(new[]
+            {
+                (MakeChunkBlob(OreId, first), ChunkPosHelper.ToIndex(0, 0, 0)),
+                (MakeChunkBlob(OreId, second), ChunkPosHelper.ToIndex(2, 0, 0))
+            });
+            try
+            {
+                using var save = VSSaveFile.OpenReadOnly(dbPath);
+                var overlay = BlockFilterScanner.BuildAll(save, new[] { OreId });
+
+                Assert.Equal(2, overlay.HitColumns);
+                Assert.Equal(2, overlay.MatchCells);
+                Assert.Equal(2, overlay.PartCount);
+                Assert.True(overlay.TryGet(3, 7, out var id, out var y, out var n));
+                Assert.Equal(OreId, id);
+                Assert.Equal(5, y);
+                Assert.Equal(1, n);
+                Assert.True(overlay.TryGet(67, 7, out _, out var y2, out _));
+                Assert.Equal(6, y2);  // chunk (2,0), local Y=6
+
+                // Navigation is in global row order and crosses the chunk boundary.
+                Assert.True(overlay.TryFindNext(3, 7, true, out var nx, out var nz));
+                Assert.Equal(67, nx);
+                Assert.Equal(7, nz);
+                Assert.True(overlay.TryFindNext(67, 7, false, out var px, out var pz));
+                Assert.Equal(3, px);
+                Assert.Equal(7, pz);
+                Assert.NotNull(overlay.Preview);
+                Assert.True(overlay.Preview!.PixelWidth > 0 && overlay.Preview.PixelHeight > 0);
+            }
+            finally { File.Delete(dbPath); }
+        }
+
+        [Fact]
+        public void Whole_save_overlay_respects_the_scope()
+        {
+            int first = 3 + 7 * 32 + 5 * 1024;
+            var dbPath = MakeSave(new[]
+            {
+                (MakeChunkBlob(OreId, first), ChunkPosHelper.ToIndex(0, 0, 0)),
+                (MakeChunkBlob(OreId, first), ChunkPosHelper.ToIndex(2, 0, 0))
+            });
+            try
+            {
+                using var save = VSSaveFile.OpenReadOnly(dbPath);
+                var overlay = BlockFilterScanner.BuildAll(save, new[] { OreId },
+                    scope: SearchScope.ForColumn(0, 0));
+                Assert.Equal(1, overlay.HitColumns);
+                Assert.Equal(1, overlay.MatchCells);
+                Assert.True(overlay.TryGet(3, 7, out _, out _, out _));
+                Assert.False(overlay.TryGet(67, 7, out _, out _, out _));
             }
             finally { File.Delete(dbPath); }
         }

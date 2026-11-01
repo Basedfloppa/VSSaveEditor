@@ -84,10 +84,18 @@ public partial class MainWindow
                 _players.Refresh();
                 break;
             case ScopeTarget.Blocks:
+                // The displayed match map belongs to the previous scope. Drop it together with any build
+                // that is still running: otherwise the old overlay stays on screen (and a late result
+                // could even be published for the new scope). The new overlay is built on "Show on map".
+                _filterCts?.Cancel();
+                if (_filterMap is not null || Map.Filter is not null)
+                {
+                    _filterMap = null;
+                    _filterMapKey = null;
+                    _filterMapScope = null;
+                    Map.SetFilterOverlay(null, null, FilterDimCheck.IsChecked == true);
+                }
                 PopulateFilterList();
-                // the overlay itself is rebuilt on "Show on map": a scope change must not start a world-wide block scan
-                // while the user is only choosing where to look
-                if (_filterMap is not null) _filterMap = null;
                 UpdateFilterStatus();
                 break;
         }

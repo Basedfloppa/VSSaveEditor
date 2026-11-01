@@ -56,6 +56,17 @@ public class TerrainPyramidTests
     }
 
     [Fact]
+    public void NonSquareMap_HasIndependentAxisDensities()
+    {
+        // 3×4096 with CellSize 2 produces 2×2048: the X and Z densities differ, so every consumer
+        // (frame, extra layers, slice overlays) must carry both values rather than reuse one.
+        var pyramid = TerrainPyramid.Build(Flat(3, 4096), TerrainColorizer.ModeBlocks)!;
+        Assert.Equal(2, pyramid.Width);
+        Assert.Equal(2048, pyramid.Height);
+        Assert.NotEqual(pyramid.Width / 3.0, pyramid.Height / 4096.0, 9);
+    }
+
+    [Fact]
     public void HeightPyramid_DoesNotRequireTheBlocksRainArrays()
     {
         var tm = Flat(4096, 1);

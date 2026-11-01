@@ -116,6 +116,44 @@ public class MapImageRendererTests
         Assert.Contains("empty", ex.Message);
     }
 
+    [Fact(DisplayName = "multi-area export: the canvas spans the union and empty gaps stay background")]
+    public void Render_MultipleAreas_SpansUnion()
+    {
+        var a = MakeTerrain(4, 4);
+        a.MinX = 0; a.MinZ = 0;
+        var b = MakeTerrain(4, 4);
+        b.MinX = 50; b.MinZ = 0;
+        var maps = new[] { a, b };
+        var r = MapImageRenderer.Render(maps, new MapImageOptions
+        {
+            TransparentBackground = true,
+            MaxDimension = 0,
+            MaxPixels = 0
+        });
+
+        Assert.Equal((54, 4), (r.Width, r.Height));
+        Assert.Equal(255, r.Rgba[0 * 4 + 3]);                 // tile A
+        Assert.Equal(0, r.Rgba[20 * 4 + 3]);                  // gap between the tiles
+        Assert.Equal(255, r.Rgba[52 * 4 + 3]);                // tile B
+    }
+
+    [Fact(DisplayName = "multi-area export: a large union is downscaled by an integer block step")]
+    public void Render_MultipleAreas_DownscalesToBudget()
+    {
+        var a = MakeTerrain(100, 10);
+        a.MinX = 0; a.MinZ = 0;
+        var b = MakeTerrain(100, 10);
+        b.MinX = 100; b.MinZ = 0;
+        var maps = new[] { a, b };
+        var o = new MapImageOptions { MaxDimension = 0, MaxPixels = 1000 };
+        var r = MapImageRenderer.Render(maps, o);
+
+        Assert.Equal(2, MapImageRenderer.BlocksPerPixel(maps, o));
+        Assert.Equal((100, 5), MapImageRenderer.PixelSize(maps, o));
+        Assert.Equal((r.Width, r.Height), MapImageRenderer.PixelSize(maps, o));
+        Assert.True(r.Rgba.Length == r.Width * r.Height * 4);
+    }
+
     [Fact(DisplayName = "map render: an oversized image fails with a clear error instead of an OOM")]
     public void Encode_TooLarge_ThrowsClear()
     {

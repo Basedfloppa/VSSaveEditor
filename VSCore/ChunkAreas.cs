@@ -12,8 +12,8 @@ namespace VSCore;
 /// One map for all groups cannot be built: the bounding box of two patches at opposite edges
 /// of a 512000×512000 world is ~6.6e10 columns, i.e. hundreds of GiB (see <see cref="TerrainMap.MaxCells"/>).
 /// Each connected group is therefore cut into build tiles of at most <see cref="TargetCells"/>
-/// columns; the tile under the viewport is the active map and the neighbouring tiles are preloaded
-/// and drawn as overview layers.
+/// columns; the tile under the viewport is the active map, while neighbouring tiles are preloaded
+/// and drawn as exact layers at detail zoom or as overview layers when zoomed out.
 /// </summary>
 public sealed class ChunkArea
 {

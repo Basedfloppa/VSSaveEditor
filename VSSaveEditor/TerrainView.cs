@@ -51,6 +51,8 @@ public class TerrainView : Control
     private static readonly IBrush DeselRubber = new SolidColorBrush(Color.FromArgb(60, 220, 130, 130));
     private static readonly IPen DeselPen = new Pen(new SolidColorBrush(Color.FromArgb(215, 255, 140, 140)), 1.5);
     private static readonly Color FilterBackground = Color.FromRgb(16, 18, 24);
+    private static readonly IBrush FilterBackgroundBrush = new SolidColorBrush(FilterBackground);
+    private static readonly IBrush FilterDimBrush = new SolidColorBrush(Color.FromArgb(160, 0, 0, 0));
 
     // ---- chunk selection (for future delete/modify features) ----
     // Left click on a chunk toggles it (add/remove); Shift+left-drag is a rectangular
@@ -70,6 +72,8 @@ public class TerrainView : Control
     private Point _lastDrag = new(double.NaN, double.NaN);
     private int _lastHoverX = int.MinValue, _lastHoverZ = int.MinValue; // the last block under the cursor (avoids a redraw)
     private DispatcherTimer? _layerTimer; // deferred Y-slice rebuild (slider smoothing)
+    private int _zoomRebuildToken; // coalesces wheel steps into one background rebuild
+    private bool _softZoom; // the shown frame is being soft-scaled until the coalesced rebuild lands
     private int _mode = ModeBlocks;
     private TerrainColorCache? _colorCache;
     private Vector _pan = new(-0, -0); // bitmap placement inside the control
@@ -160,9 +164,13 @@ public class TerrainView : Control
     public ChunkAreas? Areas { get; private set; }
 
     /// <summary>Maps of the other areas, built ahead of time (or on first visit). The view draws them
-    /// as separate overview layers while zoomed out, so two nearby areas no longer replace each other.</summary>
+    /// as separate exact layers at detail zoom, and as overview layers while zoomed out, so two nearby
+    /// areas no longer replace each other.</summary>
     private readonly Dictionary<ChunkArea, TerrainMap> _areaMaps = new();
     private readonly Dictionary<ChunkArea, TerrainPyramid> _areaOverviews = new();
+    private readonly Dictionary<TerrainPyramid, WriteableBitmap> _overviewBitmaps = new();
+    // null values are cached too: a map below the preview threshold must not be re-scanned every frame
+    private readonly Dictionary<TerrainMap, TerrainPyramid?> _fallbackPyramids = new();
     private readonly List<ExtraLayer> _extraLayers = new();
     private readonly Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer> _extraCache = new();
 
@@ -174,21 +182,41 @@ public class TerrainView : Control
         public byte[] Pixels = Array.Empty<byte>();
         public WriteableBitmap? Bitmap;
         public (ChunkArea Area, double Ppb, int Mode, int Layer) Key;
+        /// <summary>True for a pre-coloured pyramid: it has no filter data and needs the coarse preview.</summary>
+        public bool Coarse;
+        /// <summary>False for viewport-local exact frames: their bounds change with every pan, so caching them
+        /// by (area, ppb, mode, layer) would both grow without bound and reuse a frame from another viewport.</summary>
+        public bool Cacheable;
     }
 
     /// <summary>Whether an area map is already available (the window can publish it without rebuilding).</summary>
     public bool HasAreaMap(ChunkArea area) => _areaMaps.ContainsKey(area);
 
-    /// <summary>Diagnostics: how many extra area overview layers are currently in the drawing list.</summary>
+    /// <summary>Diagnostics: how many extra area layers are currently in the drawing list.</summary>
     public int ExtraAreaLayers => _extraLayers.Count;
 
+    /// <summary>Diagnostics: full-resolution extra layers for the current viewport.</summary>
+    public int ExtraExactLayers => _extraLayers.Count(l => !l.Coarse);
+
+    /// <summary>Diagnostics: coarse pyramid layers (whole-map overviews).</summary>
+    public int ExtraCoarseLayers => _extraLayers.Count(l => l.Coarse);
+
+    /// <summary>Diagnostics for probes/tests: what each non-primary layer covers and at which density.</summary>
+    public string ExtraLayerSummary => string.Join("; ", _extraLayers.Select(l =>
+        $"#{l.Area.Index + 1} {(l.Coarse ? "coarse" : "exact")} " +
+        $"{l.Frame.Left}..{l.Frame.Left + l.Frame.W - 1}/{l.Frame.Top}..{l.Frame.Top + l.Frame.H - 1} " +
+        $"@ {l.Frame.Ppb:0.###}x{l.Frame.PpbY:0.###}"));
+
     /// <summary>Replaces the set of cached area maps. The current Terrain stays the interactive one;
-    /// all other maps whose bbox is visible become extra overview layers.</summary>
+    /// all other maps whose bbox is visible become extra layers (exact at detail density).</summary>
     public void SetAreaMaps(IReadOnlyDictionary<ChunkArea, TerrainMap> maps)
     {
         _areaMaps.Clear();
         foreach (var kv in maps) _areaMaps[kv.Key] = kv.Value;
-        _extraLayers.Clear();
+        _overviewBitmaps.Clear();
+        _fallbackPyramids.Clear();
+        // Keep the current extra layers until the rebuild replaces them: a background preload adds
+        // one tile at a time and clearing the list made the whole zoomed-out view blink on each add.
         _extraCache.Clear();
         if (Terrain is not null) RebuildBitmap();
         InvalidateVisual();
@@ -201,7 +229,8 @@ public class TerrainView : Control
     {
         _areaOverviews.Clear();
         foreach (var kv in overviews) _areaOverviews[kv.Key] = kv.Value;
-        _extraLayers.Clear();
+        _overviewBitmaps.Clear();
+        _fallbackPyramids.Clear();
         _extraCache.Clear();
         if (Terrain is not null) RebuildBitmap();
         InvalidateVisual();
@@ -225,7 +254,10 @@ public class TerrainView : Control
     }
 
     /// <summary>The current filter match map (null = overlay off).</summary>
-    public BlockFilterMap? Filter { get; private set; }
+    public IBlockFilter? Filter { get; private set; }
+
+    private BlockFilterPreview? _filterPreview;
+    private WriteableBitmap? _filterPreviewBitmap;
 
     /// <summary>Render mode name by index (matches the order in the ComboBox).</summary>
     public static string ModeName(int mode)
@@ -361,6 +393,10 @@ public class TerrainView : Control
         if (_mode == mode) return;
         _mode = mode;
         _colorCache = null; // the shade/semantics are mode-specific
+        _extraLayers.Clear(); // their pixels belong to the old mode
+        _extraCache.Clear();
+        _overviewBitmaps.Clear();
+        _fallbackPyramids.Clear();
         RebuildBitmap();
         InvalidateVisual();
     }
@@ -386,7 +422,7 @@ public class TerrainView : Control
         var tm = Terrain;
         if (tm is null) return;
         double vw = Math.Max(100, Bounds.Width), vh = Math.Max(100, Bounds.Height);
-        var fit = Math.Min(vw / tm.Width, vh / tm.Height); // the whole world fits the window
+        var fit = Math.Min(vw / tm.Width, vh / tm.Height); // the active build tile fits the window
         if (double.IsNaN(fit) || double.IsInfinity(fit)) fit = MaxWanted; // a map without data (Width=1)
         _wanted = Math.Clamp(fit, MinWanted, MaxWanted);
         _focusX = tm.MinX + tm.Width / 2.0;
@@ -404,10 +440,24 @@ public class TerrainView : Control
     {
         Terrain = tm;
         _colorCache = null; // belongs to the previous map (or to no map)
+        // The new active tile may still have been drawn as an extra layer a moment ago (an area switch
+        // or a zoom over the boundary). Its old viewport/density frame must not stay underneath the
+        // new primary frame; remove just that area and keep the other neighbours.
+        if (keepView && tm?.Area is { } activeArea)
+            _extraLayers.RemoveAll(l => ReferenceEquals(l.Area, activeArea));
         _layerTimer?.Stop(); // the deferred slice belongs to the previous save
-        Filter = null; // the match map is tied to the grid of the previous map (area)
+        // The overlay is built against the whole save now, so it stays valid while switching
+        // build tiles. Only opening another save/clearing the map drops it.
         if (!keepView)
         {
+            Filter = null;
+            _filterPreview = null;
+            _filterPreviewBitmap = null;
+            _extraLayers.Clear();
+            _extraCache.Clear();
+            _overviewBitmaps.Clear();
+            _fallbackPyramids.Clear();
+            _softZoom = false;
             _frame = null; // the frame geometry belongs to the previous save
             _filterColors = null;
         }
@@ -435,7 +485,7 @@ public class TerrainView : Control
         if (!keepView)
         {
             _userZoomed = false;
-            // safe default: the whole world is visible (small), SizeChanged will fit it more precisely later
+            // safe default: the active build tile is visible, SizeChanged will fit it more precisely later
             _wanted = Math.Clamp(Math.Min(ViewportW / tm.Width, ViewportH / tm.Height), MinWanted, MaxWanted);
             _focusX = tm.MinX + tm.Width / 2.0;
             _focusZ = tm.MinZ + tm.Height / 2.0;
@@ -459,8 +509,8 @@ public class TerrainView : Control
         InvalidateVisual();
     }
 
-    /// <summary>Fit the whole world into the window. "World" here is the built area: the other areas
-    /// are not drawn on the map until the user scrolls to them.</summary>
+    /// <summary>Fit the active build tile into the window. Other cached areas are separate layers;
+    /// they are not included in this fit, so "Fit area" keeps the active tile readable.</summary>
     public void FitToArea()
     {
         if (Terrain is null) return;
@@ -576,7 +626,7 @@ public class TerrainView : Control
     /// viewport may intersect several areas at once.</summary>
     public bool IsAreaStillWanted(ChunkArea area) => ReferenceEquals(PreferredArea(), area);
 
-    /// <summary>Does the visible part of the world intersect the built map? If not, only the background is on screen.</summary>
+    /// <summary>Does the visible part of the world intersect the active map?</summary>
     private bool ViewportShowsData()
     {
         var tm = Terrain;
@@ -585,6 +635,32 @@ public class TerrainView : Control
         return vx1 >= tm.MinX && vx0 <= tm.MinX + tm.Width - 1 &&
                vz1 >= tm.MinZ && vz0 <= tm.MinZ + tm.Height - 1;
     }
+
+    /// <summary>Whether the viewport intersects any cached area, not just the active map. The active map
+    /// can be completely off screen while a preloaded neighbour is what the user is looking at.</summary>
+    private bool ViewportShowsAnyCachedData()
+    {
+        if (ViewportShowsData()) return true;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        foreach (var area in _areaMaps.Keys)
+            if (AreaIntersects(area, vx0, vz0, vx1, vz1)) return true;
+        // A pyramid cannot stand in at detail density or in a Y slice; BuildExtraLayers skips it there.
+        // Also require the same suitability check as BuildExtraLayers, otherwise an area that cannot
+        // actually be blitted would suppress the "no map data" hint and still leave a blank viewport.
+        if (_ppb < 1 && LayerY is null)
+            foreach (var (area, py) in _areaOverviews)
+                if (py.Mode == _mode &&
+                    py.SuitableFor(_ppb, (int)Math.Ceiling(area.WidthBlocks * _ppb),
+                        (int)Math.Ceiling(area.HeightBlocks * _ppb)) &&
+                    AreaIntersects(area, vx0, vz0, vx1, vz1)) return true;
+        foreach (var layer in _extraLayers)
+            if (layer.Frame.Left <= vx1 && layer.Frame.Left + layer.Frame.W >= vx0 &&
+                layer.Frame.Top <= vz1 && layer.Frame.Top + layer.Frame.H >= vz0) return true;
+        return false;
+    }
+
+    private static bool AreaIntersects(ChunkArea area, double minX, double minZ, double maxX, double maxZ)
+        => area.MaxX >= minX && area.MinX <= maxX && area.MaxZ >= minZ && area.MinZ <= maxZ;
 
     /// <summary>The hint shown when the screen sits in the void between areas: where to look for the nearest one.</summary>
     private string VoidHint()
@@ -612,80 +688,186 @@ public class TerrainView : Control
         _focusZ = vh >= h ? minZ + h / 2.0 : Math.Clamp(_focusZ, minZ, maxZ);
     }
 
+    /// <summary>Whether the active map can be shown from its pre-coloured pyramid at this density. The
+    /// extra-area layers use the same decision, so a zoomed-out view does not mix one exact tile with
+    /// coarse neighbours (the active tile used to be the only exact one when a filter was active).</summary>
+    private bool UsesPrimaryOverview(TerrainMap tm, double ppb)
+        => LayerY is null && Filter is null && tm.Pyramid is { } pyramid && pyramid.Mode == _mode
+           && pyramid.SuitableFor(ppb, (int)Math.Ceiling(tm.Width * ppb), (int)Math.Ceiling(tm.Height * ppb));
+
+    /// <summary>True when every full map that intersects the viewport can use its pyramid at this density.
+    /// If even one visible tile has no suitable overview, the whole view is rendered exactly instead of
+    /// mixing a coarse active tile with sharp neighbours (or the reverse).</summary>
+    private bool VisibleMapsHaveOverview(TerrainMap primary, double ppb)
+    {
+        if (!UsesPrimaryOverview(primary, ppb)) return false;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        foreach (var map in _areaMaps.Values)
+        {
+            if (map.MinX + map.Width - 1 < vx0 || map.MinX > vx1 ||
+                map.MinZ + map.Height - 1 < vz0 || map.MinZ > vz1) continue;
+            if (map.Pyramid is not { } pyramid || pyramid.Mode != _mode ||
+                !pyramid.SuitableFor(ppb, (int)Math.Ceiling(map.Width * ppb),
+                    (int)Math.Ceiling(map.Height * ppb))) return false;
+        }
+        return true;
+    }
+
     /// <summary>
-    /// Renders the other cached areas as independent overview layers. Only LOD is used: at detail
-    /// level the viewport is small and the primary area covers it; the extra layers exist for the
-    /// zoomed-out view where several distant patches are visible at once.
+    /// Renders the other cached areas as independent layers. At detail density every visible cached map is
+    /// sampled at the SAME density as the primary map, so a viewport that spans two build tiles shows both
+    /// at full resolution. Only the visible part (with a pan margin) is rendered: a whole 16M-column tile at
+    /// 1 px/block would be a 64 MB bitmap even when only a narrow strip is on screen.
+    /// At overview density the pre-coloured pyramids are still used: the exact pass would visit every block
+    /// of every visible area on each pan, while every area - including the primary one - is approximate there.
     /// </summary>
     private List<ExtraLayer> BuildExtraLayers(TerrainMap primary, double ppb, int? layer, int mode,
         double vx0, double vz0, double vx1, double vz1,
         IReadOnlyDictionary<ChunkArea, TerrainMap> areaMaps,
         IReadOnlyDictionary<ChunkArea, TerrainPyramid> areaOverviews,
-        IReadOnlyDictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer> cacheSnapshot)
+        IReadOnlyDictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer> cacheSnapshot,
+        bool allowOverview)
     {
         var result = new List<ExtraLayer>();
-        // At detail level the primary area fills the viewport; extras are a zoomed-out feature.
-        // Do NOT require areaMaps: a large neighbour may have only a pyramid cached (its full map
-        // was released by the preload budget), and that pyramid is exactly what should be drawn.
-        if (ppb > 1) return result;
+        // The primary map decides the quality of the view: when it is exact (detail density, an active
+        // filter, or no suitable pyramid), every cached neighbour is exact too. Mixing an exact active
+        // tile with coarse neighbours requires a rebuild that only the active tile would trigger.
+        var exactMode = ppb >= 1 || !allowOverview;
         foreach (var (area, map) in areaMaps)
         {
             if (ReferenceEquals(map, primary)) continue;
+            if (map.MinX + map.Width - 1 < vx0 || map.MinX > vx1 ||
+                map.MinZ + map.Height - 1 < vz0 || map.MinZ > vz1) continue;
             var key = (area, ppb, mode, layer ?? int.MinValue);
-            if (cacheSnapshot.TryGetValue(key, out var cached) && cached.Bitmap is not null)
+            if (!exactMode && cacheSnapshot.TryGetValue(key, out var cached) && cached.Bitmap is not null)
             {
                 result.Add(cached);
                 continue;
             }
-            if (map.MinX + map.Width - 1 < vx0 || map.MinX > vx1 || map.MinZ + map.Height - 1 < vz0 || map.MinZ > vz1) continue;
-            // A large area at ppb close to 1 would produce a second full-size bitmap; skip it.
-            // A cached coarse pyramid turns another area into a small blit instead of a full-area
-            // per-column LOD pass (which was repeated on every pan/zoom).
+
+            if (exactMode)
+            {
+                // A detail viewport is only a few hundred blocks wide; render exactly its intersection with
+                // this area. This is the path that makes both halves of a boundary show full resolution.
+                if (VisibleLayerRegion(map, vx0, vz0, vx1, vz1) is not { } r) continue;
+                byte[] exact;
+                try
+                {
+                    exact = ComputeRegion(map, ppb, r.Left, r.Top, r.W, r.H, layer, mode, null, applyFilter: true);
+                }
+                catch { continue; }
+                if (exact.Length == 0) continue;
+                var dw = Math.Max(1, (int)Math.Ceiling(r.W * ppb));
+                var dh = Math.Max(1, (int)Math.Ceiling(r.H * ppb));
+                var detailFrame = new MapFrame(r.Left, r.Top, r.W, r.H, dw, dh, ppb,
+                    _zoom, _focusX, _focusZ, 1.0, new Vector());
+                result.Add(new ExtraLayer
+                {
+                    Area = area, Map = map, Frame = detailFrame, Pixels = exact,
+                    Coarse = false, Cacheable = false, Key = key
+                });
+                continue;
+            }
+
+            // Overviews: a cached coarse pyramid is a small blit. A pyramid is pre-coloured and cannot
+            // carry the exact overlay itself; the coarse filter preview is painted over it.
             if (layer is null && map.Pyramid is { } py && py.Mode == mode
                 && py.SuitableFor(ppb, (int)Math.Ceiling(map.Width * ppb), (int)Math.Ceiling(map.Height * ppb)))
             {
                 var overviewFrame = new MapFrame(map.MinX, map.MinZ, map.Width, map.Height, py.Width, py.Height,
                     py.Width / (double)map.Width, py.Height / (double)map.Height,
                     _zoom, _focusX, _focusZ, 1.0, new Vector());
-                result.Add(new ExtraLayer { Area = area, Map = map, Frame = overviewFrame, Pixels = py.Pixels, Key = key });
+                result.Add(new ExtraLayer
+                {
+                    Area = area, Map = map, Frame = overviewFrame, Pixels = py.Pixels,
+                    Coarse = true, Cacheable = true, Key = key
+                });
                 continue;
             }
-            if ((double)map.Width * map.Height * ppb * ppb > 4_000_000) continue;
-            int w = Math.Max(1, (int)Math.Ceiling(map.Width * ppb));
-            int h = Math.Max(1, (int)Math.Ceiling(map.Height * ppb));
+            // No suitable pyramid: render only the visible intersection, exactly as at detail density.
+            // Rendering the whole bounding box was the old 4-megapixel cap, which could drop a visible
+            // cached tile entirely instead of simply making it a little more expensive.
+            if (VisibleLayerRegion(map, vx0, vz0, vx1, vz1) is not { } fallbackRegion) continue;
+            int w = Math.Max(1, (int)Math.Ceiling(fallbackRegion.W * ppb));
+            int h = Math.Max(1, (int)Math.Ceiling(fallbackRegion.H * ppb));
             byte[] px;
-            try { px = ComputeRegion(map, ppb, map.MinX, map.MinZ, map.Width, map.Height, layer, mode, null, applyFilter: false); }
+            try
+            {
+                px = ComputeRegion(map, ppb, fallbackRegion.Left, fallbackRegion.Top,
+                    fallbackRegion.W, fallbackRegion.H, layer, mode, null, applyFilter: true);
+            }
             catch { continue; }
             if (px.Length == 0) continue;
-            var frame = new MapFrame(map.MinX, map.MinZ, map.Width, map.Height, w, h,
-                w / (double)map.Width, h / (double)map.Height,
+            var frame = new MapFrame(fallbackRegion.Left, fallbackRegion.Top,
+                fallbackRegion.W, fallbackRegion.H, w, h, ppb, ppb,
                 _zoom, _focusX, _focusZ, 1.0, new Vector());
-            result.Add(new ExtraLayer { Area = area, Map = map, Frame = frame, Pixels = px, Key = key });
+            result.Add(new ExtraLayer
+            {
+                Area = area, Map = map, Frame = frame, Pixels = px,
+                // The frame is viewport-local, so the cache key (which has no bounds) must not hold it.
+                Coarse = false, Cacheable = false, Key = key
+            });
         }
         // Areas without a cached full map still have a pre-coloured pyramid: show it as a coarse layer.
+        // This fallback is also valid when the rest of the view is exact: an area with only a pyramid has
+        // no exact alternative, and omitting it entirely was the "some regions disappear while panning"
+        // bug when an overlay forced the exact mode. A Y slice is still excluded: the pyramid is the
+        // surface, not the slice the user is inspecting.
         foreach (var (area, py) in areaOverviews)
         {
+            if (layer is not null || ppb >= 1) continue;
             if (ReferenceEquals(area, primary.Area) || areaMaps.ContainsKey(area) || py.Mode != mode) continue;
+            if (area.MaxX < vx0 || area.MinX > vx1 || area.MaxZ < vz0 || area.MinZ > vz1) continue;
             var key = (area, ppb, mode, int.MinValue);
             if (cacheSnapshot.TryGetValue(key, out var cached) && cached.Bitmap is not null)
             {
                 result.Add(cached);
                 continue;
             }
-            if (area.MaxX < vx0 || area.MinX > vx1 || area.MaxZ < vz0 || area.MinZ > vz1) continue;
             int pw = area.WidthBlocks, ph = area.HeightBlocks;
             if (!py.SuitableFor(ppb, (int)Math.Ceiling(pw * ppb), (int)Math.Ceiling(ph * ppb))) continue;
             var overviewFrame = new MapFrame(area.MinX, area.MinZ, pw, ph, py.Width, py.Height,
                 py.Width / (double)pw, py.Height / (double)ph,
                 _zoom, _focusX, _focusZ, 1.0, new Vector());
-            result.Add(new ExtraLayer { Area = area, Map = null, Frame = overviewFrame, Pixels = py.Pixels, Key = key });
+            result.Add(new ExtraLayer
+            {
+                Area = area, Map = null, Frame = overviewFrame, Pixels = py.Pixels,
+                Coarse = true, Cacheable = true, Key = key
+            });
         }
         return result;
     }
 
+    /// <summary>The visible part of an area, plus a pan margin, in integer block coordinates.
+    /// The margin lets a pan stay inside the already rendered extra layer until the next rebuild.</summary>
+    private static (int Left, int Top, int W, int H)? VisibleLayerRegion(TerrainMap map,
+        double vx0, double vz0, double vx1, double vz1)
+    {
+        double margin = Math.Max(8, Math.Max(vx1 - vx0, vz1 - vz0) * 0.2);
+        int left = (int)Math.Floor(Math.Max(map.MinX, vx0 - margin));
+        int right = (int)Math.Ceiling(Math.Min(map.MinX + map.Width - 1, vx1 + margin));
+        int top = (int)Math.Floor(Math.Max(map.MinZ, vz0 - margin));
+        int bottom = (int)Math.Ceiling(Math.Min(map.MinZ + map.Height - 1, vz1 + margin));
+        if (left > right || top > bottom) return null;
+        return (left, top, right - left + 1, bottom - top + 1);
+    }
+
     private void PublishExtraLayers(List<ExtraLayer> layers)
     {
+        // Keep the previous layer of an area until its replacement is ready. Zooming out/in changes the
+        // density of the extra tiles a frame before their bitmap arrives; clearing them first made the
+        // neighbouring regions blink and made the zoom look like a jump even when the world was aligned.
+        // Never draw an extra layer for the area that is currently the primary: an area switch can
+        // leave its previous frame in the list until the next rebuild.
+        var primaryArea = Terrain?.Area;
+        if (primaryArea is not null)
+            layers = layers.Where(l => !ReferenceEquals(l.Area, primaryArea)).ToList();
+        var incoming = new HashSet<ChunkArea>(layers.Select(l => l.Area));
+        var kept = _extraLayers
+            .Where(l => !incoming.Contains(l.Area) && !ReferenceEquals(l.Area, primaryArea))
+            .ToList();
         _extraLayers.Clear();
+        _extraLayers.AddRange(kept);
         foreach (var layer in layers)
         {
             if (layer.Bitmap is not null)
@@ -712,7 +894,7 @@ public class TerrainView : Control
             }
             layer.Bitmap = bmp;
             _extraLayers.Add(layer);
-            _extraCache[layer.Key] = layer;
+            if (layer.Cacheable) _extraCache[layer.Key] = layer;
         }
     }
 
@@ -723,22 +905,49 @@ public class TerrainView : Control
         ClampFocus();
         CheckAreaRequest(); // we reached another area - the window will build its map (AreaRequested)
 
-        // The viewport is entirely in the void between areas: there is nothing to build. Keep the previous frame
-        // (it moves off screen with the focus) instead of a one-pixel bitmap at the map edge.
+        var ppb = EffectivePpb();
+        _ppb = ppb;
+        _zoom = _wanted / Math.Max(1e-9, ppb);
+        // One quality decision for the whole view: every visible full map either uses its pyramid or
+        // every one is rendered exactly. The active tile no longer gets a different LOD than the rest.
+        bool overview = VisibleMapsHaveOverview(tm, ppb);
+
+        // The active map can be off screen while a preloaded neighbour is what the user is looking at.
+        // Do not compute the primary region in that case: its coordinates are clamped to the primary
+        // bounds and would index outside the map. Publish the cached neighbour instead.
         if (!ViewportShowsData())
         {
+            if (!ViewportShowsAnyCachedData())
+            {
+                // The viewport is entirely in the void between areas: keep the previous frame
+                // (it moves off screen with the focus) instead of a one-pixel bitmap at the map edge.
+                LodStatus = FormatLod();
+                LodStatusChanged?.Invoke(LodStatus);
+                _softZoom = false;
+                InvalidateVisual();
+                return;
+            }
+
+            _rebuildGen++; // cancel a pending primary rebuild: it belongs to a viewport that is gone
+            _rebuildPending = false;
+            var (ex0, ez0, ex1, ez1) = VisibleWorld();
+            var extrasOnly = BuildExtraLayers(tm, ppb, LayerY, _mode, ex0, ez0, ex1, ez1,
+                new Dictionary<ChunkArea, TerrainMap>(_areaMaps),
+                new Dictionary<ChunkArea, TerrainPyramid>(_areaOverviews),
+                new Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer>(_extraCache),
+                allowOverview: overview);
+            SetBusy(false);
+            PublishExtraLayers(extrasOnly);
+            _softZoom = false;
             LodStatus = FormatLod();
             LodStatusChanged?.Invoke(LodStatus);
             InvalidateVisual();
             return;
         }
-
-        var ppb = EffectivePpb();
         // Coarse overview: one pre-coloured pyramid pixel per CellSize×CellSize block cell. At this
         // density the exact per-column LOD pass would visit the same blocks only to average them into
         // the same few pixels; the pyramid makes the whole-map view a bitmap blit.
-        if (LayerY is null && Filter is null && tm.Pyramid is { } pyramid && pyramid.Mode == _mode
-            && pyramid.SuitableFor(ppb, (int)Math.Ceiling(tm.Width * ppb), (int)Math.Ceiling(tm.Height * ppb)))
+        if (overview && tm.Pyramid is { } pyramid)
         {
             _ppb = ppb;
             _zoom = _wanted / Math.Max(1e-9, ppb);
@@ -758,9 +967,11 @@ public class TerrainView : Control
             var extras = BuildExtraLayers(tm, ppb, null, _mode, evx0, evz0, evx1, evz1,
                 new Dictionary<ChunkArea, TerrainMap>(_areaMaps),
                 new Dictionary<ChunkArea, TerrainPyramid>(_areaOverviews),
-                new Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer>(_extraCache));
+                new Dictionary<(ChunkArea Area, double Ppb, int Mode, int Layer), ExtraLayer>(_extraCache),
+                allowOverview: true);
             SetBusy(false);
             PublishBitmap(pyramid.Pixels, overviewFrame);
+            _softZoom = false;
             PublishExtraLayers(extras);
             LodStatus = $"LOD: overview {pyramid.CellSize}×{pyramid.CellSize} (coarse)";
             LodStatusChanged?.Invoke(LodStatus);
@@ -860,7 +1071,7 @@ public class TerrainView : Control
                 px = Array.Empty<byte>();
             }
             var extras = BuildExtraLayers(tm, ppbLocal, layer, mode, vy0x, vy0z, vy1x, vy1z,
-                areaMapsSnapshot, overviewSnapshot, extraCacheSnapshot);
+                areaMapsSnapshot, overviewSnapshot, extraCacheSnapshot, allowOverview: false);
 
             Dispatcher.UIThread.Post(() =>
             {
@@ -910,6 +1121,12 @@ public class TerrainView : Control
         }
 
         _frame = frame; // from now on we draw exactly this frame with exactly this geometry
+        // A background rebuild can finish after the user already zoomed again: only the frame that
+        // matches the current zoom/density may end the soft-scaling window.
+        if (Math.Abs(frame.Ppb - EffectivePpb()) < 1e-9 &&
+            Math.Abs(frame.PpbY - EffectivePpb()) < 1e-9 &&
+            Math.Abs(frame.FocusX - _focusX) < 0.51 && Math.Abs(frame.FocusZ - _focusZ) < 0.51)
+            _softZoom = false;
     }
 
     private string FormatLod()
@@ -926,6 +1143,91 @@ public class TerrainView : Control
         InvalidateVisual();
         CheckAreaRequest(); // panning without a rebuild can also bring the viewport to another area
         // the transform is computed in DisplayTransform from the frame
+    }
+
+    /// <summary>Whether the current view is allowed to use coarse pyramids for the active tile. This mirrors
+    /// the primary branch of <see cref="RebuildBitmap"/> so coverage checks do not accept a coarse layer
+    /// while the active tile is exact (or vice versa).</summary>
+    private bool AllowOverviewForCurrentView()
+        => _ppb < 1 && Terrain is { } tm && VisibleMapsHaveOverview(tm, _ppb);
+
+    /// <summary>
+    ///     True when every cached area that intersects the viewport has an extra layer covering the visible
+    ///     part. A pan can stay inside the primary bitmap's margin while exposing a neighbour that was not
+    ///     on screen when that bitmap was built; without this check the neighbour would stay absent until an
+    ///     unrelated rebuild. The primary map itself is covered by <see cref="ViewportCovered"/>.
+    /// </summary>
+    private bool VisibleAreasCovered()
+    {
+        var tm = Terrain;
+        if (tm is null) return true;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        bool detail = _ppb >= 1;
+        foreach (var (area, map) in _areaMaps)
+        {
+            if (ReferenceEquals(map, tm)) continue;
+            double ix0 = Math.Max(vx0, map.MinX);
+            double ix1 = Math.Min(vx1, map.MinX + map.Width - 1);
+            double iz0 = Math.Max(vz0, map.MinZ);
+            double iz1 = Math.Min(vz1, map.MinZ + map.Height - 1);
+            if (ix0 > ix1 || iz0 > iz1) continue;
+            bool exactWanted = detail || !AllowOverviewForCurrentView();
+            bool covered = false;
+            foreach (var layer in _extraLayers)
+            {
+                if (!ReferenceEquals(layer.Area, area)) continue;
+                if (layer.Coarse)
+                {
+                    if (exactWanted) continue; // a pyramid cannot stand in for an exact layer
+                }
+                else if (Math.Abs(layer.Frame.Ppb - _ppb) > 1e-9 ||
+                         Math.Abs(layer.Frame.PpbY - _ppb) > 1e-9)
+                {
+                    continue; // an exact frame from another density would be visibly re-scaled
+                }
+                var f = layer.Frame;
+                if (f.Left <= ix0 && f.Left + f.W >= ix1 &&
+                    f.Top <= iz0 && f.Top + f.H >= iz1)
+                {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) return false;
+        }
+        // Areas that have only a pyramid are not in _areaMaps, but BuildExtraLayers still paints them
+        // (exactly or as the coarse fallback). A pan that reveals one of them must request a rebuild:
+        // otherwise the primary frame covers the viewport, VisibleAreasCovered returns true, and the
+        // newly visible area stays blank. This was most visible with an overlay, where the exact mode
+        // made the omission look like a disappearing region.
+        if (_ppb < 1 && LayerY is null)
+        {
+            foreach (var (area, py) in _areaOverviews)
+            {
+                if (ReferenceEquals(area, tm.Area) || _areaMaps.ContainsKey(area) || py.Mode != _mode) continue;
+                double ix0 = Math.Max(vx0, area.MinX);
+                double ix1 = Math.Min(vx1, area.MaxX);
+                double iz0 = Math.Max(vz0, area.MinZ);
+                double iz1 = Math.Min(vz1, area.MaxZ);
+                if (ix0 > ix1 || iz0 > iz1) continue;
+                if (!py.SuitableFor(_ppb, (int)Math.Ceiling(area.WidthBlocks * _ppb),
+                        (int)Math.Ceiling(area.HeightBlocks * _ppb))) continue;
+                bool covered = false;
+                foreach (var layer in _extraLayers)
+                {
+                    if (!ReferenceEquals(layer.Area, area) || !layer.Coarse) continue;
+                    var f = layer.Frame;
+                    if (f.Left <= ix0 && f.Left + f.W >= ix1 &&
+                        f.Top <= iz0 && f.Top + f.H >= iz1)
+                    {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) return false;
+            }
+        }
+        return true;
     }
 
     /// <summary>
@@ -957,7 +1259,7 @@ public class TerrainView : Control
     private (double zoomX, double zoomY, double panX, double panY, double focusX, double focusZ,
         double ppbX, double ppbY) DisplayTransform(MapFrame f)
     {
-        var canSoft = _bmp is not null && (IsRebuilding || RegionCoversWorldVisible(f));
+        var canSoft = _bmp is not null && (_softZoom || IsRebuilding || RegionCoversWorldVisible(f));
         if (!canSoft)
             return (f.Zoom, f.Zoom, f.Pan.X, f.Pan.Y, f.FocusX, f.FocusZ,
                 f.Ppb * f.Zoom, f.PpbY * f.Zoom);
@@ -1000,26 +1302,53 @@ public class TerrainView : Control
         ClampFocus();
         var oldPpb = _ppb;
         var newPpb = EffectivePpb();
-        if (Math.Abs(newPpb - oldPpb) < 1e-9)
+        _ppb = newPpb;
+        _zoom = nw / newPpb;
+        CheckAreaRequest(); // the visible world rectangle changed even when the density did not
+
+        if (Math.Abs(newPpb - oldPpb) < 1e-9 && ViewportCovered())
         {
-            _ppb = newPpb;
-            _zoom = nw / newPpb;
-            // the density did not change and the shown frame still covers the viewport - scale it smoothly
-            if (ViewportCovered())
+            // The density did not change and the shown frame still covers the viewport - scale it
+            // smoothly. A newly revealed neighbour may still need a rebuild, but not in the middle of
+            // a wheel burst: coalesce that with the zoom rebuild below.
+            if (VisibleAreasCovered())
             {
-                CheckAreaRequest(); // zooming without a rebuild also changes the visible world rectangle
                 InvalidateVisual();
                 return;
             }
         }
 
-        RebuildBitmap();
+        if (_bmp is null)
+        {
+            RebuildBitmap();
+            return;
+        }
+
+        // Do not rebuild on every wheel notch. Keep drawing the last frame scaled (the geometry is
+        // correct at any density) and rebuild once the wheel settles; otherwise a 4-area save starts
+        // and cancels a 26M-column exact pass between notches, which is the visible "jerk".
+        _softZoom = true;
+        InvalidateVisual();
+        ScheduleZoomRebuild();
+    }
+
+    /// <summary>Coalesces rapid wheel steps: one rebuild after the gesture stops, not one per notch.</summary>
+    private void ScheduleZoomRebuild()
+    {
+        var token = ++_zoomRebuildToken;
+        _ = Task.Delay(140).ContinueWith(_ => Dispatcher.UIThread.Post(() =>
+        {
+            if (token != _zoomRebuildToken) return;
+            if (_softZoom) RebuildBitmap();
+        }), TaskScheduler.Default);
     }
 
     private void PanBy(Vector dControl)
     {
         var tm = Terrain;
-        if (tm is null) return;
+        if (tm is null || (Math.Abs(dControl.X) < 1e-9 && Math.Abs(dControl.Y) < 1e-9)) return;
+        // A resize must not re-fit the map after the user has panned away from the initial view.
+        _userZoomed = true;
         _focusX -= dControl.X / _wanted;
         _focusZ -= dControl.Y / _wanted;
         ClampFocus();
@@ -1028,6 +1357,7 @@ public class TerrainView : Control
         if (ViewportCovered())
         {
             Recentre();
+            if (!VisibleAreasCovered()) RebuildBitmap();
             return;
         }
 
@@ -1053,7 +1383,8 @@ public class TerrainView : Control
     private byte[] ComputeRegion(TerrainMap tm, double ppb, int left, int top, int rw, int rh, int? layerY, int mode,
         TerrainColorCache? colorCache, bool applyFilter = true)
     {
-        // Extra area layers are drawn without the active-area filter: the filter grid belongs to Terrain.
+        // The filter is global (a sparse overlay over the whole save), so the same steps apply to
+        // the active map and to every cached neighbour rendered by BuildExtraLayers.
         var filter = applyFilter ? Filter : null;
         var W = tm.Width;
         double range = tm.MaxSurface - tm.MinSurface;
@@ -1077,11 +1408,10 @@ public class TerrainView : Control
                     var draw = false;
                     if (filter is not null)
                     {
-                        var fi = FilterGridIndex(filter, wx, wz);
-                        if (fi >= 0 && filter.Count[fi] > 0)
+                        if (filter.TryGet(wx, wz, out var hitId, out _, out var hitCount))
                         {
-                            var c = FilterColor(filter.TopBlock[fi]);
-                            var boost = Math.Min(70, filter.Count[fi] * 14); // saturation by the number of blocks in the column
+                            var c = FilterColor(hitId);
+                            var boost = Math.Min(70, hitCount * 14); // saturation by the number of blocks in the column
                             R = (byte)Math.Min(255, c.R + boost);
                             G = (byte)Math.Min(255, c.G + boost);
                             B = (byte)Math.Min(255, c.B + boost);
@@ -1184,15 +1514,11 @@ public class TerrainView : Control
                         var i = (z - tm.MinZ) * W + (x0 - tm.MinX);
                         for (var x = x0; x < x1; x++)
                         {
-                            if (filter is not null)
+                            if (filter is not null && filter.TryGet(x, z, out var hitId, out _, out var hitCount))
                             {
-                                var fi = FilterGridIndex(filter, x, z);
-                                if (fi >= 0 && filter.Count[fi] > 0)
-                                {
-                                    if (!hitAny) hitColor = FilterColor(filter.TopBlock[fi]);
-                                    hitAny = true;
-                                    hitCells += filter.Count[fi];
-                                }
+                                if (!hitAny) hitColor = FilterColor(hitId);
+                                hitAny = true;
+                                hitCells += hitCount;
                             }
 
                             if (slice)
@@ -1311,13 +1637,40 @@ public class TerrainView : Control
     }
 
     /// <summary>Enables/disables the block overlay filter. map = null turns it off.</summary>
-    public void SetFilterOverlay(BlockFilterMap? map, IReadOnlyDictionary<int, Color>? colors, bool dimOthers)
+    public void SetFilterOverlay(IBlockFilter? map, IReadOnlyDictionary<int, Color>? colors, bool dimOthers)
     {
         Filter = map;
         _filterColors = colors is null ? null : new Dictionary<int, Color>(colors);
         _filterDimOthers = dimOthers;
+        _filterPreview = map is BlockFilterOverlay { Preview: { } preview } ? preview : null;
+        _filterPreviewBitmap = _filterPreview is null ? null : CreateFilterPreviewBitmap(_filterPreview);
+        // Extra-area bitmaps were produced without (or for another) filter; drop them so the
+        // whole-map view redraws every visible tile with the new overlay.
+        _extraCache.Clear();
+        _extraLayers.Clear();
         RebuildBitmap();
         InvalidateVisual();
+    }
+
+    private unsafe WriteableBitmap CreateFilterPreviewBitmap(BlockFilterPreview preview)
+    {
+        var bmp = new WriteableBitmap(new PixelSize(preview.PixelWidth, preview.PixelHeight),
+            new Vector(96, 96), PixelFormat.Bgra8888, AlphaFormat.Premul);
+        using var fb = bmp.Lock();
+        var dst = (byte*)fb.Address;
+        for (int y = 0; y < preview.PixelHeight; y++)
+        {
+            var row = dst + (long)y * fb.RowBytes;
+            for (int x = 0; x < preview.PixelWidth; x++)
+            {
+                int id = preview.Ids[y * preview.PixelWidth + x];
+                int q = x * 4;
+                if (id == 0) { row[q] = row[q + 1] = row[q + 2] = row[q + 3] = 0; continue; }
+                var c = FilterColor(id);
+                row[q] = c.B; row[q + 1] = c.G; row[q + 2] = c.R; row[q + 3] = 255;
+            }
+        }
+        return bmp;
     }
 
     /// <summary>Switches between "base map dimmed" and "matches only" without recomputing the filter.</summary>
@@ -1327,6 +1680,8 @@ public class TerrainView : Control
         _filterDimOthers = dimOthers;
         if (Filter is not null)
         {
+            _extraCache.Clear();
+            _extraLayers.Clear();
             RebuildBitmap();
             InvalidateVisual();
         }
@@ -1344,27 +1699,124 @@ public class TerrainView : Control
         return _filterColors is not null && _filterColors.TryGetValue(id, out var c) ? c : HighlightColor(null, id);
     }
 
-    /// <summary>Column index in the filter grid (-1 = out of bounds / no filter).</summary>
-    private int FilterGridIndex(int wx, int wz) => FilterGridIndex(Filter, wx, wz);
-
-    private int FilterGridIndex(BlockFilterMap? f, int wx, int wz)
-    {
-        if (f is null) return -1;
-        if (wx < f.MinX || wz < f.MinZ || wx >= f.MinX + f.Width || wz >= f.MinZ + f.Height) return -1;
-        return (wz - f.MinZ) * f.Width + (wx - f.MinX);
-    }
-
     // ===================== RENDERING =====================
 
-    /// <summary>Draws cached non-primary areas. Their frames always cover the whole area at the current
-    /// LOD density, so a pan/zoom only scales the ready bitmap; the primary area is drawn afterwards.
-    /// The transform is derived from the PRIMARY frame, not from the live focus: while an exact frame is
-    /// frozen during a rebuild, using the live focus shifted every extra area relative to the primary map.</summary>
-    private void DrawExtraLayers(DrawingContext dc, MapFrame primaryFrame)
+    /// <summary>Draws cached non-primary areas. Exact detail frames cover the visible intersection plus a
+    /// margin; overview frames cover the whole area. A pan/zoom only scales the ready bitmap; the primary
+    /// area is drawn afterwards. While the primary frame is on screen its transform is used, so a frozen
+    /// exact frame does not shift against it; when the primary is off screen the live focus/zoom is used.</summary>
+    private (double PpbX, double PpbY, double BaseX, double BaseY) ScreenMapping(MapFrame primaryFrame)
     {
         var (primaryZoomX, primaryZoomY, primaryPanX, primaryPanY, _, _, _, _) = DisplayTransform(primaryFrame);
-        double screenPpbX = primaryFrame.Ppb * primaryZoomX;
-        double screenPpbY = primaryFrame.PpbY * primaryZoomY;
+        if (ViewportShowsData())
+            return (primaryFrame.Ppb * primaryZoomX, primaryFrame.PpbY * primaryZoomY,
+                primaryPanX * primaryZoomX - primaryFrame.Left * primaryFrame.Ppb * primaryZoomX,
+                primaryPanY * primaryZoomY - primaryFrame.Top * primaryFrame.PpbY * primaryZoomY);
+        // The active map is off screen: place extras through the live focus/zoom instead of the
+        // stale primary frame, which may belong to a different pan and scale.
+        return (_wanted, _wanted, ViewportW / 2 - _focusX * _wanted,
+            ViewportH / 2 - _focusZ * _wanted);
+    }
+
+    /// <summary>Draws a coarse overview of every visible cached map below the exact/primary layers.
+    /// While a rebuild is in flight the old exact frames are deliberately kept on screen; a pan or a
+    /// zoom-out can reveal a strip outside those frames before the new bitmap is published. Without
+    /// this base layer that strip is the map background, i.e. a hole that blinks for a frame or two.
+    /// The pyramids are small bitmap blits and the exact frame is drawn on top, so this only shows
+    /// through where the current exact coverage is genuinely absent.</summary>
+    private void DrawOverviewBackdrop(DrawingContext dc, MapFrame primaryFrame)
+    {
+        if (LayerY is not null) return; // a pyramid is the surface, not the current Y slice
+        // Always paint this base layer: exact frames cover it at rest, and it shows through only where
+        // the current exact coverage is absent (a rebuild in flight, a pyramid-only area, or a strip
+        // exposed by a pan/zoom before the next frame). Deciding coverage here would reintroduce the
+        // very holes this layer exists to hide.
+        var (screenPpbX, screenPpbY, baseScreenX, baseScreenY) = ScreenMapping(primaryFrame);
+        if (!(screenPpbX > 0) || !(screenPpbY > 0) ||
+            double.IsInfinity(screenPpbX) || double.IsInfinity(screenPpbY)) return;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        void Draw(TerrainPyramid py, int minX, int minZ, int mapWidth, int mapHeight)
+        {
+            if (py.Mode != _mode) return;
+            if (minX + mapWidth - 1 < vx0 || minX > vx1 || minZ + mapHeight - 1 < vz0 || minZ > vz1) return;
+            double ppbX = py.Width / (double)mapWidth;
+            double ppbY = py.Height / (double)mapHeight;
+            double zoomX = screenPpbX / ppbX;
+            double zoomY = screenPpbY / ppbY;
+            if (!(zoomX > 0) || !(zoomY > 0) || double.IsInfinity(zoomX) || double.IsInfinity(zoomY)) return;
+            double sx = baseScreenX + minX * screenPpbX;
+            double sy = baseScreenY + minZ * screenPpbY;
+            using (dc.PushTransform(Matrix.CreateTranslation(sx / zoomX, sy / zoomY) *
+                                    Matrix.CreateScale(zoomX, zoomY)))
+                dc.DrawImage(OverviewBitmap(py), new Rect(0, 0, py.Width, py.Height));
+
+            // The pyramid has no per-column overlay; paint the same coarse preview as a normal coarse
+            // layer so a transient hole does not switch from filtered map to plain background.
+            if (Filter is not null)
+            {
+                var areaRect = new Rect(sx, sy, Math.Max(0, mapWidth * screenPpbX), Math.Max(0, mapHeight * screenPpbY));
+                dc.FillRectangle(_filterDimOthers ? FilterDimBrush : FilterBackgroundBrush, areaRect);
+                if (_filterPreview is { } preview && _filterPreviewBitmap is not null)
+                {
+                    double pvZoomX = screenPpbX / preview.PpbX;
+                    double pvZoomY = screenPpbY / preview.PpbY;
+                    if (pvZoomX > 0 && pvZoomY > 0 && !double.IsInfinity(pvZoomX) && !double.IsInfinity(pvZoomY))
+                    {
+                        double pvX = (baseScreenX + preview.MinX * screenPpbX) / pvZoomX;
+                        double pvY = (baseScreenY + preview.MinZ * screenPpbY) / pvZoomY;
+                        using (dc.PushClip(areaRect))
+                        using (dc.PushTransform(Matrix.CreateTranslation(pvX, pvY) *
+                                                Matrix.CreateScale(pvZoomX, pvZoomY)))
+                            dc.DrawImage(_filterPreviewBitmap,
+                                new Rect(0, 0, _filterPreviewBitmap.PixelSize.Width, _filterPreviewBitmap.PixelSize.Height));
+                    }
+                }
+            }
+        }
+        foreach (var map in _areaMaps.Values)
+        {
+            var py = map.Pyramid ?? FallbackPyramid(map);
+            if (py is not null) Draw(py, map.MinX, map.MinZ, map.Width, map.Height);
+        }
+        foreach (var (area, py) in _areaOverviews)
+        {
+            if (_areaMaps.ContainsKey(area) || ReferenceEquals(area, Terrain?.Area)) continue;
+            Draw(py, area.MinX, area.MinZ, area.WidthBlocks, area.HeightBlocks);
+        }
+    }
+
+    /// <summary>A 512-pixel fallback for a small map, whose normal pyramid is null because a
+    /// full-resolution preview would be larger than the map itself. This is only used for the
+    /// transient backdrop, never for the normal exact/overview decision.</summary>
+    private TerrainPyramid? FallbackPyramid(TerrainMap map)
+    {
+        if (_fallbackPyramids.TryGetValue(map, out var cached)) return cached;
+        var py = TerrainPyramid.Build(map, _mode, 512);
+        _fallbackPyramids[map] = py;
+        return py;
+    }
+
+    private WriteableBitmap OverviewBitmap(TerrainPyramid py)
+    {
+        if (_overviewBitmaps.TryGetValue(py, out var bmp)) return bmp;
+        bmp = new WriteableBitmap(new PixelSize(py.Width, py.Height), new Vector(96, 96),
+            PixelFormat.Bgra8888, AlphaFormat.Premul);
+        using var fb = bmp.Lock();
+        unsafe
+        {
+            var dst = (byte*)fb.Address;
+            fixed (byte* src = py.Pixels)
+                for (var y = 0; y < py.Height; y++)
+                    Buffer.MemoryCopy(src + (long)y * py.Width * 4,
+                        dst + (long)y * fb.RowBytes, py.Width * 4, py.Width * 4);
+        }
+        _overviewBitmaps[py] = bmp;
+        return bmp;
+    }
+
+    private void DrawExtraLayers(DrawingContext dc, MapFrame primaryFrame)
+    {
+        var (screenPpbX, screenPpbY, baseScreenX, baseScreenY) = ScreenMapping(primaryFrame);
         if (!(screenPpbX > 0) || !(screenPpbY > 0)
             || double.IsInfinity(screenPpbX) || double.IsInfinity(screenPpbY)) return;
         foreach (var layer in _extraLayers)
@@ -1374,15 +1826,43 @@ public class TerrainView : Control
             double zoomX = screenPpbX / f.Ppb;
             double zoomY = screenPpbY / f.PpbY;
             if (!(zoomX > 0) || !(zoomY > 0) || double.IsInfinity(zoomX) || double.IsInfinity(zoomY)) continue;
-            // Place the extra bitmap through the PRIMARY frame's screen mapping. This keeps every area
-            // in the same coordinate system even when the primary frame is frozen during a rebuild.
+            // Place the extra bitmap through the same screen mapping as the primary map. This keeps
+            // every area in one coordinate system even when the primary frame is frozen during a rebuild.
             // Translation is in pre-scale units (the matrix scales it), hence the division by zoom.
-            double screenX0 = primaryPanX * primaryZoomX + (f.Left - primaryFrame.Left) * screenPpbX;
-            double screenY0 = primaryPanY * primaryZoomY + (f.Top - primaryFrame.Top) * screenPpbY;
+            double screenX0 = baseScreenX + f.Left * screenPpbX;
+            double screenY0 = baseScreenY + f.Top * screenPpbY;
             double panX = screenX0 / zoomX;
             double panY = screenY0 / zoomY;
             using (dc.PushTransform(Matrix.CreateTranslation(panX, panY) * Matrix.CreateScale(zoomX, zoomY)))
                 dc.DrawImage(layer.Bitmap, new Rect(0, 0, layer.Bitmap.PixelSize.Width, layer.Bitmap.PixelSize.Height));
+
+            // A pyramid has no per-column filter data; paint the coarse match overlay on top of this
+            // area, clipped to the area's screen rectangle. Full maps already carry the exact filter.
+            if (layer.Coarse && LayerY is null && Filter is not null)
+            {
+                double screenW = f.W * screenPpbX;
+                double screenH = f.H * screenPpbY;
+                var areaRect = new Rect(screenX0, screenY0, Math.Max(0, screenW), Math.Max(0, screenH));
+                // Coarse fallback must obey the same "dim the rest" / "matches only" choice as an
+                // exact layer; otherwise a pyramid area shows the base map in "matches only".
+                dc.FillRectangle(_filterDimOthers ? FilterDimBrush : FilterBackgroundBrush, areaRect);
+                if (_filterPreview is { } preview && _filterPreviewBitmap is not null)
+                {
+                    double pvZoomX = screenPpbX / preview.PpbX;
+                    double pvZoomY = screenPpbY / preview.PpbY;
+                    if (pvZoomX > 0 && pvZoomY > 0 && !double.IsInfinity(pvZoomX) && !double.IsInfinity(pvZoomY))
+                    {
+                        double pvScreenX0 = baseScreenX + preview.MinX * screenPpbX;
+                        double pvScreenY0 = baseScreenY + preview.MinZ * screenPpbY;
+                        double pvPanX = pvScreenX0 / pvZoomX;
+                        double pvPanY = pvScreenY0 / pvZoomY;
+                        using (dc.PushClip(areaRect))
+                        using (dc.PushTransform(Matrix.CreateTranslation(pvPanX, pvPanY) * Matrix.CreateScale(pvZoomX, pvZoomY)))
+                            dc.DrawImage(_filterPreviewBitmap,
+                                new Rect(0, 0, _filterPreviewBitmap.PixelSize.Width, _filterPreviewBitmap.PixelSize.Height));
+                    }
+                }
+            }
         }
     }
 
@@ -1405,6 +1885,7 @@ public class TerrainView : Control
             DrawCenteredText(dc, "Rendering the map…");
             return;
         }
+        DrawOverviewBackdrop(dc, frame);
         DrawExtraLayers(dc, frame);
         var (dispZoomX, dispZoomY, dispPanX, dispPanY, _, _, _, _) = DisplayTransform(frame);
         var m = Matrix.CreateTranslation(dispPanX, dispPanY) * Matrix.CreateScale(dispZoomX, dispZoomY);
@@ -1459,10 +1940,9 @@ public class TerrainView : Control
             }
         }
 
-        // The screen moved outside the built map (to another area or into the void between them):
-        // without a label this would look like "the map disappeared". The other areas are drawn only
-        // when the user scrolls to them - the window builds their map on AreaRequested.
-        if (!ViewportShowsData()) DrawVoidHint(dc);
+        // The screen moved outside every cached map (into the void between areas): without a label this
+        // would look like "the map disappeared". A cached neighbour is not a void; do not cover it.
+        if (!ViewportShowsAnyCachedData()) DrawVoidHint(dc);
 
         // the rectangular selection rubber band (in the control's screen coordinates)
         if (_shiftSelect && Terrain is not null)
@@ -1580,12 +2060,10 @@ public class TerrainView : Control
         var bid = Terrain.TopBlock[i];
         var code = Terrain.Registry?.CodeOf(bid);
         var filterInfo = "";
-        var fiHover = FilterGridIndex(wx, wz);
-        if (fiHover >= 0 && Filter is not null && Filter.Count[fiHover] > 0)
+        if (Filter is not null && Filter.TryGet(wx, wz, out var fid, out var fy, out var fc))
         {
-            var fid = Filter.TopBlock[fiHover];
             var fcode = Terrain.Registry?.CodeOf(fid) ?? "id:" + fid;
-            filterInfo = $"  |  * {fcode} at Y={Filter.TopY[fiHover]} ({Filter.Count[fiHover]} blocks)";
+            filterInfo = $"  |  * {fcode} at Y={fy} ({fc} blocks)";
         }
 
         // with an active Y layer show the real block AT THAT level (the slice), not just the surface

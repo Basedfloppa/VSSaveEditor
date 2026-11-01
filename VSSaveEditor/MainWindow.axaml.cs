@@ -57,9 +57,10 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private int _dumpSeq; // dump epoch: a background build does not publish a stale result
     private bool _exportingImage; // guard against exporting the map to PNG twice
     private CancellationTokenSource? _filterCts;
-    private BlockFilterMap? _filterMap;
+    private IBlockFilter? _filterMap;
     private HashSet<int>? _filterMapKey; // which id set the current map was built for
-    private SearchScope? _filterMapScope; // ...and for which scope (null — the whole area)
+    private SearchScope? _filterMapScope; // ...and for which scope (null — the whole save)
+    private VSSaveFile? _filterMapSave; // ...and for which save (a new save can reuse the same ids)
     private int _lastCx, _lastCz; // the last shown chunk (fallback when the X/Z fields do not parse)
     private int? _layerYLast; // the last applied Y layer (for persistence)
     private int _loadEpoch; // load epoch: background tasks of older loads publish no data
@@ -106,7 +107,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         };
         Map.LodStatusChanged += txt => LodStatusText.Text = txt;
         // The user scrolled to another area of the save - build its map in the background (P1-21).
-        // Until then the map is drawn only for the loaded area, distant parts are not shown.
+        // Cached neighbours are already drawn as extra layers; this publishes the one under the centre.
         Map.AreaRequested += area => _ = LoadAreaAsync(area);
         // "rendering…" in the layer label: a Y slice decodes the chunks of the visible area - when zoomed out
         // this takes noticeable time, and the user should see that the map is still rebuilding.
@@ -437,7 +438,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         JpegQualityBox.Value = Math.Clamp(_settings.JpegQuality, 30, 100);
         ExportFilterBox.SelectedIndex = Math.Clamp(_settings.ExportFilterMode, 0, 3);
         ExportTransparentBgCheck.IsChecked = _settings.ExportTransparentBg;
-        ExportRegionBox.SelectedIndex = Math.Clamp(_settings.ExportRegionMode, 0, 1);
+        ExportRegionBox.SelectedIndex = Math.Clamp(_settings.ExportRegionMode, 0, 2);
         UpdateExportRegionLabel();
         _filterCodes.Clear();
         foreach (var c in _settings.OverlayCodes) _filterCodes.Add(c);
@@ -463,7 +464,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _settings.JpegQuality = (int)Math.Clamp(JpegQualityBox.Value ?? 90, 30, 100);
         _settings.ExportFilterMode = Math.Clamp(ExportFilterBox.SelectedIndex, 0, 3);
         _settings.ExportTransparentBg = ExportTransparentBgCheck.IsChecked == true;
-        _settings.ExportRegionMode = Math.Clamp(ExportRegionBox.SelectedIndex, 0, 1);
+        _settings.ExportRegionMode = Math.Clamp(ExportRegionBox.SelectedIndex, 0, 2);
         ScheduleSettingsSave();
     }
 
@@ -511,24 +512,37 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             ShowChunkData(sx, sz);
     }
 
-    /// <summary>Explains what will be exported: the whole built area or the selected chunk region.</summary>
+    /// <summary>Explains what will be exported: every build tile, the active area or the selected chunk region.</summary>
     private void UpdateExportRegionLabel()
     {
         if (ExportRegionLabel is null) return;
-        var areaNote = _areas is { Areas.Count: > 1 } many
-            ? $" · area {(Map.Terrain?.Area?.Index ?? 0) + 1} of {many.Areas.Count}"
-            : "";
-        if (ExportRegionBox.SelectedIndex != 1)
+        if (ExportRegionBox.SelectedIndex == 0)
         {
-            var t = Map.Terrain;
-            // "the whole world" now means the built area: the map does not draw distant chunk groups (P1-21)
-            ExportRegionLabel.Text = t is null ? "whole area" : $"whole area ({t.Width}×{t.Height} blocks){areaNote}";
+            if (_areas is { Areas.Count: > 0 } all)
+            {
+                int x0 = all.Areas.Min(a => a.MinX), x1 = all.Areas.Max(a => a.MaxX);
+                int z0 = all.Areas.Min(a => a.MinZ), z1 = all.Areas.Max(a => a.MaxZ);
+                var suffix = all.Areas.Count > 1 ? " — large unions are downscaled automatically" : "";
+                ExportRegionLabel.Text = $"whole save — {all.Areas.Count} area(s), {x1 - x0 + 1}×{z1 - z0 + 1} blocks{suffix}";
+            }
+            else ExportRegionLabel.Text = "whole save";
+            return;
+        }
+
+        var t = Map.Terrain;
+        if (ExportRegionBox.SelectedIndex == 2)
+        {
+            var areaNote = _areas is { Areas.Count: > 1 } many
+                ? $" · area {(t?.Area?.Index ?? 0) + 1} of {many.Areas.Count}"
+                : "";
+            // The active tile alone keeps the requested pixels-per-block scale; neighbouring tiles are not exported.
+            ExportRegionLabel.Text = t is null ? "active area" : $"active area ({t.Width}×{t.Height} blocks){areaNote}";
             return;
         }
 
         if (Map.SelectionBounds is not { } b)
         {
-            ExportRegionLabel.Text = "no chunks selected — the whole area will be exported";
+            ExportRegionLabel.Text = "no chunks selected — the whole save will be exported";
             return;
         }
 
@@ -1378,6 +1392,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _filterMap = null;
         _filterMapKey = null;
         _filterMapScope = null;
+        _filterMapSave = null;
         Map.SetFilterOverlay(null, null, FilterDimCheck.IsChecked == true);
         PopulateFilterList();
         SaveSettings();
@@ -1426,15 +1441,13 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             }
 
             var save = _save;
-            // The overlay is built for the scope, not for the whole area: the scope is passed to the scanner as the
-            // set of chunks to read, while the map itself stays the area's — the overlay is aligned to it 1:1, and a
-            // smaller map would move the highlights away from the blocks they belong to.
-            var grid = Map.Terrain!;
+            // The overlay is global: every build tile and every chunk area of the save is scanned,
+            // so it does not stop at the edge of the 16 Mi tile that happens to be active. The
+            // scope still narrows the scan when the user asked for a rectangle/area.
             var scope = _filterScope.HasRegion && !_filterScope.IsEmpty ? _filterScope : null;
-            // cache: the same id set, the same grid and the same scope - just enable the ready map
+            // cache: the same save, id set and scope - just enable the ready overlay
             if (_filterMap is not null && _filterMapKey is not null && _filterMapKey.SetEquals(ids) &&
-                _filterMap.MinX == grid.MinX && _filterMap.MinZ == grid.MinZ && _filterMap.Width == grid.Width &&
-                ReferenceEquals(_filterMapScope, scope))
+                ReferenceEquals(_filterMapScope, scope) && ReferenceEquals(_filterMapSave, save))
             {
                 Map.SetFilterOverlay(_filterMap, _filterColors, FilterDimCheck.IsChecked == true);
                 UpdateFilterStatus();
@@ -1448,15 +1461,28 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             ShowProgress("Building block overlay…");
             LoadProgress.IsIndeterminate = true;
             var sw = Stopwatch.StartNew();
-            var progress = new UiProgress(pct => Status.Set(StatusChannel.Filter, $"Scanning chunks... {pct}%"));
+            var published = false;
+            var progress = new UiProgress(pct =>
+            {
+                // A queued 100% report must not overwrite the final "codes … columns …" line.
+                if (!published) Status.Set(StatusChannel.Filter, $"Scanning chunks... {pct}%");
+            });
             try
             {
-                var built = await Task.Run(() => BlockFilterScanner.Build(save, grid, ids, progress, cts.Token, scope));
+                var built = await Task.Run(() => BlockFilterScanner.BuildAll(save, ids, progress, cts.Token, scope));
                 if (cts.IsCancellationRequested) return;
+                // The scan can take seconds. Do not publish its result over a newer save, scope or
+                // block selection: this is the same class of stale-publish bug as an old area result.
+                if (!ReferenceEquals(save, _save)) return;
+                var currentScope = _filterScope.HasRegion && !_filterScope.IsEmpty ? _filterScope : null;
+                if (!ReferenceEquals(scope, currentScope)) return;
+                if (!new HashSet<int>(ids).SetEquals(_filterCodes.SelectMany(c => reg.IdsOf(c)).Distinct())) return;
                 sw.Stop();
+                published = true;
                 _filterMap = built;
                 _filterMapKey = new HashSet<int>(ids);
                 _filterMapScope = scope;
+                _filterMapSave = save;
                 Map.SetFilterOverlay(built, _filterColors, FilterDimCheck.IsChecked == true);
                 UpdateFilterStatus(sw.ElapsedMilliseconds);
                 SaveSettings();
@@ -1490,8 +1516,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         var map = _filterMap;
         if (map is null)
         {
-            // the scope is named here rather than silently applied: the overlay is built for the scope, and the
-            // numbers below ("columns", "blocks") are counted inside it, not over the whole world
+            // The scope is named here rather than silently applied: the overlay is built for the scope.
+            // Without a scope the numbers below cover the whole save; with one they are counted inside it.
             var scopeNote = _filterScope.HasRegion && !_filterScope.IsEmpty ? $" (in {_filterScope.Label})" : "";
             Status.Set(StatusChannel.Filter, _filterCodes.Count == 0
                 ? $"Nothing selected - search for a code and tick it in the list below{scopeNote}."
@@ -1720,11 +1746,15 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
-        var idx = _filterMap.Index(wx, wz);
-        var code = _save?.BlockRegistry.CodeOf(_filterMap.TopBlock[idx]) ?? "id:" + _filterMap.TopBlock[idx];
+        if (!_filterMap.TryGet(wx, wz, out var topId, out var topY, out var hitCount))
+        {
+            Status.Set(StatusChannel.Filter, "No matches found.");
+            return;
+        }
+        var code = _save?.BlockRegistry.CodeOf(topId) ?? "id:" + topId;
         Map.CentreOn(wx + 0.5, wz + 0.5, 2.0);
         Status.Set(StatusChannel.Filter,
-            $"{(forward ? "▶" : "◀")} {code} · X={wx} Z={wz} · Y={_filterMap.TopY[idx]} · blocks in column: {_filterMap.Count[idx]}");
+            $"{(forward ? "▶" : "◀")} {code} · X={wx} Z={wz} · Y={topY} · blocks in column: {hitCount}");
     }
 
     // The card primitives live in CardUi: both the chunk cards (ChunkViewService) and the
@@ -2185,20 +2215,13 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
     }
 
-    private async Task PublishAreaAsync(TerrainMap tm, ChunkArea area, int count)
+    private Task PublishAreaAsync(TerrainMap tm, ChunkArea area, int count)
     {
         Map.SetTerrain(tm, keepView: true);
         UpdateExportRegionLabel();
         Status.Set(StatusChannel.App, $"Showing {area.Label(count)}");
-        // The overlay filter is tied to the grid of the previous area (SetTerrain resets it):
-        // rebuild it for the new one, otherwise it would silently vanish on a switch.
-        if (_filterMap is not null)
-        {
-            _filterMap = null;
-            _filterMapKey = null;
-            _filterMapScope = null;
-            await BuildFilterOverlayAsync();
-        }
+        // The overlay covers the whole save, not the grid of this tile: keep it across area switches.
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -2321,6 +2344,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _filterCts?.Cancel();
         _filterMap = null;
         _filterMapKey = null;
+        _filterMapScope = null;
+        _filterMapSave = null;
         FilterListPanel.Children.Clear();
         Map.SetFilterOverlay(null, null, true);
         Status.Set(StatusChannel.Filter, "");
@@ -2734,6 +2759,8 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             _filterMap = null;
             _filterMapKey = null;
             _filterMapScope = null;
+            _filterMapSave = null;
+            Map.SetFilterOverlay(null, null, true);
 
             var areas = await Task.Run(() => ChunkAreas.Build(save));
             if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return false;
@@ -2785,9 +2812,47 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     }
 
     /// <summary>
-    ///     Exports the map of the built area to PNG honouring the render mode, the Y layer and the active
-    ///     block overlay filter (the map neither draws nor exports distant areas of the save). With "matches only" the background is transparent - handy
-    ///     for overlaying a roads/ores map onto another base layer.
+    ///     Builds the maps of every build tile for a whole-save export. Cached tiles are reused; a tile
+    ///     that the background preload has not reached yet is built on demand. The list is deliberately
+    ///     kept local: the renderer consumes it and releases the references afterwards.
+    /// </summary>
+    private async Task<List<TerrainMap>> BuildExportMapsAsync(VSSaveFile save, ChunkAreas areas, int epoch)
+    {
+        var needs = TerrainMap.NeedsForMode(_renderMode);
+        var maps = new List<TerrainMap>(areas.Areas.Count);
+        for (int i = 0; i < areas.Areas.Count; i++)
+        {
+            var area = areas.Areas[i];
+            TerrainMap? map = null;
+            if (_areaMaps.TryGetValue(area, out var cached) && cached.Needs == needs) map = cached;
+            else if (ReferenceEquals(area, Map.Terrain?.Area) && Map.Terrain is { } active && active.Needs == needs)
+                map = active;
+            if (map is null)
+            {
+                if (epoch != _loadEpoch || !ReferenceEquals(save, _save))
+                    throw new InvalidOperationException("the save was changed during the export");
+                int index = i;
+                var progress = new UiProgress(pct =>
+                {
+                    if (epoch != _loadEpoch) return;
+                    LoadProgress.Value = pct;
+                    Status.Set(StatusChannel.App,
+                        $"Building export tile {index + 1} of {areas.Areas.Count}… {pct}%");
+                });
+                map = await Task.Run(() => TerrainMap.BuildInArea(save, area, progress, needs, _renderMode));
+                if (epoch != _loadEpoch || !ReferenceEquals(save, _save))
+                    throw new InvalidOperationException("the save was changed during the export");
+            }
+            maps.Add(map);
+        }
+        return maps;
+    }
+
+    /// <summary>
+    ///     Exports the map to PNG honouring the render mode, the Y layer and the active block overlay
+    ///     filter. "Whole save" combines every build tile; that union can be much larger than one tile,
+    ///     so the renderer samples it at a coarser block step instead of failing. "Active area only" and
+    ///     a chunk selection keep the requested pixels-per-block scale.
     /// </summary>
     private async void OnExportMapImage(object? sender, RoutedEventArgs e)
     {
@@ -2807,14 +2872,20 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
-        // Export area: the whole area or the chunk region selected on the map (in blocks)
+        // Export area: whole save, the selected chunk region, or the active build tile.
+        bool wholeSave = _settings.ExportRegionMode == 0;
         MapRegion? region = null;
         if (_settings.ExportRegionMode == 1)
         {
             if (Map.SelectionBounds is { } b)
                 region = new MapRegion(b.minCx * 32, b.minCz * 32, b.maxCx * 32 + 31, b.maxCz * 32 + 31);
             else
-                Status.Set(StatusChannel.App, "No chunk selection — exporting the whole area.");
+            {
+                // Falling back to one tile was the original "small piece" surprise: no selection means
+                // the user asked for the whole save, so export all of it instead.
+                wholeSave = true;
+                Status.Set(StatusChannel.App, "No chunk selection — exporting the whole save.");
+            }
         }
 
         var format = (MapImageFormat)Math.Clamp(_settings.ExportFormat, 0, 2);
@@ -2857,13 +2928,34 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 JpegQuality = Math.Clamp(_settings.JpegQuality, 30, 100),
                 MatteColor = (255, 255, 255)
             };
-            var progress = new UiProgress(pct => Status.Set(StatusChannel.App, $"Rendering map image… {pct}%"));
-            await Task.Run(() => MapImageRenderer.Export(path, tm, opts, progress));
+            var exportSave = _save!;
+            var exportAreas = _areas;
+            var epoch = _loadEpoch;
+            IReadOnlyList<TerrainMap> maps;
+            if (wholeSave && exportAreas is { Areas.Count: > 1 })
+                maps = await BuildExportMapsAsync(exportSave, exportAreas, epoch);
+            else
+                maps = new[] { tm };
+
+            var progress = new UiProgress(pct =>
+            {
+                LoadProgress.Value = pct;
+                Status.Set(StatusChannel.App, $"Rendering map image… {pct}%");
+            });
+            if (maps.Count == 1)
+                await Task.Run(() => MapImageRenderer.Export(path, tm, opts, progress));
+            else
+                await Task.Run(() => MapImageRenderer.Export(path, maps, opts, progress));
             RememberDir(path, (s, d) => s.LastExportDir = d); // the next export goes to the same folder
             var actual = ImageWriter.FormatFromPath(path) ?? format;
-            var (outW, outH) = MapImageRenderer.PixelSize(tm, opts);
+            var (outW, outH) = maps.Count == 1 ? MapImageRenderer.PixelSize(tm, opts) : MapImageRenderer.PixelSize(maps, opts);
+            int blocksPerPixel = maps.Count == 1 ? 1 : MapImageRenderer.BlocksPerPixel(maps, opts);
+            var scope = region is not null ? ", selected region"
+                : maps.Count > 1 ? $", {maps.Count} areas"
+                : "";
+            var downsample = blocksPerPixel > 1 ? $", 1 px per {blocksPerPixel} blocks" : "";
             Status.Set(StatusChannel.App, $"Map image saved ({ImageWriter.DisplayName(actual)}): {path} " +
-                                          $"({outW}×{outH} px{(region is not null ? ", selected region" : "")})" +
+                                          $"({outW}×{outH} px{scope}{downsample})" +
                                           (opts.Filter is not null
                                               ? $" — {opts.Filter.HitColumns:N0} filtered column(s)"
                                               : ""));

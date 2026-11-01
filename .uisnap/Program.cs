@@ -203,6 +203,12 @@ internal static class Harness
             return;
         }
 
+        if (mode == "areadetail")
+        {
+            AreaDetail(save);
+            return;
+        }
+
         if (mode == "layerslice")
         {
             LayerSlice(save);
@@ -2024,8 +2030,9 @@ internal static class Harness
                 if (!selected.Contains((string)kv.Key)) continue;
                 sum += (long)kv.Value; codes++;
             }
-            var matchCells = (long)map.GetType().GetField("MatchCells")!.GetValue(map)!;
-            var hitCols = (int)map.GetType().GetField("HitColumns")!.GetValue(map)!;
+            var bf = (IBlockFilter)map;
+            var matchCells = bf.MatchCells;
+            var hitCols = bf.HitColumns;
             Console.WriteLine($"[overlay] CROSS-CHECK: selected codes in the histogram={codes} of {selected.Count}, cells={sum:N0}, MatchCells={matchCells:N0}, columns={hitCols:N0}");
             Console.WriteLine("[overlay] expectation: histogram cells == MatchCells (1:1)");
         }
@@ -2224,10 +2231,91 @@ internal static class Harness
         }
     }
 
+    /// <summary>Temporary probe: capture the map while panning/zooming, before async rebuilds settle.</summary>
+    /// <summary>Checks that every visible build tile is rendered at the SAME detail density, not just
+    /// the active one. Builds both tiles of an adjacent pair, centres on their boundary and prints the
+    /// extra-layer frames; the screenshots are the visual proof.</summary>
+    private static void AreaDetail(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        var map = (TerrainView)w.FindNamed<Control>("Map")!;
+        var deadline = DateTime.UtcNow.AddSeconds(600);
+        while (DateTime.UtcNow < deadline && map.Terrain is null) Pump(0.3);
+        if (map.Terrain is null) { Console.WriteLine("FAILED: the map was not built"); CloseNow(w); return; }
+        var areas = map.Areas!;
+        Console.WriteLine($"[areadetail] areas={areas.Areas.Count}, active=#{map.Terrain.Area!.Index + 1}");
+        foreach (var a in areas.Areas)
+            Console.WriteLine($"[areadetail]   #{a.Index + 1}: X {a.MinX}..{a.MaxX}, Z {a.MinZ}..{a.MaxZ}, bbox {a.BlockCells:N0}");
+
+        // Pick a pair whose bboxes touch/overlap along both axes: a detail viewport can then straddle
+        // their boundary and show two tiles at once.
+        (ChunkArea A, ChunkArea B)? pair = null;
+        double best = double.MaxValue;
+        foreach (var a in areas.Areas)
+        foreach (var b in areas.Areas)
+        {
+            if (ReferenceEquals(a, b)) continue;
+            double gapX = Math.Max(0, Math.Max(a.MinX - b.MaxX - 1, b.MinX - a.MaxX - 1));
+            double gapZ = Math.Max(0, Math.Max(a.MinZ - b.MaxZ - 1, b.MinZ - a.MaxZ - 1));
+            if (gapX > 0 || gapZ > 0) continue;
+            double d = Math.Abs(a.CentreX - b.CentreX) + Math.Abs(a.CentreZ - b.CentreZ);
+            if (d < best) { best = d; pair = (a, b); }
+        }
+        if (pair is null)
+        {
+            Console.WriteLine("[areadetail] FAILED: no adjacent pair (bboxes do not touch)");
+            CloseNow(w);
+            return;
+        }
+        var (pa, pb) = pair.Value;
+        double ax = Math.Clamp(pb.CentreX, pa.MinX, pa.MaxX), az = Math.Clamp(pb.CentreZ, pa.MinZ, pa.MaxZ);
+        double bx = Math.Clamp(pa.CentreX, pb.MinX, pb.MaxX), bz = Math.Clamp(pa.CentreZ, pb.MinZ, pb.MaxZ);
+        double cx = (ax + bx) / 2.0, cz = (az + bz) / 2.0;
+        Console.WriteLine($"[areadetail] pair #{pa.Index + 1} + #{pb.Index + 1}, boundary centre ~({cx:0},{cz:0})");
+
+        // Force both full maps into the cache through the normal area-switch path.
+        foreach (var area in new[] { pa, pb })
+        {
+            map.CentreOn(area.CentreX, area.CentreZ, 1.0);
+            var sw = DateTime.UtcNow.AddSeconds(300);
+            while (DateTime.UtcNow < sw && !ReferenceEquals(map.Terrain?.Area, area)) Pump(0.3);
+            Console.WriteLine($"[areadetail] built #{area.Index + 1}: active=#{map.Terrain?.Area?.Index + 1}, " +
+                              $"cached maps={areas.Areas.Count(map.HasAreaMap)}/{areas.Areas.Count}");
+        }
+
+        // Start fully inside the lower tile, then pan toward the boundary. The primary bitmap's margin
+        // still covers the viewport, so this is the path that used to leave the newly visible tile blank.
+        map.CentreOn(cx, cz - 600, 1.0);
+        Pump(4.0);
+        Console.WriteLine($"[areadetail] pan-start: exact={map.ExtraExactLayers}, layers='{map.ExtraLayerSummary}'");
+        map.PanByPixels(0, -300);
+        Pump(4.0);
+        Console.WriteLine($"[areadetail] after pan toward boundary: exact={map.ExtraExactLayers}, " +
+                          $"layers='{map.ExtraLayerSummary}'");
+        Shot(w, "areas_detail_pan");
+
+        foreach (var zoom in new[] { 1.0, 2.0, 8.0, 0.1 })
+        {
+            map.CentreOn(cx, cz, zoom);
+            Pump(4.0);
+            Console.WriteLine($"[areadetail] zoom={zoom:0.###}: active=#{map.Terrain?.Area?.Index + 1}, " +
+                              $"exact={map.ExtraExactLayers}, coarse={map.ExtraCoarseLayers}, " +
+                              $"layers='{map.ExtraLayerSummary}', lod='{Cut(TextOf(w, "LodStatusText"))}'");
+            Shot(w, $"areas_detail_{zoom:0.#}");
+        }
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
+
     /// <summary>
-    ///     P1-21: a save with chunks at two ends of the world. The map is built for ONE area (the starting one —
-    ///     where the world centre is), the far group is not drawn until the user scrolls to it;
-    ///     on scroll the window builds its map and publishes it without resetting the zoom.
+    ///     P1-21: a save with chunks at two ends of the world. The map opens on the area with the world
+    ///     centre; cached neighbours are drawn as extra layers, and scrolling to another area makes it
+    ///     the active map without resetting the zoom.
     /// </summary>
     private static void Areas(string save)
     {
@@ -2321,8 +2409,8 @@ internal static class Harness
                           $"hover='{Cut(TextOf(w, "InfoText"))}'");
         Shot(w, "areas_void");
 
-        // The overlay filter is bound to the AREA GRID: after switching it must rebuild,
-        // and not silently disappear (SetTerrain resets the match map). A scan is needed — wait for it.
+        // The overlay is whole-save: switching area must keep the same match map (no rebuild).
+        // A scan is still needed — wait for it.
         // WaitLoaded is not suitable here: the App channel is already busy with area loading messages,
         // and it needs "opened: …" — so wait specifically for the scan channel
         var scanEnd = DateTime.UtcNow.AddSeconds(900);
@@ -2353,7 +2441,7 @@ internal static class Harness
                 var ovEnd = DateTime.UtcNow.AddSeconds(600);
                 while (DateTime.UtcNow < ovEnd && map.Filter is null) Pump(0.5);
                 Console.WriteLine($"[areas] overlay on {AreaName(map.Terrain!)}: match map={DescribeGrid(map.Filter, map.Terrain!)}");
-                // back to the first area — the overlay must rebuild for its grid
+                // back to the first area — the whole-save overlay must stay active
                 var mainArea = areas.Main!;
                 map.CentreOn(mainArea.CentreX, mainArea.CentreZ, 1.0);
                 var backEnd = DateTime.UtcNow.AddSeconds(300);
@@ -2363,6 +2451,13 @@ internal static class Harness
                 Pump(1.0);
                 Console.WriteLine($"[areas] back in {AreaName(map.Terrain!)}: AreaRequested={requested}, " +
                                   $"match map={DescribeGrid(map.Filter, map.Terrain!)}");
+                // Zoom out far enough to see the neighbouring areas: the overlay must be drawn on them too.
+                map.ZoomBy(0.02);
+                Pump(4.0);
+                Console.WriteLine($"[areas] whole-world overlay: view={map.Bounds.Width:0}x{map.Bounds.Height:0}, " +
+                                  $"extra layers={map.ExtraAreaLayers}, filter={(map.Filter is null ? "null" : map.Filter.HitColumns.ToString())}, " +
+                                  $"lod='{Cut(TextOf(w, "LodStatusText"))}'");
+                Shot(w, "areas_overlay_all");
             }
         }
 
@@ -2371,13 +2466,14 @@ internal static class Harness
         Console.WriteLine("DONE");
     }
 
-    /// <summary>Does the match map grid coincide with the terrain map grid (the overlay landed 1:1).</summary>
-    private static string DescribeGrid(BlockFilterMap? filter, TerrainMap tm)
+    /// <summary>Describes the overlay. The map is now split into build tiles, so a single grid
+    /// would only cover one tile; the whole-save overlay is a set of sparse chunk parts.</summary>
+    private static string DescribeGrid(IBlockFilter? filter, TerrainMap tm)
     {
         if (filter is null) return "NO";
-        bool same = filter.MinX == tm.MinX && filter.MinZ == tm.MinZ && filter.Width == tm.Width && filter.Height == tm.Height;
-        return $"{filter.Width}×{filter.Height} @ ({filter.MinX},{filter.MinZ}), columns {filter.HitColumns}, " +
-               $"grid {(same ? "coincides with the map" : "does NOT coincide")}";
+        var parts = filter is BlockFilterOverlay sparse ? $", parts {sparse.PartCount}" : "";
+        return $"{filter.HitColumns} columns / {filter.MatchCells} blocks{parts}; " +
+               $"active tile {tm.Width}×{tm.Height} @ ({tm.MinX},{tm.MinZ})";
     }
 
     private static string AreaName(TerrainMap tm)
@@ -2396,7 +2492,7 @@ internal static class Harness
         var map = (TerrainView)w.FindNamed<Control>("Map")!;
         int rebuilds = 0;
         map.LodStatusChanged += _ => rebuilds++;
-        map.FitToArea();          // the whole world in the window: it is certainly smaller than the screen along one axis
+        map.FitToArea();          // the active tile in the window: it is certainly smaller than the screen along one axis
         Pump(3.0);
 
         var centreLocal = new Point(map.Bounds.Width / 2, map.Bounds.Height / 2);

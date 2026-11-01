@@ -53,10 +53,11 @@
             </StackPanel>
             <StackPanel Orientation="Horizontal" Spacing="6">
                 <TextBlock Text="Export area:" />
-                <ComboBox x:Name="ExportRegionBox" SelectedIndex="0" Width="220"
-                          ToolTip.Tip="'Selected chunks only' exports just the region selected on the map (left-click chunks, Shift+drag for a region)">
-                    <ComboBoxItem>Whole area</ComboBoxItem>
+                <ComboBox x:Name="ExportRegionBox" SelectedIndex="0" Width="260"
+                          ToolTip.Tip="'Whole save' includes every build tile; very large unions are downscaled to fit the image limit. 'Active area only' keeps 1–8 pixels per block for the tile you are looking at.">
+                    <ComboBoxItem>Whole save (all areas)</ComboBoxItem>
                     <ComboBoxItem>Selected chunks only</ComboBoxItem>
+                    <ComboBoxItem>Active area only</ComboBoxItem>
                 </ComboBox>
                 <Button x:Name="ClearSelectionBtn" Content="Clear selection" Padding="8,2"
                         ToolTip.Tip="Deselect chunks on the map" />

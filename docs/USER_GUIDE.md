@@ -21,7 +21,7 @@ Opening a world creates a disposable **working copy**. The original `.vcdbs` is 
 
 ## The map
 
-Large saves are split into **build tiles** of up to 16 million columns each. The map opens on the tile containing the world centre (normally the spawn); neighbouring tiles are preloaded in the background and, at overview zoom, are drawn as separate overview layers. A tile that is not cached yet is built when you pan to it: the status line shows **Preloading…**, **Waiting for area N of M…** or **Building map of area N of M…**.
+Large saves are split into **build tiles** of up to 16 million columns each. The map opens on the tile containing the world centre (normally the spawn); neighbouring tiles are preloaded in the background. Every visible tile with a cached full map uses the same quality decision: at detail zoom all of them are drawn at the active tile's resolution, and at overview zoom they are drawn as separate pre-coloured overview layers. If any visible full tile has no suitable overview (or a filter/Y slice needs exact pixels), the whole view falls back to exact rendering, so one tile cannot be sharp while the others are coarse. A tile that is not cached yet is built when you pan to it: the status line shows **Preloading…**, **Waiting for area N of M…** or **Building map of area N of M…**. While a pan or zoom is waiting for the new exact frame, a coarse overview of each already-cached tile is drawn underneath the old frame; this keeps the known map from blinking out at the edge of the viewport. Chunk columns that do not exist in the save remain background — they are empty world, not a rendering gap.
 
 | Action | Result |
 |---|---|
@@ -35,7 +35,7 @@ Large saves are split into **build tiles** of up to 16 million columns each. The
 
 Click a chunk to select it. `Shift+LMB` selects a rectangular region; `Shift+RMB` removes chunks from the selection.
 
-The **Settings → Map image export** controls (also **View → Export map image…**) write PNG, JPEG or lossless WebP at 1–8 pixels per block. You can export the active map area (**Whole area**) or only selected chunks, with the current render mode, Y slice and overlay applied. There is no “current view” export: the image always covers a whole build tile or the selection.
+The **Settings → Map image export** controls (also **View → Export map image…**) write PNG, JPEG or lossless WebP at 1–8 pixels per block. **Whole save (all areas)** combines every build tile into one image; when the union is too large to keep at the requested scale, it is sampled at an integer block step so that distant pregen patches do not make the export fail. **Active area only** keeps the requested pixels per block for the tile you are looking at, and **Selected chunks only** exports just the region selected on the map. There is no “current view” export. The current render mode, Y slice and overlay are applied in every case.
 
 ## Tabs
 
@@ -80,7 +80,7 @@ How each tab reads the scope:
 | **Entities** | Creatures and block entities standing in the rectangle. |
 | **Items** | Containers and creature inventories in the rectangle. **Player inventories are only listed when the scope is the whole save** — `playerdata` has no position, and a player's backpack travels with the player, not with the chunk. |
 | **Players** | Lists nobody in a chunk scope: only the player's creature is placed in the world, and it is in the Entities tab. |
-| **Find blocks** | The block list and the "Show on map" overlay count only the blocks inside the scope; the overlay itself stays aligned with the current map area. |
+| **Find blocks** | The block list and the "Show on map" overlay count only the blocks inside the scope. The overlay is built for the whole save (or the scope), so it covers every build tile and every area, not just the tile that happens to be active. At detail zoom every visible tile with a cached full map gets the exact layer; areas with only a coarse overview get a coarse match layer. |
 
 Every scope goes back to the whole save when another save is opened.
 
