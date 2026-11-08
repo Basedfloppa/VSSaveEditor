@@ -28,8 +28,10 @@ public enum TerrainNeeds
 public sealed class TerrainMap
 {
     public int MinX, MinZ, Width, Height;
-    public int[] SurfaceY = Array.Empty<int>();   // absolute surface Y (0 = no data)
-    public int[] BottomY = Array.Empty<int>();    // absolute bottom bound of the column (0 = none)
+    // Y fits in 16 bits (the save's chunk Y is 10 bits), so two bytes per column instead of four. On the
+    // 156M-column preload budget that is ~0.6 GiB; The sentinel stays 0 = no data, exactly as before.
+    public ushort[] SurfaceY = Array.Empty<ushort>();   // absolute surface Y (0 = no data)
+    public ushort[] BottomY = Array.Empty<ushort>();    // absolute bottom bound of the column (0 = none)
     public ushort[] TopBlock = Array.Empty<ushort>(); // block id at the surface
     /// <summary>Real thickness of the water body under the surface (in blocks) for water; otherwise 0.
     /// null in a blocks-mode build: the in-game map does not use it.</summary>
@@ -109,13 +111,14 @@ public sealed class TerrainMap
         return true;
     }
 
-    /// <summary>Limit of the map area in columns. A blocks-mode column costs surface/bottom/top plus
-    /// rain-map arrays and shadow (~15 bytes); the water modes add the water depth (4 bytes) and no
-    /// longer allocate the rain-map arrays, so a column is ~19 bytes only when every field is requested. It is needed because W and H come from the 22-bit X/Z of a chunk
-    /// (up to 4 Mi blocks each), and two chunks at opposite ends of the world give W×H ~10¹³ columns,
-    /// which overflows int and ends in an OOM. The threshold guards against absurdity, not a memory budget:
-    /// the largest real save among those checked ("Captured d3e82bd6") yields 79,265,792 columns
-    /// (7,552×10,496, ~1.1 GiB of arrays), so 256 Mi is a ~3× margin and still far from 10¹³.</summary>
+    /// <summary>Limit of the map area in columns. A blocks-mode column costs surface/bottom/top (2 bytes
+    /// each) plus the rain-map arrays and shadow (11 bytes); the water modes replace the rain arrays with
+    /// the water depth (4 bytes), so a column is 15 bytes only when every field is requested. It is needed
+    /// because W and H come from the 22-bit X/Z of a chunk (up to 4 Mi blocks each), and two chunks at
+    /// opposite ends of the world give W×H ~10¹³ columns, which overflows int and ends in an OOM. The
+    /// threshold guards against absurdity, not a memory budget: the largest real save among those checked
+    /// ("Captured d3e82bd6") yields 79,265,792 columns (7,552×10,496, ~0.8–1.1 GiB of arrays), so 256 Mi
+    /// is a ~3× margin and still far from 10¹³.</summary>
     public const long MaxCells = 256L * 1024 * 1024;
 
     /// <summary>What a render mode needs. Blocks is the default and the cheapest; the water modes
@@ -199,8 +202,8 @@ public sealed class TerrainMap
         var tm = new TerrainMap
         {
             MinX = minX, MinZ = minZ, Width = W, Height = H,
-            SurfaceY = new int[cells],
-            BottomY = new int[cells],
+            SurfaceY = new ushort[cells],
+            BottomY = new ushort[cells],
             TopBlock = new ushort[cells],
             WaterDepth = needWater ? new int[cells] : null,
             MapY = needRain ? new ushort[cells] : null,
@@ -210,8 +213,7 @@ public sealed class TerrainMap
             MinWorldY = minCy * 32, MaxWorldY = maxCy * 32 + 31,
             Area = area
         };
-        // a "no data" sentinel for the max merge (otherwise a real surface at y=0 would look like an empty one)
-        for (int i = 0; i < tm.SurfaceY.Length; i++) tm.SurfaceY[i] = int.MinValue;
+        // 0 is the "no data" sentinel for the max merge: the editor already treats surface y=0 as empty.
         for (int i = 0; i < n; i++)
         {
             var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)positions[i]);
@@ -256,8 +258,8 @@ public sealed class TerrainMap
                         int wy = cyBase + s.TopY - 1;
                         if (wy > tm.SurfaceY[idx])
                         {
-                            tm.SurfaceY[idx] = wy;
-                            tm.BottomY[idx] = cyBase + s.BottomY - 1;
+                            tm.SurfaceY[idx] = (ushort)wy;
+                            tm.BottomY[idx] = (ushort)(cyBase + s.BottomY - 1);
                             tm.TopBlock[idx] = s.TopId;
                             if (tm.WaterDepth is not null) tm.WaterDepth[idx] = s.WaterDepth;
                             any = true;
@@ -282,12 +284,12 @@ public sealed class TerrainMap
         progress?.Report(1.0);
         if (Volatile.Read(ref anyData) == 0) return EmptyMap(save, area, minCy, maxCy, needs);
 
-        // normalise empty cells (SurfaceY=0 = no data) + relief bounds from the final columns
+        // relief bounds from the final columns (SurfaceY = 0 already means "no data")
         int len = tm.SurfaceY.Length;
         for (int i = 0; i < len; i++)
         {
             int sy = tm.SurfaceY[i];
-            if (sy == int.MinValue) { tm.SurfaceY[i] = 0; continue; }
+            if (sy == 0) continue;
             if (sy > tm.MaxSurface) tm.MaxSurface = sy;
             if (sy < tm.MinSurface) tm.MinSurface = sy;
         }
@@ -313,8 +315,8 @@ public sealed class TerrainMap
             MinZ = area?.MinZ ?? 0,
             Width = 1,
             Height = 1,
-            SurfaceY = new int[1],
-            BottomY = new int[1],
+            SurfaceY = new ushort[1],
+            BottomY = new ushort[1],
             TopBlock = new ushort[1],
             WaterDepth = (needs & TerrainNeeds.Water) != 0 ? new int[1] : null,
             MapY = (needs & TerrainNeeds.RainSurface) != 0 ? new ushort[1] : null,

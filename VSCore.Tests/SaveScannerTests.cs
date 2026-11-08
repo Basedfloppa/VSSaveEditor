@@ -164,5 +164,43 @@ namespace VSCore.Tests
             }
             finally { if (File.Exists(dbPath)) File.Delete(dbPath); }
         }
+
+        /// <summary>The scan extracts the same type/code for every chest/spawner; the model must keep one
+        /// string instance per value, not one per record (a server save has millions of those).</summary>
+        [Fact]
+        public void Repeated_types_and_codes_are_pooled_across_records()
+        {
+            var dbPath = Path.Combine(Path.GetTempPath(), "scanpool_" + Guid.NewGuid().ToString("N") + ".vcdbs");
+            var cs = new SqliteConnectionStringBuilder { DataSource = dbPath }.ToString();
+            try
+            {
+                using (var con = new SqliteConnection(cs))
+                {
+                    con.Open();
+                    Exec(con, "CREATE TABLE chunk(position INTEGER PRIMARY KEY, data BLOB);");
+                    Exec(con, "CREATE TABLE mapchunk(position INTEGER PRIMARY KEY, data BLOB);");
+                    Exec(con, "CREATE TABLE mapregion(position INTEGER PRIMARY KEY, data BLOB);");
+                    Exec(con, "CREATE TABLE gamedata(savegameid INTEGER PRIMARY KEY, data BLOB);");
+                    Exec(con, "CREATE TABLE playerdata(playerid INTEGER PRIMARY KEY AUTOINCREMENT, playeruid TEXT, data BLOB);");
+
+                    byte[] be = Encoding.ASCII.GetBytes("Spawner entityCodes game:drifter-normal meta-spawner");
+                    var chunkBlob = Concat(TagLenDelim(8, be), TagLenDelim(8, be));
+                    using var ins = con.CreateCommand();
+                    ins.CommandText = "INSERT INTO chunk(position,data) VALUES(1, $d);";
+                    ins.Parameters.AddWithValue("$d", chunkBlob);
+                    ins.ExecuteNonQuery();
+                }
+
+                using (var save = VSSaveFile.OpenReadOnly(dbPath))
+                {
+                    var res = SaveScanner.Scan(save, captureRaw: false);
+                    var a = res.Chunks[0].BlockEntities[0];
+                    var b = res.Chunks[0].BlockEntities[1];
+                    Assert.Same(a.Type, b.Type);
+                    Assert.Same(a.SpeciesCodes[0], b.SpeciesCodes[0]);
+                }
+            }
+            finally { if (File.Exists(dbPath)) File.Delete(dbPath); }
+        }
     }
 }

@@ -11,12 +11,12 @@ public class MapImageRendererTests
         var tm = new TerrainMap
         {
             MinX = 100, MinZ = 200, Width = w, Height = h,
-            SurfaceY = new int[n], BottomY = new int[n], TopBlock = new ushort[n], WaterDepth = new int[n],
+            SurfaceY = new ushort[n], BottomY = new ushort[n], TopBlock = new ushort[n], WaterDepth = new int[n],
             MinSurface = 1, MaxSurface = 6
         };
         for (int i = 0; i < n; i++)
         {
-            tm.SurfaceY[i] = 1 + (i % 5);
+            tm.SurfaceY[i] = (ushort)(1 + (i % 5));
             tm.TopBlock[i] = (ushort)(1 + (i % 3));
             tm.WaterDepth[i] = i % 4;
         }
@@ -171,7 +171,7 @@ public class MapImageRendererTests
         var tm = new TerrainMap
         {
             MinX = 0, MinZ = 0, Width = w, Height = h,
-            SurfaceY = new int[n], BottomY = new int[n], TopBlock = new ushort[n], WaterDepth = new int[n],
+            SurfaceY = new ushort[n], BottomY = new ushort[n], TopBlock = new ushort[n], WaterDepth = new int[n],
             MinSurface = 1, MaxSurface = 1
         };
         for (int i = 0; i < n; i++) { tm.SurfaceY[i] = 1; tm.TopBlock[i] = 1; }

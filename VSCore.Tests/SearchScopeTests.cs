@@ -129,33 +129,39 @@ namespace VSCore.Tests
 
             // chunk (5,7), y1: a wolf, a chest with 2 stacks, plus a creature inventory; (5,7) y2: another chest
             var c1 = new ChunkScanData { Position = 100, ChunkX = 5, ChunkY = 1, ChunkZ = 7 };
-            c1.Entities.Add(new EntityInfo
+            c1.AddEntity(new EntityInfo
             {
                 Species = "game:wolf-eurasian-adult-male", Kind = "wolf", ChunkX = 5, ChunkY = 1, ChunkZ = 7,
                 Position = 100, Occurrence = 0, Fields = { "maxhealth = 12" },
                 Inventories = { Inv(InventoryOwnerKind.Entity, chunk: (5, 1, 7), items: 1) }
             });
-            c1.BlockEntities.Add(new BlockEntityInfo
+            var chest1 = new BlockEntityInfo
             {
-                Type = "Chest", ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 1,
-                Inventories = { Inv(InventoryOwnerKind.BlockEntity, chunk: (5, 1, 7), items: 2, x: 5 * 32 + 3, z: 7 * 32 + 4) }
-            });
+                Type = "Chest", ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 1
+            };
+            chest1.SetInventories(new List<InventoryInfo>
+                { Inv(InventoryOwnerKind.BlockEntity, chunk: (5, 1, 7), items: 2, x: 5 * 32 + 3, z: 7 * 32 + 4) });
+            c1.AddBlockEntity(chest1);
             res.Chunks.Add(c1);
 
             var c2 = new ChunkScanData { Position = 101, ChunkX = 5, ChunkY = 2, ChunkZ = 7 };
-            c2.BlockEntities.Add(new BlockEntityInfo
+            var barrel = new BlockEntityInfo
             {
-                Type = "Barrel", ChunkX = 5, ChunkY = 2, ChunkZ = 7, Position = 101, Occurrence = 0,
-                Inventories = { Inv(InventoryOwnerKind.BlockEntity, chunk: (5, 2, 7), items: 1) }
-            });
+                Type = "Barrel", ChunkX = 5, ChunkY = 2, ChunkZ = 7, Position = 101, Occurrence = 0
+            };
+            barrel.SetInventories(new List<InventoryInfo>
+                { Inv(InventoryOwnerKind.BlockEntity, chunk: (5, 2, 7), items: 1) });
+            c2.AddBlockEntity(barrel);
             res.Chunks.Add(c2);
 
             var c3 = new ChunkScanData { Position = 200, ChunkX = 9, ChunkY = 2, ChunkZ = 9 };
-            c3.BlockEntities.Add(new BlockEntityInfo
+            var chest2 = new BlockEntityInfo
             {
-                Type = "Chest", ChunkX = 9, ChunkY = 2, ChunkZ = 9, Position = 200, Occurrence = 0,
-                Inventories = { Inv(InventoryOwnerKind.BlockEntity, chunk: (9, 2, 9), items: 3) }
-            });
+                Type = "Chest", ChunkX = 9, ChunkY = 2, ChunkZ = 9, Position = 200, Occurrence = 0
+            };
+            chest2.SetInventories(new List<InventoryInfo>
+                { Inv(InventoryOwnerKind.BlockEntity, chunk: (9, 2, 9), items: 3) });
+            c3.AddBlockEntity(chest2);
             res.Chunks.Add(c3);
 
             // playerdata has no position and rides along with every scope

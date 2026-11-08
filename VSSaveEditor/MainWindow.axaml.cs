@@ -816,7 +816,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             {
                 WorkingCopyLabel.Text = _edits.UnsavedAppliedCount > 0 ? "working copy · unsaved" : "working copy";
                 ToolTip.SetTip(WorkingCopyLabel,
-                    $"Edits go to a temporary working copy. Original (unchanged): {_save!.SourcePath}");
+                    $"Edits go to this disposable working copy:\n{_save!.Path}\nOriginal (unchanged): {_save.SourcePath}");
             }
         }
     }

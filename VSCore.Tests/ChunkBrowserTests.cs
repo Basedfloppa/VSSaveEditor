@@ -19,17 +19,19 @@ namespace VSCore.Tests
             c1.SolidCells = 1000;
             c1.BlockCodeCounts["rock-granite"] = 900;
             c1.BlockCodeCounts["ore-quartz-granite"] = 120;
-            c1.Entities.Add(new EntityInfo
+            c1.AddEntity(new EntityInfo
             {
                 Species = "game:wolf-eurasian-adult-male", Kind = "wolf", SexAge = "adult-male",
                 ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 0,
                 Fields = { "onHurt = 7", "maxhealth = 12" }
             });
-            c1.BlockEntities.Add(new BlockEntityInfo
+            var spawner = new BlockEntityInfo
             {
-                Type = "Spawner", SpeciesCodes = { "game:drifter-normal" }, Tokens = { "Spawner", "entityCodes" },
+                Type = "Spawner",
                 ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 0
-            });
+            };
+            spawner.SetSpeciesCodes(new List<string> { "game:drifter-normal" });
+            c1.AddBlockEntity(spawner);
             res.Chunks.Add(c1);
 
             var c2 = new ChunkScanData { Position = 101, ChunkX = 5, ChunkY = 2, ChunkZ = 7 };
@@ -40,7 +42,7 @@ namespace VSCore.Tests
             // column 9,9: empty (air only), with an inactive node that has no type or attributes
             var c3 = new ChunkScanData { Position = 200, ChunkX = 9, ChunkY = 2, ChunkZ = 9 };
             c3.AirCells = 32768;
-            c3.Entities.Add(new EntityInfo { ChunkX = 9, ChunkY = 2, ChunkZ = 9, Position = 200, Occurrence = 0 });
+            c3.AddEntity(new EntityInfo { ChunkX = 9, ChunkY = 2, ChunkZ = 9, Position = 200, Occurrence = 0 });
             res.Chunks.Add(c3);
 
             return res;

@@ -31,6 +31,35 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 ### Performance
 
+- Working copies are no longer created in the system temp folder. On Linux `/tmp` is often a tmpfs:
+  opening the 6.3 GB server save copied 6.3 GB into RAM before the first edit and kept it there for the
+  whole session (measured on the 1.7 GB save: the tmpfs copy raised `used` by ~1.7 GB and `shared` by
+  ~1.6 GB, while the disk-backed copy left `used` unchanged and only grew the page cache). Copies now
+  go to the local application data folder, with `VSSAVEEDITOR_WORK_DIR` as an override and stale copies
+  cleaned from both the new root and the old temp location.
+- The scan model holds one string instance per value instead of one per occurrence: a 6.3 GB server
+  save (2.19M chunk rows, 1.87M block entities) repeats only ~12k distinct tokens across ~32M
+  references. The tokens are pooled per scan (not `string.Intern`, whose table would outlive every
+  opened save), and the per-chunk block histogram is packed into `(id << 16) | count` words instead
+  of a `Dictionary<string,long>`. On the 1.7 GB server save the retained scan model fell from 845 to
+  392 MiB; on the 518 MB test save the scan went from 6.4 to 5.5 s, allocation from 3379 to 3117 MiB
+  and peak working set from 860 to 510 MiB, with identical block/entity/aggregate hashes.
+- Terrain-map surface and bottom Y are 16-bit (a chunk Y is 10 bits), which removes 4 bytes per map
+  column: the 156M-column preload budget of the 6.3 GB save dropped from 2629 to 1999 MiB with the
+  same rendered world-coordinate and colour hashes.
+- The scan no longer keeps the full block-entity vocabulary or empty per-row containers: block-entity
+  tokens were 31M references (281 MiB) on the 6.3 GB save, while only the type (first token) and the
+  `game:` codes are read by the UI. Chunk rows and block entities allocate their entity/inventory lists
+  on the first record instead of per row (~260 MiB of empty `List` objects), block-entity/entity
+  payloads are parsed straight from the chunk span instead of a `byte[]` copy per record, and world
+  coordinates are derived from the chunk coordinates. Retained scan model on the 6.3 GB server save:
+  **1501 → 875 MiB**, peak working set **3562 → 2910 MiB**, scan **58 → 50 s**. Side effect: free-text
+  search over the Entities tab no longer matches arbitrary block-entity token words — its type and
+  `game:` codes are still searchable, and the full record is parsed from the working copy when the
+  card is opened.
+- A registry where two block ids share a code no longer turns every per-chunk histogram into a
+  `Dictionary<string,long>`: the histogram stays packed by id and duplicate codes are summed only when
+  the histogram is read. On the modded 518 MB capture this cut the scan model from 235 to 108 MiB.
 - Chunk decoding for the map and the scan is fused and allocation-light: block planes are read in
   place, top/bottom/water/rain come from per-column summaries, and block statistics use a numeric
   histogram instead of a string dictionary per cell.

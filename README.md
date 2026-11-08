@@ -26,7 +26,9 @@ You can also find which chest or player holds an item, edit a player's inventory
 
 ## Editing and safety
 
-Opening a save creates a temporary working copy; the original `.vcdbs` is only read. Every edit goes into that copy.
+Opening a save creates a temporary working copy in the app's data folder (not in the system temp
+folder, which is RAM-backed on many Linux systems); the original `.vcdbs` is only read. Every edit goes
+into that copy. `VSSAVEEDITOR_WORK_DIR` overrides the location.
 
 - **Review before write.** “Review & apply…” shows a before/after diff per chunk or player, with undo, redo and history.
 - **Save a copy.** Writes a new `.vcdbs` next to the original, by default `<name> (edited).vcdbs`. There is no “save over the original” command.

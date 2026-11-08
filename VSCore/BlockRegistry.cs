@@ -27,6 +27,11 @@ public sealed class BlockRegistry
     /// the code itself matters, not the id: picking blocks by mod domain ("has a colon") and diagnostics.</summary>
     public IReadOnlyCollection<string> Codes => _idToCode.Values;
 
+    /// <summary>True when two ids share a code. The packed per-chunk histogram keys by id, so a save with
+    /// duplicate codes must aggregate by code instead — otherwise one chunk would report the same code twice
+    /// and a per-chunk lookup would see only one of the two counts.</summary>
+    public bool HasDuplicateCodes { get; private set; }
+
     private Dictionary<string, List<int>>? _codeToIds;
 
     /// <summary>Reverse index: code -> list of ids (one code may correspond to several ids).</summary>
@@ -109,6 +114,9 @@ public sealed class BlockRegistry
                 reg._idToCode[id] = code;
         }
         reg._empty = reg._idToCode.Count == 0;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var code in reg._idToCode.Values)
+            if (!seen.Add(code)) { reg.HasDuplicateCodes = true; break; }
         return reg;
     }
 }

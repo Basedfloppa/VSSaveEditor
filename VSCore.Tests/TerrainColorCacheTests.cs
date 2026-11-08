@@ -13,16 +13,16 @@ public class TerrainColorCacheTests
     private static TerrainMap Map()
     {
         const int w = 4, h = 3;
-        var surface = new int[w * h];
-        var bottom = new int[w * h];
+        var surface = new ushort[w * h];
+        var bottom = new ushort[w * h];
         var top = new ushort[w * h];
         var water = new int[w * h];
         var mapY = new ushort[w * h];
         var mapBlock = new ushort[w * h];
         for (int i = 0; i < surface.Length; i++)
         {
-            surface[i] = 100 + i;
-            bottom[i] = 40 + i;
+            surface[i] = (ushort)(100 + i);
+            bottom[i] = (ushort)(40 + i);
             top[i] = 0;           // no registry: the fallback color path, still deterministic
             mapY[i] = (ushort)(100 + i);
         }

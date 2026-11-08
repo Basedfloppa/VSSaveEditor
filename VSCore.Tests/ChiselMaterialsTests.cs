@@ -136,7 +136,7 @@ namespace VSCore.Tests
             var tm = new TerrainMap
             {
                 MinX = 0, MinZ = 0, Width = 4, Height = 4,
-                SurfaceY = new int[n], BottomY = new int[n], TopBlock = new ushort[n], WaterDepth = new int[n],
+                SurfaceY = new ushort[n], BottomY = new ushort[n], TopBlock = new ushort[n], WaterDepth = new int[n],
                 MinSurface = 1, MaxSurface = 1, Registry = reg
             };
             for (int i = 0; i < n; i++) { tm.SurfaceY[i] = 1; tm.TopBlock[i] = topId; }

@@ -290,7 +290,7 @@ public sealed class VSSaveFile : IDisposable
     }
 
     /// <summary>File name of the working copy: the basename of the source save, but only a safe one.
-    /// An empty name and `..`/separators would take the copy outside the temp directory, hence the fallback.</summary>
+    /// An empty name and `..`/separators would take the copy outside the working-copy directory, hence the fallback.</summary>
     public static string SafeCopyFileName(string srcPath)
     {
         var name = System.IO.Path.GetFileName(srcPath);
@@ -300,7 +300,7 @@ public sealed class VSSaveFile : IDisposable
     }
 
     /// <summary>
-    /// A consistent working snapshot of the save in a new temp folder + a backup BEFORE any edits.
+    /// A consistent working snapshot of the save in the working-copy folder + a backup BEFORE any edits.
     /// The snapshot is taken through the SQLite Online Backup API, so it also includes uncheckpointed data
     /// from `-wal`; if a read-only WAL is unavailable — by copying the file set and then
     /// folding the WAL into the main file. The result is one self-contained file (without `-wal`/`-shm`),
@@ -309,7 +309,7 @@ public sealed class VSSaveFile : IDisposable
     /// </summary>
     private static (string dir, string copy, string backup) CreateWorkingCopy(string srcPath, bool withBackup = true)
     {
-        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "vseditor_" + Guid.NewGuid().ToString("N"));
+        var dir = System.IO.Path.Combine(WorkingCopyRoot, "vseditor_" + Guid.NewGuid().ToString("N"));
         System.IO.Directory.CreateDirectory(dir);
         var copy = System.IO.Path.Combine(dir, SafeCopyFileName(srcPath));
         var backup = copy + ".bak";
@@ -368,18 +368,62 @@ public sealed class VSSaveFile : IDisposable
         }
     }
 
-    /// <summary>Removes temporary working copies left behind by a crashed editor
-    /// (older than `olderThan`, 3 days by default). Fresh directories are left alone — another running
-    /// instance may be working in them.</summary>
+    /// <summary>
+    ///     Directory for throwaway working copies.
+    ///
+    ///     Deliberately NOT <see cref="System.IO.Path.GetTempPath" />: `/tmp` is a tmpfs on many Linux
+    ///     installs, so a 6-GB server save copied there would occupy 6 GB of RAM for the whole editing
+    ///     session (and would not show up as process memory, only as "used" in the system monitor). The
+    ///     local application data folder is disk-backed on Windows, Linux and macOS; the temp folder stays
+    ///     the fallback for a sandboxed or portable install where that folder cannot be created.
+    ///     VSSAVEEDITOR_WORK_DIR overrides it (useful for tests and for putting the copy on another disk).
+    /// </summary>
+    public static string WorkingCopyRoot { get; } = ResolveWorkingCopyRoot();
+
+    private static string ResolveWorkingCopyRoot()
+    {
+        var overridden = Environment.GetEnvironmentVariable("VSSAVEEDITOR_WORK_DIR");
+        if (!string.IsNullOrWhiteSpace(overridden))
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(overridden);
+                return overridden;
+            }
+            catch { /* unwritable override: fall through to the defaults */ }
+        }
+
+        try
+        {
+            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrEmpty(local))
+            {
+                var root = System.IO.Path.Combine(local, "VSSaveEditor", "working");
+                System.IO.Directory.CreateDirectory(root);
+                return root;
+            }
+        }
+        catch { /* no usable profile: the temp folder is still better than failing to open a save */ }
+
+        return System.IO.Path.GetTempPath();
+    }
+
+    /// <summary>Removes working copies left behind by a crashed editor (older than `olderThan`, 3 days by
+    /// default). Fresh directories are left alone — another running instance may be working in them.
+    /// The temp folder is still scanned: copies created by older versions live there.</summary>
     public static void CleanupStaleWorkingCopies(TimeSpan? olderThan = null)
     {
         try
         {
             var cutoff = DateTime.UtcNow - (olderThan ?? TimeSpan.FromDays(3));
-            foreach (var d in System.IO.Directory.GetDirectories(System.IO.Path.GetTempPath(), "vseditor_*"))
+            foreach (var root in new[] { WorkingCopyRoot, System.IO.Path.GetTempPath() }.Distinct(StringComparer.Ordinal))
             {
-                try { if (System.IO.Directory.GetCreationTimeUtc(d) < cutoff) System.IO.Directory.Delete(d, true); }
-                catch { }
+                if (!System.IO.Directory.Exists(root)) continue;
+                foreach (var d in System.IO.Directory.GetDirectories(root, "vseditor_*"))
+                {
+                    try { if (System.IO.Directory.GetCreationTimeUtc(d) < cutoff) System.IO.Directory.Delete(d, true); }
+                    catch { }
+                }
             }
         }
         catch { /* cleanup must not get in the way of startup */ }

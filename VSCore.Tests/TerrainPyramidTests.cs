@@ -13,13 +13,13 @@ public class TerrainPyramidTests
         var tm = new TerrainMap
         {
             MinX = 1000, MinZ = 2000, Width = w, Height = h,
-            SurfaceY = new int[n], BottomY = new int[n], TopBlock = new ushort[n],
+            SurfaceY = new ushort[n], BottomY = new ushort[n], TopBlock = new ushort[n],
             WaterDepth = new int[n], MapY = new ushort[n], MapBlock = new ushort[n],
             MinSurface = 1, MaxSurface = 5
         };
         for (int i = 0; i < n; i++)
         {
-            tm.SurfaceY[i] = 1 + i % 5;
+            tm.SurfaceY[i] = (ushort)(1 + i % 5);
             tm.TopBlock[i] = block;
             tm.MapY[i] = (ushort)tm.SurfaceY[i];
             tm.MapBlock[i] = block;

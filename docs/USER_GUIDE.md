@@ -18,6 +18,9 @@ by, or connected to Anego Studios or the Vintage Story team.
 3. Wait for the background scan. The map tile appears first; chunk, entity and item indexes fill in as the scan finishes.
 
 Opening a world creates a disposable **working copy**. The original `.vcdbs` is opened read-only and is never the target of an edit.
+The copy lives in the app's data folder, not in the system temp folder — on many Linux systems `/tmp` is
+RAM-backed, so a multi-GB server save copied there would occupy the same amount of RAM for the whole session.
+Set `VSSAVEEDITOR_WORK_DIR` to put the copies on another disk.
 
 ## The map
 
@@ -170,7 +173,7 @@ Always open the **saved copy**, not the original, when checking the result in Vi
 ## Safety
 
 - The original `.vcdbs` is opened read-only.
-- All changes go into a temporary working copy.
+- All changes go into a disposable working copy in the app's data folder.
 - **Save a copy…** writes a separate file; the original is never overwritten.
 - Block and chunk actions require confirmation and only affect the copy.
 - Field edits are reviewable as a before → after diff before they are applied.

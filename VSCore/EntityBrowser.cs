@@ -91,8 +91,9 @@ public sealed class EntityRow
                              + (ItemCount > 0 ? $" · {ItemCount} item{(ItemCount == 1 ? "" : "s")}" : "");
 
     /// <summary>
-    ///     Substring search over everything the record has: name/kind/sex-age, the player-given name, attributes,
-    ///     parsed fields, tokens. Case-insensitive and without allocations per row.
+    ///     Substring search over everything the record retains: name/kind/sex-age, the player-given name,
+    ///     attributes, parsed fields, tokens. Block-entity token words are not kept in the scan model
+    ///     (they cost 281 MiB on the 6.3-GB save); its type and `game:` codes are still searched.
     /// </summary>
     public bool Matches(string needle)
     {
@@ -119,9 +120,6 @@ public sealed class EntityRow
             if (Hit(be.Type) || Hit(be.CodeSummary)) return true;
             foreach (var c in be.SpeciesCodes)
                 if (Hit(c))
-                    return true;
-            foreach (var t in be.Tokens)
-                if (Hit(t))
                     return true;
         }
 

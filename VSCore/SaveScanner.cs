@@ -79,11 +79,29 @@ public sealed class ChunkScanData
 {
     public long Position { get; set; }
     public int ChunkX, ChunkY, ChunkZ;      // chunk coordinates (from position)
-    public int WorldX, WorldY, WorldZ;      // world corner of the chunk in blocks (ch*32)
-    public Dictionary<string, long> BlockCodeCounts { get; } = new();
+
+    // Derived, not stored: three ints per chunk row cost 26 MiB on the 6.3-GB save, and every consumer
+    // needs only the corner of the chunk, which is ch*32 by definition.
+    public int WorldX => ChunkX * 32;
+    public int WorldY => ChunkY * 32;
+    public int WorldZ => ChunkZ * 32;
+    /// <summary>Per-chunk block histogram. Packed words in a scan, a real dictionary for hand-built models.</summary>
+    public BlockCodeCounts BlockCodeCounts { get; } = new();
     public long SolidCells, FluidCells, AirCells;
-    public List<EntityInfo> Entities { get; } = new();
-    public List<BlockEntityInfo> BlockEntities { get; } = new();
+    // Most chunk rows hold neither an entity nor a block entity: on the 6.3-GB server save 2.19M rows had
+    // 41k entities and 1.87M block entities. An eager `List` per row costs 32 bytes even when empty, and the
+    // empty lists alone were ~140 MiB. The backing lists are therefore created on the first record.
+    private List<EntityInfo>? _entities;
+    private List<BlockEntityInfo>? _blockEntities;
+
+    public IReadOnlyList<EntityInfo> Entities => _entities ?? (IReadOnlyList<EntityInfo>)Array.Empty<EntityInfo>();
+    public IReadOnlyList<BlockEntityInfo> BlockEntities =>
+        _blockEntities ?? (IReadOnlyList<BlockEntityInfo>)Array.Empty<BlockEntityInfo>();
+
+    internal void AddEntity(EntityInfo entity) => (_entities ??= new List<EntityInfo>()).Add(entity);
+    internal void AddBlockEntity(BlockEntityInfo blockEntity) =>
+        (_blockEntities ??= new List<BlockEntityInfo>()).Add(blockEntity);
+
     public RawBlob? Raw { get; set; }
 
     /// <summary>Length of the chunk blob in the table. Kept even when <see cref="Raw"/> is not captured
@@ -155,9 +173,18 @@ public sealed class EntityInfo
 public sealed class BlockEntityInfo
 {
     public string? Type { get; set; }            // "Spawner", "Chest", ...
-    public List<string> Tokens { get; set; } = new();
-    public List<string> SpeciesCodes { get; set; } = new();
     public int DataLength { get; set; }
+
+    // Tokens were a list of up to 60 identifier words per block entity — 31M references / 281 MiB on the
+    // 6.3-GB save. Only `Type` (the first token) and the `game:` codes are used by the list/search/cards;
+    // the full record is parsed from the working copy when a card is opened, so the vocabulary is not pinned.
+    private List<string>? _speciesCodes;
+    private List<InventoryInfo>? _inventories;
+
+    public IReadOnlyList<string> SpeciesCodes =>
+        _speciesCodes ?? (IReadOnlyList<string>)Array.Empty<string>();
+
+    internal void SetSpeciesCodes(List<string>? codes) => _speciesCodes = codes is { Count: > 0 } ? codes : null;
 
     public int ChunkX, ChunkY, ChunkZ;
 
@@ -173,7 +200,11 @@ public sealed class BlockEntityInfo
     public string? Note { get; set; }
 
     /// <summary>The container inventories (`inventory`) found in the ECX tree.</summary>
-    public List<InventoryInfo> Inventories { get; set; } = new();
+    public IReadOnlyList<InventoryInfo> Inventories =>
+        _inventories ?? (IReadOnlyList<InventoryInfo>)Array.Empty<InventoryInfo>();
+
+    internal void SetInventories(List<InventoryInfo>? inventories) =>
+        _inventories = inventories is { Count: > 0 } ? inventories : null;
 }
 
 /// <summary>Region (mapregion): worldgen/geological layers.</summary>
@@ -242,6 +273,8 @@ public static class SaveScanner
     public static SaveScanResult Scan(VSSaveFile save, IProgress<double>? progress = null, bool captureRaw = false)
     {
         var res = new SaveScanResult();
+        // One vocabulary per scan: the model keeps the strings, the pool itself dies with the result.
+        var pool = new StringPool();
         var reg = save.BlockRegistry;
         var itemReg = save.ItemRegistry;
 
@@ -291,7 +324,7 @@ public static class SaveScanner
             {
                 var row = page[idx];
                 var cd = new ChunkScanData();
-                ProcessChunk(row.Position, row.Data, reg, itemReg, cd, captureRaw);
+                ProcessChunk(row.Position, row.Data, reg, itemReg, cd, captureRaw, pool);
                 chunks[pageStart + idx] = cd;
                 int d = Interlocked.Increment(ref done);
                 if (progress != null && (d % 32 == 0 || d == n)) progress.Report((double)d / total);
@@ -340,8 +373,8 @@ public static class SaveScanner
         {
             var pd = new PlayerScanData { PlayerId = p.Id, PlayerUid = p.Uid };
             var b = p.Data ?? Array.Empty<byte>();
-            pd.Tokens = ExtractTokens(b, 80);
-            pd.SpeciesCodes = ExtractGameCodes(b);
+            pd.Tokens = ExtractTokens(b, 80, pool);
+            pd.SpeciesCodes = ExtractGameCodes(b, pool);
             if (captureRaw && b.Length > 0) pd.Raw = MakeRaw("playerdata", p.Id, p.Uid, b);
 
             if (b.Length > 0)
@@ -402,13 +435,12 @@ public static class SaveScanner
     }
 
     private static void ProcessChunk(long position, byte[] blob, BlockRegistry reg, ItemRegistry itemReg,
-        ChunkScanData cd, bool captureRaw)
+        ChunkScanData cd, bool captureRaw, StringPool pool)
     {
         cd.Position = position;
         cd.DataLength = blob.Length;
         var (cx, cy, cz) = ChunkPosHelper.DecodeIndex((ulong)position);
         cd.ChunkX = cx; cd.ChunkY = cy; cd.ChunkZ = cz;
-        cd.WorldX = cx * 32; cd.WorldY = cy * 32; cd.WorldZ = cz * 32;
 
         var occ6 = 0; // the order of field 6 here matches WalkTop — that is how an edit is addressed
         var occ8 = 0; // the same for field 8 (block entities): without the ordinal they cannot be opened in the editor
@@ -422,27 +454,30 @@ public static class SaveScanner
             switch (r.Field)
             {
                 case 6:
-                    cd.Entities.Add(ParseEntity(r.Bytes.ToArray(), cx, cy, cz, position, occ6++, reg, itemReg));
+                    cd.AddEntity(ParseEntity(r.Bytes, cx, cy, cz, position, occ6++, reg, itemReg, pool));
                     break;
                 case 8:
-                    cd.BlockEntities.Add(ParseBlockEntity(r.Bytes.ToArray(), cx, cy, cz, position, occ8++, reg, itemReg));
+                    cd.AddBlockEntity(ParseBlockEntity(r.Bytes, cx, cy, cz, position, occ8++, reg, itemReg, pool));
                     break;
             }
         }
         if (captureRaw && blob.Length > 0) cd.Raw = MakeRaw("chunk", position, null, blob);
 
         // Block statistics (solids field1 + liquids field16) in one fused pass: no 32 768-cell arrays,
-        // no per-cell CodeOf/Dictionary<string,long>. The string dictionary is touched once per distinct
-        // id in the chunk; the per-thread histogram is reset through the touched list.
+        // no per-cell CodeOf lookup. The per-thread histogram is reset through the touched list.
         var hist = _idHistogram ??= new long[ushort.MaxValue + 1];
         var touched = _histTouched ??= new List<int>(256);
         touched.Clear();
         ChunkBlockDecoder.DecodeChunkHistogram(blob, hist, touched, out cd.SolidCells, out cd.FluidCells, out cd.AirCells);
+        // The ids in `touched` are distinct by construction, so the per-chunk histogram is written once,
+        // without the code-string dictionary that used to be built (and thrown away) for every chunk row.
+        // A registry where two ids share a code is still packed by id: `BlockCodeCounts` merges the
+        // duplicates when someone enumerates it. The old by-code dictionary per chunk cost ~390 B/row on
+        // the modded 518-MB capture — more than the histogram data itself.
+        cd.BlockCodeCounts.Reset(reg, touched.Count);
         foreach (var id in touched)
         {
-            var code = reg.CodeOf(id) ?? "id:" + id;
-            cd.BlockCodeCounts.TryGetValue(code, out var v);
-            cd.BlockCodeCounts[code] = v + hist[id];
+            cd.BlockCodeCounts.Add((ushort)id, hist[id]);
             hist[id] = 0;
         }
     }
@@ -451,33 +486,35 @@ public static class SaveScanner
     [ThreadStatic] private static long[]? _idHistogram;
     [ThreadStatic] private static List<int>? _histTouched;
 
-    private static EntityInfo ParseEntity(byte[] b, int cx, int cy, int cz, long position, int occurrence,
-        BlockRegistry blocks, ItemRegistry items)
+    private static EntityInfo ParseEntity(ReadOnlySpan<byte> b, int cx, int cy, int cz, long position, int occurrence,
+        BlockRegistry blocks, ItemRegistry items, StringPool pool)
     {
         var ent = new EntityInfo
         {
             ChunkX = cx, ChunkY = cy, ChunkZ = cz, DataLength = b.Length,
             Position = position, Occurrence = occurrence
         };
-        ent.SpeciesCodes = ExtractSpeciesCodes(b, out var species);
+        ent.SpeciesCodes = ExtractSpeciesCodes(b, out var species, pool);
         ent.Species = species;
         ent.Domain = EntityInfo.DomainOf(species);
         if (species is string sp)
         {
             var core = EntityInfo.PathOf(sp);                          // the domain is not part of the kind
             var parts = core.Split('-');
-            ent.Kind = parts[0];                                       // "wolf", "fox", "chicken"
+            ent.Kind = pool.Intern(parts[0]);                          // "wolf", "fox", "chicken"
             ent.SexAge = parts.Length <= 2
-                ? (parts.Length == 2 ? parts[1] : null)                // "hen", "aged"
-                : string.Join("-", parts.Skip(parts.Length - 2));     // "adult-male", "baby-female"
+                ? (parts.Length == 2 ? pool.Intern(parts[1]) : null)   // "hen", "aged"
+                : pool.Intern(string.Join("-", parts.Skip(parts.Length - 2))); // "adult-male", "baby-female"
         }
-        ent.CustomName = ExtractCustomName(b);
+        ent.CustomName = ExtractCustomName(b, pool);
         foreach (var k in EntityAttrKeys)
             if (ScanBytes(b, Encoding.ASCII.GetBytes(k))) ent.Attributes[k] = "1";
-        ent.Tokens = ExtractTokens(b, 60);
-        ent.Fields = ExtractEntityFields(b);   // all fields with their values
+        ent.Tokens = ExtractTokens(b, 60, pool);
+        ent.Fields = ExtractEntityFields(b, pool);   // all fields with their values
+        // The tree parser needs a byte[] (it copies attribute payloads while parsing). Most entities have no
+        // inventory, so the payload is materialised only after the cheap "slots" probe says it is worth it.
         if (InventoryParser.MightContainInventory(b))
-            ent.Inventories = InventoryParser.ParseEntity(b, ent, blocks, items);
+            ent.Inventories = InventoryParser.ParseEntity(b.ToArray(), ent, blocks, items);
         return ent;
     }
 
@@ -503,10 +540,10 @@ public static class SaveScanner
     ///     "first" matched in 12 and 12. So the rule is simple: the later candidate wins,
     ///     and a `domain:path` (with a mod domain) beats its own "bare" path.
     /// </summary>
-    private static List<string> ExtractSpeciesCodes(byte[] b, out string? species)
+    private static List<string> ExtractSpeciesCodes(ReadOnlySpan<byte> b, out string? species, StringPool pool)
     {
-        var domains = ExtractDomainCodes(b);
-        var bare = ExtractBareCodes(b, domains);        // we do not duplicate tokens inside an already found code
+        var domains = ExtractDomainCodes(b, pool);
+        var bare = ExtractBareCodes(b, domains, pool);  // we do not duplicate tokens inside an already found code
         var last = (Pos: -1, Code: (string?)null);
         foreach (var d in domains)
             if (d.Pos > last.Pos) last = (d.Pos, d.Code);
@@ -528,7 +565,7 @@ public static class SaveScanner
     ///     A code is a length-prefixed string, and the length must be checked: the length byte itself can be
     ///     a printable character (`0x30` = `'0'`), and without the check it stuck to the domain, yielding
     ///     `0crfish:cagedfish-…` instead of `crfish:cagedfish-…` — there were 10 of those in a real save.</summary>
-    private static List<(int Pos, string Code)> ExtractDomainCodes(byte[] b)
+    private static List<(int Pos, string Code)> ExtractDomainCodes(ReadOnlySpan<byte> b, StringPool pool)
     {
         var res = new List<(int, string)>();
         for (int i = 1; i < b.Length; i++)
@@ -544,7 +581,7 @@ public static class SaveScanner
             int path = j;
             while (j < end && IsCodePath(b[j])) j++;
             if (j != end || j - path < 2) continue;                      // the string must be exactly the code, with no tail
-            var code = Encoding.ASCII.GetString(b, i, len);
+            var code = pool.InternAscii(b, i, len);
             if (char.IsAsciiLetterOrDigit(code[^1])) res.Add((i, code));   // a truncated one (`foo-`) is not a code
         }
         return res;
@@ -559,21 +596,21 @@ public static class SaveScanner
     ///     (`07 nametag`, `04 name`, `09 Moonlight`). The value is decoded as UTF-8, so non-Latin characters
     ///     in the name are not lost, even though the other dump fields are read as ASCII.
     /// </summary>
-    private static string? ExtractCustomName(byte[] b)
+    private static string? ExtractCustomName(ReadOnlySpan<byte> b, StringPool pool)
     {
         var nametag = IndexOfPrefixed(b, "nametag", 0);
         if (nametag >= 0)
         {
             var name = IndexOfPrefixed(b, "name", nametag + 1);
-            if (name >= 0 && name - nametag <= 64 && ReadPrefixedText(b, name + 5, 64) is { } v) return v;
+            if (name >= 0 && name - nametag <= 64 && ReadPrefixedText(b, name + 5, 64) is { } v) return pool.Intern(v);
         }
         for (var i = IndexOfPrefixed(b, "name", 0); i >= 0; i = IndexOfPrefixed(b, "name", i + 1))
-            if (ReadPrefixedText(b, i + 5, 64) is { } v) return v;
+            if (ReadPrefixedText(b, i + 5, 64) is { } v) return pool.Intern(v);
         return null;
     }
 
     /// <summary>Position of the length-prefixed string <paramref name="s" /> (of the length byte followed by the string itself).</summary>
-    private static int IndexOfPrefixed(byte[] b, string s, int from)
+    private static int IndexOfPrefixed(ReadOnlySpan<byte> b, string s, int from)
     {
         if (s.Length is 0 or > 127) return -1;
         for (int i = Math.Max(0, from); i + 1 + s.Length <= b.Length; i++)
@@ -587,7 +624,7 @@ public static class SaveScanner
     }
 
     /// <summary>Length-prefixed text at the position of the length byte: free of control characters, valid UTF-8.</summary>
-    private static string? ReadPrefixedText(byte[] b, int at, int max)
+    private static string? ReadPrefixedText(ReadOnlySpan<byte> b, int at, int max)
     {
         if (at < 0 || at >= b.Length) return null;
         int len = b[at];
@@ -599,7 +636,7 @@ public static class SaveScanner
         }
         try
         {
-            return new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(b, at + 1, len);
+            return new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(b.Slice(at + 1, len));
         }
         catch (ArgumentException)
         {
@@ -607,26 +644,46 @@ public static class SaveScanner
         }
     }
 
-    private static BlockEntityInfo ParseBlockEntity(byte[] b, int cx, int cy, int cz, long position, int occurrence,
-        BlockRegistry blocks, ItemRegistry items)
+    private static BlockEntityInfo ParseBlockEntity(ReadOnlySpan<byte> b, int cx, int cy, int cz, long position, int occurrence,
+        BlockRegistry blocks, ItemRegistry items, StringPool pool)
     {
         var be = new BlockEntityInfo
         {
             DataLength = b.Length, ChunkX = cx, ChunkY = cy, ChunkZ = cz,
             Position = position, Occurrence = occurrence
         };
-        be.Tokens = ExtractTokens(b, 60);
-        be.SpeciesCodes = ExtractGameCodes(b);
-        be.Type = be.Tokens.FirstOrDefault(t => t.Length >= 3);
+        be.SetSpeciesCodes(ExtractGameCodes(b, pool));
+        be.Type = FirstToken(b, 3, pool);
         if (InventoryParser.MightContainInventory(b))
-            be.Inventories = InventoryParser.ParseBlockEntity(b, be, blocks, items);
+            be.SetInventories(InventoryParser.ParseBlockEntity(b.ToArray(), be, blocks, items));
         return be;
+    }
+
+    /// <summary>The first identifier word of at least <paramref name="min" /> characters — the block entity type.
+    /// The old code built the whole 60-token list (and a `Distinct` copy) per block entity just to take its
+    /// first element; on the 6.3-GB save that was 31M token references and 1.87M temporary lists.</summary>
+    private static string? FirstToken(ReadOnlySpan<byte> b, int min, StringPool pool)
+    {
+        int i = 0;
+        while (i < b.Length)
+        {
+            if (b[i] >= 48 && b[i] < 127 && (char.IsLetter((char)b[i]) || b[i] == '_'))
+            {
+                int j = i;
+                while (j < b.Length && b[j] >= 32 && b[j] < 127
+                       && (char.IsLetterOrDigit((char)b[j]) || b[j] == '_')) j++;
+                if (j - i >= min) return pool.InternAscii(b, i, j - i);
+                i = j;
+            }
+            else i++;
+        }
+        return null;
     }
 
     /// <summary>Entity fields from the ECX blob: length-prefixed strings (the name) followed by a value
     /// (a length-prefixed string or a varint). Best-effort against the VS framing; some values may be
     /// shifted, but it outputs ALL fields with their values for display.</summary>
-    private static List<string> ExtractEntityFields(byte[] b)
+    private static List<string> ExtractEntityFields(ReadOnlySpan<byte> b, StringPool pool)
     {
         var res = new List<string>();
         int i = 0, n = b.Length;
@@ -635,15 +692,15 @@ public static class SaveScanner
             int L = b[i];
             if (L > 0 && L < 60 && i + 1 + L <= n && IsIdent(b, i + 1, L))
             {
-                var name = Encoding.ASCII.GetString(b, i + 1, L);
+                var name = pool.InternAscii(b, i + 1, L);
                 i += 1 + L;
                 if (i < n)
                 {
                     int L2 = b[i];
                     if (L2 > 0 && L2 < 300 && i + 1 + L2 <= n && IsPrintable(b, i + 1, L2))
                     {
-                        var val = Encoding.ASCII.GetString(b, i + 1, L2);
-                        res.Add($"{name} = {val}");
+                        var val = pool.InternAscii(b, i + 1, L2);
+                        res.Add(pool.Intern($"{name} = {val}"));
                         i += 1 + L2;
                         continue;
                     }
@@ -661,7 +718,7 @@ public static class SaveScanner
         return res.Distinct().ToList();
     }
 
-    private static bool IsIdent(byte[] b, int s, int len)
+    private static bool IsIdent(ReadOnlySpan<byte> b, int s, int len)
     {
         if (len == 0) return false;
         byte c0 = b[s];
@@ -674,7 +731,7 @@ public static class SaveScanner
         return true;
     }
 
-    private static bool IsPrintable(byte[] b, int s, int len)
+    private static bool IsPrintable(ReadOnlySpan<byte> b, int s, int len)
     {
         for (int k = 0; k < len; k++)
         {
@@ -684,7 +741,7 @@ public static class SaveScanner
         return true;
     }
 
-    private static bool TryVarint(byte[] b, int i, out long val, out int next)
+    private static bool TryVarint(ReadOnlySpan<byte> b, int i, out long val, out int next)
     {
         val = 0; next = i;
         for (int sh = 0; sh < 63 && next < b.Length; sh += 7)
@@ -697,7 +754,7 @@ public static class SaveScanner
         return false;
     }
 
-    private static bool ScanBytes(byte[] hay, byte[] needle)
+    private static bool ScanBytes(ReadOnlySpan<byte> hay, ReadOnlySpan<byte> needle)
     {
         if (needle.Length == 0 || needle.Length > hay.Length) return false;
         for (int i = 0; i <= hay.Length - needle.Length; i++)
@@ -710,7 +767,7 @@ public static class SaveScanner
     }
 
     /// <summary>All `game:...` codes in the blob (domain:type-variations).</summary>
-    private static List<string> ExtractGameCodes(byte[] b)
+    private static List<string> ExtractGameCodes(ReadOnlySpan<byte> b, StringPool pool)
     {
         var res = new List<string>();
         for (int i = 0; i + 5 <= b.Length; i++)
@@ -718,10 +775,10 @@ public static class SaveScanner
             if (b[i] == 'g' && b[i + 1] == 'a' && b[i + 2] == 'm' && b[i + 3] == 'e' && b[i + 4] == ':')
             {
                 int j = i + 5;
-                var sb = new StringBuilder("game:");
                 while (j < b.Length && b[j] >= 32 && b[j] < 127 && (char.IsLetterOrDigit((char)b[j]) || b[j] == '-' || b[j] == '_' || b[j] == '.' || b[j] == '/'))
-                    sb.Append((char)b[j++]);
-                if (sb.Length > 6 && char.IsAsciiLetterOrDigit(sb[^1])) res.Add(sb.ToString());   // `game:foo-` is truncated
+                    j++;
+                // j - i counts the "game:" prefix as well; a bare `game:` is not a code
+                if (j - i > 6 && char.IsAsciiLetterOrDigit((char)b[j - 1])) res.Add(pool.InternAscii(b, i, j - i));   // `game:foo-` is truncated
                 i = j + 1;
             }
         }
@@ -739,7 +796,8 @@ public static class SaveScanner
     /// (`slot-0` → `slot-`, `baseseat-0`) are not kinds. Tokens lying inside an already found
     /// `domain:path` (<paramref name="domains" />) are skipped — otherwise the same code would be found twice,
     /// and its path without the domain would end up "last" (see <see cref="ExtractSpeciesCodes" />).</summary>
-    private static List<(int Pos, string Code)> ExtractBareCodes(byte[] b, List<(int Pos, string Code)> domains)
+    private static List<(int Pos, string Code)> ExtractBareCodes(ReadOnlySpan<byte> b, List<(int Pos, string Code)> domains,
+        StringPool pool)
     {
         var res = new List<(int, string)>();
         int i = 0;
@@ -753,7 +811,7 @@ public static class SaveScanner
                 int n = j - i;
                 if (n >= 5)
                 {
-                    var t = Encoding.ASCII.GetString(b, i, n);
+                    var t = pool.InternAscii(b, i, n);
                     // only hyphenated tokens look like a "kind-variant"; without a hyphen it is a fragment of camelCase keys
                     if (t.Contains('-') && char.IsAsciiLetter(t[^1]) && !BareCodeStoplist.Contains(t)
                         && !domains.Any(d => i >= d.Pos && i < d.Pos + d.Code.Length))
@@ -767,7 +825,7 @@ public static class SaveScanner
     }
 
     /// <summary>Printable identifier words in the blob (for dumping into the UI).</summary>
-    private static List<string> ExtractTokens(byte[] b, int cap)
+    private static List<string> ExtractTokens(ReadOnlySpan<byte> b, int cap, StringPool pool)
     {
         var res = new List<string>();
         int i = 0;
@@ -777,7 +835,7 @@ public static class SaveScanner
             {
                 int j = i;
                 while (j < b.Length && b[j] >= 32 && b[j] < 127 && (char.IsLetterOrDigit((char)b[j]) || b[j] == '_')) j++;
-                if (j - i >= 3) res.Add(Encoding.ASCII.GetString(b, i, j - i));
+                if (j - i >= 3) res.Add(pool.InternAscii(b, i, j - i));
                 i = j;
             }
             else i++;
@@ -785,7 +843,7 @@ public static class SaveScanner
         return res.Distinct().ToList();
     }
 
-    private static string FirstAscii(byte[] b, int max)
+    private static string FirstAscii(ReadOnlySpan<byte> b, int max)
     {
         var sb = new StringBuilder();
         for (int i = 0; i < b.Length && sb.Length < max; i++)

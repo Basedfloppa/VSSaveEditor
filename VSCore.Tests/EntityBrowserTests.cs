@@ -16,38 +16,39 @@ namespace VSCore.Tests
             var res = new SaveScanResult();
 
             var c1 = new ChunkScanData { Position = 100, ChunkX = 5, ChunkY = 1, ChunkZ = 7 };
-            c1.Entities.Add(new EntityInfo
+            c1.AddEntity(new EntityInfo
             {
                 Species = "game:wolf-eurasian-adult-male", Domain = "game", Kind = "wolf", SexAge = "adult-male",
                 ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 0, DataLength = 395,
                 Attributes = { ["maxhealth"] = "1" },
                 Fields = { "onHurt = 7" }
             });
-            c1.Entities.Add(new EntityInfo
+            c1.AddEntity(new EntityInfo
             {
                 Species = "game:chicken-hen", Kind = "chicken", SexAge = "hen",
                 ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 1, DataLength = 120
             });
             // a node with no type or attributes: there is nothing to show for it in the list
-            c1.Entities.Add(new EntityInfo { ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 2 });
-            c1.BlockEntities.Add(new BlockEntityInfo
+            c1.AddEntity(new EntityInfo { ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 2 });
+            var spawner = new BlockEntityInfo
             {
-                Type = "Spawner", SpeciesCodes = { "game:drifter-normal" },
-                Tokens = { "Spawner", "entityCodes", "meta-spawner" },
+                Type = "Spawner",
                 ChunkX = 5, ChunkY = 1, ChunkZ = 7, Position = 100, Occurrence = 0, DataLength = 88
-            });
+            };
+            spawner.SetSpeciesCodes(new List<string> { "game:drifter-normal" });
+            c1.AddBlockEntity(spawner);
             res.Chunks.Add(c1);
 
             var c2 = new ChunkScanData { Position = 200, ChunkX = 9, ChunkY = 2, ChunkZ = 9 };
-            c2.Entities.Add(new EntityInfo
+            c2.AddEntity(new EntityInfo
             {
                 Species = null, Kind = null, ChunkX = 9, ChunkY = 2, ChunkZ = 9,
                 Position = 200, Occurrence = 0, DataLength = 40,
                 Attributes = { ["entityDead"] = "1" }
             });
-            c2.BlockEntities.Add(new BlockEntityInfo
+            c2.AddBlockEntity(new BlockEntityInfo
             {
-                Type = "GenericTypedContainer", Tokens = { "GenericTypedContainer" },
+                Type = "GenericTypedContainer",
                 ChunkX = 9, ChunkY = 2, ChunkZ = 9, Position = 200, Occurrence = 0, DataLength = 640
             });
             res.Chunks.Add(c2);
@@ -172,7 +173,7 @@ namespace VSCore.Tests
         {
             var res = new SaveScanResult();
             var c = new ChunkScanData { Position = 300, ChunkX = 16005, ChunkY = 7, ChunkZ = 15986 };
-            c.Entities.Add(new EntityInfo
+            c.AddEntity(new EntityInfo
             {
                 Species = "equusdestrier:horse-adult-female-destrier", Domain = "equusdestrier",
                 Kind = "horse", SexAge = "female-destrier", CustomName = "Moonlight",

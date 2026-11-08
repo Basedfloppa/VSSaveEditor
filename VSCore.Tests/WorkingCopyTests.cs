@@ -71,6 +71,17 @@ public class WorkingCopyTests : IDisposable
         Assert.Equal(new byte[] { 1, 2, 3 }, original.ReadChunk(_chunkPos));
     }
 
+    [Fact(DisplayName = "Working copy: created in the disk-backed root, not in the temp folder")]
+    public void WorkingCopy_UsesTheDiskBackedRoot()
+    {
+        var save = VSSaveFile.OpenForEditing(_src);
+        var copy = Path.GetFullPath(save.Path);
+        Assert.StartsWith(Path.GetFullPath(VSSaveFile.WorkingCopyRoot), copy, StringComparison.Ordinal);
+        Assert.True(File.Exists(copy));
+        save.Dispose();
+        Assert.False(File.Exists(copy)); // the throwaway directory is removed with the session
+    }
+
     [Fact(DisplayName = "DeleteChunks: deletes the column only in the working copy, the original stays intact")]
     public void DeleteChunks_AppliesToWorkingCopyOnly()
     {

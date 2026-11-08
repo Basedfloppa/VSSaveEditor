@@ -131,10 +131,10 @@ public class ImageWriterTests
         var tm = new TerrainMap
         {
             MinX = 0, MinZ = 0, Width = 12, Height = 9,
-            SurfaceY = new int[108], BottomY = new int[108], TopBlock = new ushort[108], WaterDepth = new int[108],
+            SurfaceY = new ushort[108], BottomY = new ushort[108], TopBlock = new ushort[108], WaterDepth = new int[108],
             MinSurface = 1, MaxSurface = 5
         };
-        for (int i = 0; i < 108; i++) { tm.SurfaceY[i] = 1 + i % 4; tm.TopBlock[i] = (ushort)(1 + i % 3); }
+        for (int i = 0; i < 108; i++) { tm.SurfaceY[i] = (ushort)(1 + i % 4); tm.TopBlock[i] = (ushort)(1 + i % 3); }
         var dir = Path.Combine(Path.GetTempPath(), "vsimg_" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try

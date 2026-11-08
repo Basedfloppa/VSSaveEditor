@@ -60,10 +60,10 @@ public class VoxelSliceTests
         var tm = new TerrainMap
         {
             MinX = 0, MinZ = 0, Width = w, Height = h,
-            SurfaceY = new int[n], BottomY = new int[n], TopBlock = new ushort[n], WaterDepth = new int[n],
+            SurfaceY = new ushort[n], BottomY = new ushort[n], TopBlock = new ushort[n], WaterDepth = new int[n],
             MinSurface = surface, MaxSurface = surface, Registry = reg
         };
-        for (int i = 0; i < n; i++) { tm.SurfaceY[i] = surface; tm.BottomY[i] = surface - 3; }
+        for (int i = 0; i < n; i++) { tm.SurfaceY[i] = (ushort)surface; tm.BottomY[i] = (ushort)(surface - 3); }
         return tm;
     }
 

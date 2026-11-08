@@ -73,12 +73,7 @@ public sealed class ChunkColumnInfo
             }
 
             foreach (var be in c.BlockEntities)
-            {
                 if (Hit(be.Type) || Hit(be.CodeSummary)) return true;
-                foreach (var t in be.Tokens)
-                    if (Hit(t))
-                        return true;
-            }
 
             foreach (var code in c.BlockCodeCounts.Keys)
                 if (Hit(code))
