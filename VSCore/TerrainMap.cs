@@ -111,6 +111,40 @@ public sealed class TerrainMap
         return true;
     }
 
+    /// <summary>Allocates an empty map of the given window: the arrays a render mode reads, nothing else.
+    /// Used by the builder and by the on-disk tile store, which has to restore a map with the same shape.</summary>
+    internal static TerrainMap Allocate(int minX, int minZ, int width, int height, TerrainNeeds needs)
+    {
+        int cells = checked(width * height);
+        bool needWater = (needs & TerrainNeeds.Water) != 0;
+        bool needRain = (needs & TerrainNeeds.RainSurface) != 0;
+        return new TerrainMap
+        {
+            MinX = minX, MinZ = minZ, Width = width, Height = height,
+            SurfaceY = new ushort[cells],
+            BottomY = new ushort[cells],
+            TopBlock = new ushort[cells],
+            WaterDepth = needWater ? new int[cells] : null,
+            MapY = needRain ? new ushort[cells] : null,
+            MapBlock = needRain ? new ushort[cells] : null,
+            Needs = needs,
+            MaxSurface = int.MinValue, MinSurface = int.MaxValue
+        };
+    }
+
+    /// <summary>Attaches a restored overview (the on-disk tile store carries it, so the cache hit does not
+    /// have to re-colour the whole tile to get one).</summary>
+    internal void SetPyramid(TerrainPyramid? pyramid) => Pyramid = pyramid;
+
+    /// <summary>Binds a restored map to the save it came from: the registry and the on-demand voxel source
+    /// are live objects and are not part of the serialized data.</summary>
+    internal void Attach(VSSaveFile save, ChunkArea? area)
+    {
+        Area = area;
+        Registry = save.BlockRegistry.Count > 0 ? save.BlockRegistry : null;
+        Voxels = new SaveVoxelSource(save.ReadChunk);
+    }
+
     /// <summary>Limit of the map area in columns. A blocks-mode column costs surface/bottom/top (2 bytes
     /// each) plus the rain-map arrays and shadow (11 bytes); the water modes replace the rain arrays with
     /// the water depth (4 bytes), so a column is 15 bytes only when every field is requested. It is needed

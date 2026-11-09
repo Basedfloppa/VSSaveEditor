@@ -440,6 +440,103 @@ public static class ChunkBlockDecoder
         var ps = palS.AsSpan(0, Math.Max(0, ns));
         var pf = palF.AsSpan(0, Math.Max(0, nf));
 
+        // Word-at-a-time instead of cell-at-a-time. A 32-cell word whose bit planes are all zero holds
+        // 32 copies of palette[0], and on a real save ~60 % of cells are air in whole zero words, so the
+        // cell loop is skipped there entirely. Inside a mixed word a cell whose mask bit is clear still
+        // avoids CellId: its value is palette[0] by definition.
+        int s0 = ns > 1 ? ps[0] : 0;
+        int f0 = nf > 1 ? pf[0] : 0;
+        for (int word = 0; word < CellsPerChunk >> 5; word++)
+        {
+            uint maskS = 0, maskF = 0;
+            if (bs > 0) for (int p = 0; p < bs; p++) maskS |= PlaneWord(planesS, p, word);
+            if (bf > 0) for (int p = 0; p < bf; p++) maskF |= PlaneWord(planesF, p, word);
+            if ((maskS | maskF) == 0)
+            {
+                if (s0 != 0)
+                {
+                    solid += 32;
+                    if (hist[s0] == 0) touched.Add(s0);
+                    hist[s0] += 32;
+                }
+                else if (f0 != 0)
+                {
+                    fluid += 32;
+                    if (hist[f0] == 0) touched.Add(f0);
+                    hist[f0] += 32;
+                }
+                else air += 32;
+                continue;
+            }
+
+            int baseIdx = word * 32;
+            for (int bit = 0; bit < 32; bit++)
+            {
+                int idx = baseIdx + bit;
+                uint b = 1u << bit;
+                ushort id = (maskS & b) != 0 ? CellId(planesS, bs, ps, idx) : (ushort)s0;
+                if (id != 0)
+                {
+                    solid++;
+                    if (hist[id]++ == 0) touched.Add(id);
+                    continue;
+                }
+                id = (maskF & b) != 0 ? CellId(planesF, bf, pf, idx) : (ushort)f0;
+                if (id != 0)
+                {
+                    fluid++;
+                    if (hist[id]++ == 0) touched.Add(id);
+                }
+                else air++;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Per-cell reference for <see cref="DecodeChunkHistogram"/>. The word-at-a-time decoder is only
+    /// trustworthy while it agrees with this one on real saves, so the perf probe and the tests run both
+    /// over the same chunks and compare. Not used by the app path.
+    /// </summary>
+    public static void DecodeChunkHistogramPerCell(byte[] chunkBlob, long[] hist, List<int> touched,
+        out long solid, out long fluid, out long air)
+    {
+        if (hist.Length < ushort.MaxValue + 1) throw new ArgumentException("histogram must cover 65536 ids", nameof(hist));
+        solid = fluid = air = 0;
+
+        ReadOnlySpan<byte> solids = default, fluids = default;
+        var r = new PbSpanReader(chunkBlob, maxFields: 5000);
+        while (r.MoveNext())
+        {
+            if (r.WireType != 2) continue;
+            if (r.Field == 1) solids = r.Bytes;
+            else if (r.Field == 16) fluids = r.Bytes;
+        }
+        if (solids.Length == 0 && fluids.Length == 0)
+        {
+            air = CellsPerChunk;
+            return;
+        }
+
+        var palS = _paletteSolids ??= new int[MaxPaletteEntries];
+        var palF = _paletteFluids ??= new int[MaxPaletteEntries];
+        int ns = 0, nf = 0;
+        ReadOnlySpan<byte> planesS = default, planesF = default;
+        if (solids.Length > 0)
+        {
+            var dec = Decoder1;
+            ns = ReadPaletteInto(solids, dec, palS, out int off);
+            if (ns > 1) planesS = ZstdDecompressSpan(solids, off, solids.Length - off, dec);
+        }
+        if (fluids.Length > 0)
+        {
+            var dec = Decoder2;
+            nf = ReadPaletteInto(fluids, dec, palF, out int off);
+            if (nf > 1) planesF = ZstdDecompressSpan(fluids, off, fluids.Length - off, dec);
+        }
+        int bs = ns > 1 ? BitsNeeded(ns) : 0, bf = nf > 1 ? BitsNeeded(nf) : 0;
+        var ps = palS.AsSpan(0, Math.Max(0, ns));
+        var pf = palF.AsSpan(0, Math.Max(0, nf));
+
         for (int idx = 0; idx < CellsPerChunk; idx++)
         {
             ushort id = ns > 1 ? CellId(planesS, bs, ps, idx) : (ushort)0;

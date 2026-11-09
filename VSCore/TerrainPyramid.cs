@@ -28,6 +28,11 @@ public sealed class TerrainPyramid
         MinX = minX; MinZ = minZ; Width = width; Height = height; CellSize = cellSize; Mode = mode; Pixels = pixels;
     }
 
+    /// <summary>Restores a pyramid read from the on-disk tile store (the display data is all it carries).</summary>
+    internal static TerrainPyramid Restore(int minX, int minZ, int width, int height, int cellSize, int mode,
+        byte[] pixels)
+        => new(minX, minZ, width, height, cellSize, mode, pixels);
+
     /// <summary>Blocks per pyramid pixel on the X/Z axes (both axes use the same cell to keep the aspect).</summary>
     public int CellBlocks => CellSize;
 
@@ -101,5 +106,35 @@ public sealed class TerrainPyramid
             if (tm.SurfaceY[i] > 0) return i;
         }
         return -1;
+    }
+
+    /// <summary>
+    ///     A coarser copy for an area that has to leave the RAM budget. Keeping the full pyramid of every
+    ///     evicted tile would cost hundreds of megabytes; a copy capped at 512 pixels is under a megabyte and
+    ///     is still a usable picture at whole-world zoom, where the alternative is a blank piece of the map.
+    /// </summary>
+    public TerrainPyramid Shrink(int maxDimension)
+    {
+        int maxDim = Math.Clamp(maxDimension, 64, MaxDimension);
+        if (Width <= maxDim && Height <= maxDim) return this;
+        int k = Math.Max(2, (int)Math.Ceiling(Math.Max(Width, Height) / (double)maxDim));
+        int w = Math.Max(1, Width / k), h = Math.Max(1, Height / k);
+        var pixels = new byte[w * h * 4];
+        for (var z = 0; z < h; z++)
+        {
+            var sz = Math.Min(Height - 1, z * k + k / 2);
+            for (var x = 0; x < w; x++)
+            {
+                var sx = Math.Min(Width - 1, x * k + k / 2);
+                var src = (sz * Width + sx) * 4;
+                var dst = (z * w + x) * 4;
+                pixels[dst] = Pixels[src];
+                pixels[dst + 1] = Pixels[src + 1];
+                pixels[dst + 2] = Pixels[src + 2];
+                pixels[dst + 3] = Pixels[src + 3];
+            }
+        }
+        // The block rectangle is unchanged: one coarse pixel now covers CellSize*k blocks.
+        return new TerrainPyramid(MinX, MinZ, w, h, CellSize * k, Mode, pixels);
     }
 }

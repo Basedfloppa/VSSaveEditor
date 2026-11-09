@@ -13,7 +13,9 @@ public sealed record ChunkInfo(long Position, int DataLength);
 /// </summary>
 public sealed class VSSaveFile : IDisposable
 {
-    private readonly SqliteConnection _conn;
+    private SqliteConnection _conn;
+    private List<long>? _positionsCache;
+    private CancellationTokenSource? _prefetch;
 
     /// <summary>Guards the single read connection. Microsoft.Data.Sqlite does not allow one connection to be
     /// used by two threads at once; the background scan and an area build (or a chunk card) overlap all the
@@ -24,14 +26,24 @@ public sealed class VSSaveFile : IDisposable
     private BlockRegistry? _blockRegistry;
     private ItemRegistry? _itemRegistry;
 
-    /// <summary>The file that is actually open. For an editing session this is the working copy, not the user's save.</summary>
-    public string Path { get; }
+    /// <summary>The file that is actually open. An editing session starts on the user's save and switches to
+    /// the working copy at the first write (see <see cref="EnsureEditable"/>).</summary>
+    public string Path => _path;
+    private string _path;
 
     /// <summary>The source file the user opened. null — the object was opened directly (read-only).</summary>
     public string? SourcePath { get; }
 
+    /// <summary>True once an editing session has its own copy on disk. False right after opening (the
+    /// session still reads the original) and for a read-only session.</summary>
+    public bool HasWorkingCopy => _workingDir is not null;
+
     /// <summary>Directory of the throwaway working copy: deleted together with the object.</summary>
     private string? _workingDir;
+
+    /// <summary>True for an editing session that has not written yet: reads go to the original, and the
+    /// 12-GB snapshot is skipped until something is actually edited.</summary>
+    private bool _promotionPending;
 
     /// <summary>Block registry (block id -> code) from gamedata, parsed lazily.</summary>
     public BlockRegistry BlockRegistry
@@ -58,10 +70,87 @@ public sealed class VSSaveFile : IDisposable
 
     private VSSaveFile(string path, SqliteConnection conn, string? sourcePath = null, string? workingDir = null)
     {
-        Path = path;
+        _path = path;
         _conn = conn;
         SourcePath = sourcePath;
         _workingDir = workingDir;
+        // A reader of a WAL database makes SQLite create `-wal`/`-shm` next to the save. Remembering whether
+        // they were already there is what separates "ours to remove" from "someone else's, hands off".
+        _readerPath = workingDir is null ? path : null;
+        if (_readerPath is not null)
+            RegisterReader(_readerPath, System.IO.File.Exists(path + "-wal") || System.IO.File.Exists(path + "-shm"));
+    }
+
+    /// <summary>Read-only sessions per file. Two sessions on one save share the same `-shm`, so the cleanup runs
+    /// only when the last of them closes; and the files may be removed only when the FIRST of them opened a
+    /// save that had neither — otherwise a writer put them there and they are not ours.</summary>
+    private sealed class ReaderSessions
+    {
+        public int Count;
+        public bool FilesWereOurs;
+    }
+
+    private static readonly Dictionary<string, ReaderSessions> Readers = new(StringComparer.Ordinal);
+
+    private static void RegisterReader(string path, bool filesExisted)
+    {
+        lock (Readers)
+        {
+            if (Readers.TryGetValue(path, out var existing)) { existing.Count++; return; }
+            Readers[path] = new ReaderSessions { Count = 1, FilesWereOurs = !filesExisted };
+        }
+    }
+
+    /// <summary>Drops this session from the open readers; <paramref name="filesWereOurs" /> says whether the pair
+    /// next to the save may be removed by whoever closes last.</summary>
+    private static bool UnregisterReader(string path, out bool filesWereOurs)
+    {
+        lock (Readers)
+        {
+            filesWereOurs = false;
+            if (!Readers.TryGetValue(path, out var state)) return true;
+            if (state.Count > 1) { state.Count--; return false; }
+            Readers.Remove(path);
+            filesWereOurs = state.FilesWereOurs;
+            return true;
+        }
+    }
+
+    /// <summary>The file whose `-wal`/`-shm` this session may have created (the user's save, never the
+    /// working copy — that one leaves together with its folder). Cleared once the cleanup has run.</summary>
+    private string? _readerPath;
+
+    /// <summary>
+    ///     Removes the `-wal`/`-shm` a read-only session left next to the save. SQLite deletes those files
+    ///     itself only when the last connection closes **with write access**; a reader cannot unlink them, so a
+    ///     clean world used to be left with a 32-KB `-shm` and an empty `-wal` after every look at it.
+    ///
+    ///     Two conditions guard the deletion, both about not touching foreign data: the files must not have
+    ///     existed before we opened (otherwise a writer put them there), and the WAL must still be empty — a WAL
+    ///     with frames carries committed transactions and deleting it would throw them away. A third guard is
+    ///     the other read-only session on the same file: the files may only go when the last one closes.
+    /// </summary>
+    private void FoldAwayReaderWal()
+    {
+        var path = _readerPath;
+        _readerPath = null;
+        if (path is null) return;
+        if (!UnregisterReader(path, out var filesWereOurs) || !filesWereOurs) return;
+        var wal = path + "-wal";
+        var shm = path + "-shm";
+        try
+        {
+            if (System.IO.File.Exists(wal) && new System.IO.FileInfo(wal).Length > 0) return;
+        }
+        catch
+        {
+            return;
+        }
+        foreach (var file in new[] { wal, shm })
+        {
+            try { if (System.IO.File.Exists(file)) System.IO.File.Delete(file); }
+            catch { /* the file is locked (another process joined in): leaving it is the safe outcome */ }
+        }
     }
 
     /// <summary>
@@ -72,17 +161,63 @@ public sealed class VSSaveFile : IDisposable
     /// </summary>
     public static VSSaveFile OpenForEditing(string path)
     {
-        // No .bak is needed for the working copy: the original does not change anyway, while an extra full copy
-        // of a 500-MB save is noticeable both on disk and in opening time.
-        var (dir, copy, _) = CreateWorkingCopy(path, withBackup: false);
+        // The snapshot is deferred to the first write. On a 12-GB save it cost 24 s (24 GB of disk traffic)
+        // before anything was decoded, and most sessions never edit at all. Until then the session reads
+        // the original — the same pages the map and the scan need — and only a write pays for the copy.
         try
         {
-            return new VSSaveFile(copy, OpenConnection(copy, SqliteOpenMode.ReadWrite), path, dir);
+            return new VSSaveFile(path, OpenConnection(path, SqliteOpenMode.ReadOnly), path)
+            {
+                _promotionPending = true
+            };
         }
-        catch
+        catch (SqliteException)
         {
-            try { System.IO.Directory.Delete(dir, true); } catch { }
-            throw;
+            // A read-only WAL that cannot be opened without its `-shm` (foreign permissions, the world is
+            // not stopped) cannot be read consistently at all, so this falls back to the eager snapshot.
+            var (dir, copy, _) = CreateWorkingCopy(path, withBackup: false);
+            try
+            {
+                return new VSSaveFile(copy, OpenConnection(copy, SqliteOpenMode.ReadWrite), path, dir);
+            }
+            catch
+            {
+                try { System.IO.Directory.Delete(dir, true); } catch { }
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Switches an editing session to its working copy: creates the snapshot now and replaces the read
+    /// connection. Called from every write path, so nothing above this class has to know that opening
+    /// was lazy. A read-only session (opened through <see cref="OpenReadOnly"/>) has no source and still
+    /// throws, exactly as before.
+    /// </summary>
+    private void EnsureEditable()
+    {
+        if (SourcePath is null) throw new InvalidOperationException("this save is not editable (open it with OpenForEditing)");
+        if (!_promotionPending) return;
+        lock (_ioLock)
+        {
+            if (!_promotionPending) return;
+            var (dir, copy, _) = CreateWorkingCopy(SourcePath, withBackup: false);
+            SqliteConnection conn;
+            try
+            {
+                conn = OpenConnection(copy, SqliteOpenMode.ReadWrite);
+            }
+            catch
+            {
+                try { System.IO.Directory.Delete(dir, true); } catch { }
+                throw;
+            }
+            _conn.Dispose();
+            FoldAwayReaderWal(); // the read-only phase is over: the original must be left as clean as we found it
+            _conn = conn;
+            _path = copy;
+            _workingDir = dir;
+            _promotionPending = false;
         }
     }
 
@@ -93,7 +228,7 @@ public sealed class VSSaveFile : IDisposable
     /// </summary>
     public int ApplyChanges(IEnumerable<(string table, long position, byte[] data)> changes)
     {
-        if (SourcePath is null) throw new InvalidOperationException("this save is not editable (open it with OpenForEditing)");
+        EnsureEditable();
         var list = changes.ToList();
         if (list.Count == 0) return 0;
         foreach (var (table, _, _) in list) EnsureSafeTableName(table);
@@ -113,6 +248,7 @@ public sealed class VSSaveFile : IDisposable
             pp.Value = pos;
             applied += up.ExecuteNonQuery();
         }
+        InvalidatePositions(); // an update may add or drop chunk rows
         txn.Commit();
         return applied;
     }
@@ -123,7 +259,7 @@ public sealed class VSSaveFile : IDisposable
     /// </summary>
     private SqliteConnection OpenWriteConnection()
     {
-        if (SourcePath is null) throw new InvalidOperationException("this save is not editable (open it with OpenForEditing)");
+        EnsureEditable();
         var conn = OpenConnection(Path, SqliteOpenMode.ReadWrite);
         try
         {
@@ -146,7 +282,7 @@ public sealed class VSSaveFile : IDisposable
     /// </summary>
     public string SaveCopyTo(string destination)
     {
-        if (SourcePath is null) throw new InvalidOperationException("this save is not a working copy");
+        EnsureEditable();
         var dest = System.IO.Path.GetFullPath(destination);
         if (SamePath(dest, SourcePath))
             throw new InvalidOperationException("refusing to overwrite the original save; choose another file name");
@@ -210,6 +346,7 @@ public sealed class VSSaveFile : IDisposable
         int chunkRows = DeleteChunkColumns(conn, txn, "chunk", wanted);
         int mapRows = TableExists(conn, txn, "mapchunk") ? DeleteChunkColumns(conn, txn, "mapchunk", wanted) : 0;
         txn.Commit();
+        InvalidatePositions(); // the deleted columns are gone from the chunk table
         return (chunkRows, mapRows);
     }
 
@@ -264,7 +401,11 @@ public sealed class VSSaveFile : IDisposable
         {
             DataSource = path,
             Mode = mode,
-            Cache = mode == SqliteOpenMode.ReadOnly ? SqliteCacheMode.Shared : SqliteCacheMode.Default
+            Cache = mode == SqliteOpenMode.ReadOnly ? SqliteCacheMode.Shared : SqliteCacheMode.Default,
+            // No pooling: a pooled connection is handed back instead of closed, so SQLite never runs its
+            // "last connection" path and the `-wal`/`-shm` of the save outlive the session. Closing for real
+            // also keeps the exit deterministic: what the editor opened, the editor closes.
+            Pooling = false
         };
         // DataSource is not a parameter but connection-string text. If the path contains `;` or a quote,
         // we check that the path stayed exactly the same after assembly: otherwise there is a risk of connecting
@@ -274,7 +415,31 @@ public sealed class VSSaveFile : IDisposable
             throw new InvalidOperationException($"unsafe save path: {path}");
         var conn = new SqliteConnection(connStr);
         conn.Open();
+        ApplyReadPragmas(conn, mode);
         return conn;
+    }
+
+    /// <summary>
+    /// Read-side tuning, read-only connections only. `query_only` makes an accidental write fail instead
+    /// of touching the user's save, at no measurable cost. Two other pragmas were measured on a 12-GB save
+    /// and deliberately NOT set: a 128-MiB `cache_size` made a full positions pass 26 % slower
+    /// (2.57 s -> 3.25 s) — the scan streams pages once, so a large cache only adds bookkeeping — and
+    /// `mmap_size` moved the same pass by ~2 %, inside the run-to-run noise, while mmap of a file the game
+    /// may rewrite risks a SIGBUS. The defaults are better here.
+    /// </summary>
+    private static void ApplyReadPragmas(SqliteConnection conn, SqliteOpenMode mode)
+    {
+        if (mode != SqliteOpenMode.ReadOnly) return;
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA query_only=1;";
+            cmd.ExecuteNonQuery();
+        }
+        catch
+        {
+            // tuning must never prevent opening a save: a build without this pragma still works
+        }
     }
 
     /// <summary>The table name is inserted into the SQL as text (an identifier cannot be a parameter),
@@ -535,21 +700,15 @@ public sealed class VSSaveFile : IDisposable
 
     /// <summary>Positions of the chunk rows of an area (no blobs are read). Used by the paged map build:
     /// it needs the bounds and the groups first, then fetches the blobs a page at a time.</summary>
-    public List<long> ChunkPositionsInWindow(ChunkArea? area) => ReadDb(conn =>
+    public List<long> ChunkPositionsInWindow(ChunkArea? area) => ReadDb(_ =>
     {
-        var list = new List<long>();
-        using var c = conn.CreateCommand();
-        c.CommandText = "SELECT position FROM chunk ORDER BY position;";
-        using var r = c.ExecuteReader();
-        while (r.Read())
+        var all = _positionsCache ??= ReadPositions(_conn);
+        if (area is null) return all;
+        var list = new List<long>(all.Count / 8);
+        foreach (var position in all)
         {
-            long position = r.GetInt64(0);
-            if (area is not null)
-            {
-                var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)position);
-                if (!area.ContainsChunk(cx, cz)) continue;
-            }
-            list.Add(position);
+            var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)position);
+            if (area.ContainsChunk(cx, cz)) list.Add(position);
         }
         return list;
     });
@@ -610,7 +769,19 @@ public sealed class VSSaveFile : IDisposable
     });
 
     /// <summary>Positions of all `chunk` rows (no data is read) — the map areas are computed from them.</summary>
-    public List<long> ChunkPositions => ReadDb(conn =>
+    /// <remarks>
+    ///     Cached for the lifetime of the save object: the query reads the whole table (the blob column lives in
+    ///     the same b-tree, so selecting one column still touches every page). The map builds one tile per area
+    ///     and asked for the same list again for each of them — on a 12-GB save with 45 tiles that was 45 full
+    ///     passes over the file. The writers below invalidate the cache, because they remove rows.
+    /// </remarks>
+    public List<long> ChunkPositions => ReadDb(_ => _positionsCache ??= ReadPositions(_conn));
+
+    /// <summary>How many times the chunk tables of this file were changed in this session. The on-disk tile
+    /// cache mixes it into its key, so a tile built from older content is never served after an edit.</summary>
+    public int ContentVersion { get; private set; }
+
+    private static List<long> ReadPositions(SqliteConnection conn)
     {
         var list = new List<long>();
         using var c = conn.CreateCommand();
@@ -618,17 +789,42 @@ public sealed class VSSaveFile : IDisposable
         using var r = c.ExecuteReader();
         while (r.Read()) list.Add(r.GetInt64(0));
         return list;
-    });
+    }
+
+    /// <summary>Drops the cached positions — a write may have added or removed chunk rows.</summary>
+    private void InvalidatePositions()
+    {
+        _positionsCache = null;
+        // Chunk data changed: every tile cached from the previous content is stale, so the cache key
+        // (which includes this counter) rotates. Within a session the file mtime is not enough — an edit
+        // and a re-read can land in the same second.
+        ContentVersion++;
+    }
 
     /// <summary>Rows of the mapchunk table (the client map) with data.</summary>
-    public List<ChunkRow> MapchunkRowsWithData => ReadDb(conn =>
+    public List<ChunkRow> MapchunkRowsWithData => MapchunkRowsWithDataLimit(int.MaxValue);
+
+    /// <summary>First <paramref name="limit"/> mapchunk rows with data, ordered by position.</summary>
+    /// <remarks>The mapchunk blobs are 3.7 GB on the 12-GB server save (31 % of the file) while the only
+    /// consumer of the scanned rows — the data dump — prints fifty of them. The scan therefore reads a
+    /// sample and asks for <see cref="MapchunkRowCount"/> separately, which walks the leaf pages only.</remarks>
+    public List<ChunkRow> MapchunkRowsWithDataLimit(int limit) => ReadDb(conn =>
     {
-        var list = new List<ChunkRow>();
+        var list = new List<ChunkRow>(Math.Min(limit, 4096));
         using var c = conn.CreateCommand();
-        c.CommandText = "SELECT position, data FROM mapchunk ORDER BY position;";
+        c.CommandText = "SELECT position, data FROM mapchunk ORDER BY position LIMIT @n;";
+        c.Parameters.AddWithValue("@n", limit);
         using var r = c.ExecuteReader();
         while (r.Read()) list.Add(new ChunkRow { Position = r.GetInt64(0), Data = r.IsDBNull(1) ? Array.Empty<byte>() : (byte[])r.GetValue(1) });
         return list;
+    });
+
+    /// <summary>Number of mapchunk rows. COUNT(*) over this table reads its leaves (~12 MB), not the blobs.</summary>
+    public int MapchunkRowCount => ReadDb(conn =>
+    {
+        using var c = conn.CreateCommand();
+        c.CommandText = "SELECT count(*) FROM mapchunk;";
+        return Convert.ToInt32(c.ExecuteScalar());
     });
 
     public byte[]? ReadRegion(long position) => ReadDb(conn =>
@@ -1037,13 +1233,71 @@ public sealed class VSSaveFile : IDisposable
         return new BlockRewriteStats(scanned, changed, fields, cleared, bytesBefore, bytesAfter);
     }
 
+    /// <summary>
+    /// Reads the file front to back once, in the background, so the passes that follow meet warm pages.
+    /// Measured on a cold 12-GB save: the positions pass took 43.3 s on its own and 31.7 s right after a
+    /// sequential read of the same file, because SQLite pulls 4-KB pages one at a time (~280 MB/s) while a
+    /// bulk read of the same file runs at ~3.7 GB/s. Best effort: a failure or a busy disk changes nothing,
+    /// and it stops as soon as the save is disposed.
+    /// </summary>
+    public void StartPrefetch()
+    {
+        if (SourcePath is not { Length: > 0 } path) return;
+        _prefetch?.Cancel();
+        var cts = new CancellationTokenSource();
+        _prefetch = cts;
+        var token = cts.Token;
+        new Thread(() =>
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
+                    1 << 20, FileOptions.SequentialScan);
+                var buf = new byte[1 << 20];
+                while (!token.IsCancellationRequested && fs.Read(buf, 0, buf.Length) > 0) { }
+            }
+            catch
+            {
+                // prefetch is an optimisation only: a locked or unreadable file must not affect opening
+            }
+        })
+        { IsBackground = true, Name = "save-prefetch" }.Start();
+    }
+
     public void Dispose()
     {
-        lock (_ioLock) _conn.Dispose();
+        try { _prefetch?.Cancel(); } catch { }
+        _prefetch?.Dispose();
+        _prefetch = null;
+        lock (_ioLock)
+        {
+            // On exit the WAL of a copy we wrote must be folded into the main file, not left next to it.
+            // The working copies are opened in DELETE mode, so this is a no-op today — it states the contract
+            // for any future writable session, where a leftover `-wal` would carry the user's edits.
+            if (_workingDir is not null) CheckpointQuietly(_conn);
+            _conn.Dispose();
+        }
+        FoldAwayReaderWal();
         if (_workingDir is { Length: > 0 } dir)
         {
             _workingDir = null;
             try { System.IO.Directory.Delete(dir, true); } catch { /* the copy is throwaway; cleanup must not break the exit */ }
+        }
+    }
+
+    /// <summary>`PRAGMA wal_checkpoint(TRUNCATE)`: every frame goes into the main file and the WAL is emptied.
+    /// Never throws: a failed checkpoint must not break the exit, and the caller deletes the file set anyway.</summary>
+    private static void CheckpointQuietly(SqliteConnection conn)
+    {
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+            cmd.ExecuteNonQuery();
+        }
+        catch
+        {
+            // not a WAL database, or the file is busy — the caller's cleanup is the fallback
         }
     }
 }

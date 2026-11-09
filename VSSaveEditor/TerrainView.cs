@@ -207,6 +207,73 @@ public class TerrainView : Control
         $"{l.Frame.Left}..{l.Frame.Left + l.Frame.W - 1}/{l.Frame.Top}..{l.Frame.Top + l.Frame.H - 1} " +
         $"@ {l.Frame.Ppb:0.###}x{l.Frame.PpbY:0.###}"));
 
+    /// <summary>
+    ///     Areas that intersect the viewport but have nothing to draw them with: not the primary map, not a
+    ///     cached full map, not an overview. Every entry is a piece of the world the user sees as background,
+    ///     which is exactly the "empty pieces of space" symptom - so this is the number to watch.
+    /// </summary>
+    public List<ChunkArea> UncoveredVisibleAreas()
+    {
+        var result = new List<ChunkArea>();
+        if (Areas is null) return result;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        foreach (var area in Areas.Areas)
+        {
+            if (!AreaIntersects(area, vx0, vz0, vx1, vz1)) continue;
+            if (Terrain?.Area is { } current && ReferenceEquals(current, area)) continue;
+            if (_areaMaps.ContainsKey(area)) continue;
+            if (_areaOverviews.ContainsKey(area)) continue;
+            result.Add(area);
+        }
+        return result;
+    }
+
+    /// <summary>Diagnostics: areas the map could still show if their overview were kept on eviction.</summary>
+    public int CachedAreaCount => _areaMaps.Count;
+
+    /// <summary>Raised when the current view needs a map the window does not hold: the areas are visible but
+    /// neither cached in RAM nor covered by an overview fine enough for this zoom. The window answers by
+    /// reading them from the on-disk tile cache - a load of ~0.1 s instead of a blank piece of the map.</summary>
+    public event Action<IReadOnlyList<ChunkArea>>? AreasNeedMaps;
+
+    /// <summary>Visible areas that need a full map right now: not the primary one, not cached, and either
+    /// without an overview or with one too coarse for the current density.</summary>
+    public List<ChunkArea> VisibleAreasNeedingMap()
+    {
+        var result = new List<ChunkArea>();
+        if (Areas is null || _ppb <= 0) return result;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        foreach (var area in Areas.Areas)
+        {
+            if (!AreaIntersects(area, vx0, vz0, vx1, vz1)) continue;
+            if (Terrain?.Area is { } current && ReferenceEquals(current, area)) continue;
+            if (_areaMaps.ContainsKey(area)) continue;
+            if (_areaOverviews.TryGetValue(area, out var py) && py.Mode == _mode &&
+                py.SuitableFor(_ppb, (int)Math.Ceiling(area.WidthBlocks * _ppb),
+                    (int)Math.Ceiling(area.HeightBlocks * _ppb))) continue;
+            result.Add(area);
+        }
+        return result;
+    }
+
+    private void RaiseAreasNeeded()
+    {
+        // Only at detail density: that is where a missing tile is a real hole (the overviews cannot stand
+        // in), and where asking for it costs one tile instead of the whole map.
+        if (AreasNeedMaps is null || _ppb < 1) return;
+        var needed = VisibleAreasNeedingMap();
+        if (needed.Count > 0) AreasNeedMaps(needed);
+    }
+
+    /// <summary>Whether <paramref name="area"/> has any part on screen right now. The RAM budget must not
+    /// evict one of these: the tile would vanish from under the cursor while the user is looking at it.</summary>
+    public bool AreaVisible(ChunkArea area)
+    {
+        if (Areas is null) return false;
+        var (vx0, vz0, vx1, vz1) = VisibleWorld();
+        return AreaIntersects(area, vx0, vz0, vx1, vz1);
+    }
+
     /// <summary>Replaces the set of cached area maps. The current Terrain stays the interactive one;
     /// all other maps whose bbox is visible become extra layers (exact at detail density).</summary>
     public void SetAreaMaps(IReadOnlyDictionary<ChunkArea, TerrainMap> maps)
@@ -904,6 +971,7 @@ public class TerrainView : Control
         if (tm is null) return;
         ClampFocus();
         CheckAreaRequest(); // we reached another area - the window will build its map (AreaRequested)
+        RaiseAreasNeeded(); // and ask for visible areas we cannot draw at all
 
         var ppb = EffectivePpb();
         _ppb = ppb;

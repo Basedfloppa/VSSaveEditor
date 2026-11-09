@@ -6,6 +6,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Presenters;
@@ -125,6 +126,12 @@ internal static class Harness
             return;
         }
 
+        if (mode == "statusrace")
+        {
+            StatusRace();
+            return;
+        }
+
         if (mode == "input")
         {
             InputProbe(save);
@@ -203,6 +210,18 @@ internal static class Harness
             return;
         }
 
+        if (mode == "warm")
+        {
+            Warm(save);
+            return;
+        }
+
+        if (mode == "cover")
+        {
+            Cover(save);
+            return;
+        }
+
         if (mode == "areadetail")
         {
             AreaDetail(save);
@@ -272,6 +291,12 @@ internal static class Harness
         if (mode == "statusline")
         {
             StatusLine(save);
+            return;
+        }
+
+        if (mode == "applog")
+        {
+            AppLogProbe();
             return;
         }
 
@@ -1598,6 +1623,64 @@ internal static class Harness
     }
 
     /// <summary>
+    ///     The scan reports progress from worker threads (Parallel.For in SaveScanner). Every write goes to
+    ///     AppStatus, which raises Changed, which touches the status TextBlock — so the path must be safe from
+    ///     a non-UI thread and from several threads at once. This probe reproduces both, in the order the
+    ///     crash was seen: one write from a worker thread, then thousands of concurrent ones.
+    /// </summary>
+    private static void StatusRace()
+    {
+        var w = new MainWindow { Width = 960, Height = 660 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        var line = w.FindNamed<TextBlock>("AppStatusText")!;
+
+        // 1) exactly what ScanProgress.Report does: one write, from a thread that is not the UI thread
+        string? single = null;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                w.Status.Set(StatusChannel.Scan, "Scanning save data... 1 chunks");
+            }
+            catch (Exception ex)
+            {
+                single = ex.GetType().Name + ": " + ex.Message;
+            }
+        });
+        t.Start();
+        t.Join();
+        Console.WriteLine($"[statusrace] single write from a worker thread: {(single is null ? "ok" : "THREW " + single)}");
+
+        // 2) concurrent writers: the dictionary behind the channels is shared, not per caller
+        var errors = 0;
+        string? first = null;
+        Parallel.For(0, 4000, new ParallelOptions { MaxDegreeOfParallelism = 8 }, i =>
+        {
+            try
+            {
+                w.Status.Set(StatusChannel.Scan, $"Scanning save data... {i:N0} chunks");
+            }
+            catch (Exception ex)
+            {
+                if (Interlocked.Increment(ref errors) == 1) first = ex.GetType().Name + ": " + ex.Message;
+            }
+        });
+        Console.WriteLine($"[statusrace] 4000 concurrent writes: errors={errors}" + (first is null ? "" : $" first=" + first));
+
+        // 3) the line itself: after the dispatcher runs, the control must show the newest message
+        Pump(0.5);
+        Dispatcher.UIThread.RunJobs();
+        var expected = w.Status.Text.Replace("\r\n", "\n").Replace("\n", " · ");
+        var match = string.Equals(line.Text, expected, StringComparison.Ordinal);
+        Console.WriteLine($"[statusrace] line='{Cut(line.Text)}' status='{Cut(w.Status.Text)}' match={match}");
+
+        var ok = single is null && errors == 0 && match;
+        Console.WriteLine($"RESULT: {(ok ? "OK" : "FAIL")}");
+    }
+
+    /// <summary>
     ///     The "Entities" tab: a flat list of creatures and block entities instead of a text dump —
     ///     filter, category, "frequent names", record card and editing of its parameters up to a COPY of the save
     ///     (both for creatures and for block entities: field 6 and field 8).
@@ -2310,6 +2393,116 @@ internal static class Harness
         CloseNow(w);
         Pump(0.5);
         Console.WriteLine("DONE");
+    }
+
+    /// <summary>
+    ///     The residual "empty pieces of space" symptom: after the warm pass, zoom out to the whole world and
+    ///     count the areas that intersect the viewport but have nothing to draw them with. Every such area is
+    ///     a blank piece the user sees, so the number must reach zero when the pass is done.
+    /// </summary>
+    private static void Cover(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        var ok = WaitFor(w, "StatusText", "Map ready:", 1500);
+        Console.WriteLine($"[cover] warm report: {(ok ? "yes" : "NO")} — {TextOf(w, "StatusText")}");
+
+        var map = (TerrainView)w.FindNamed<Control>("Map")!;
+        if (map.Terrain is null) { Console.WriteLine("FAILED: no map"); CloseNow(w); return; }
+
+        // Fit the whole world: the zoom where every area is on screen at once.
+        var world = map.Areas!.WorldBounds;
+        double wW = world.MaxX - world.MinX + 1, wH = world.MaxZ - world.MinZ + 1;
+        double ppb = Math.Min(map.Bounds.Width / wW, map.Bounds.Height / wH) * 0.95;
+        map.CentreOn((world.MinX + world.MaxX) / 2.0, (world.MinZ + world.MaxZ) / 2.0, ppb);
+        // Two rebuilds: the first is triggered by the zoom, the extras arrive with it.
+        for (int i = 0; i < 3; i++) Pump(1.5);
+
+        var uncovered = map.UncoveredVisibleAreas();
+        Console.WriteLine($"[cover] world {wW:0}×{wH:0} blocks at {ppb:0.###} px/block; cached maps {map.CachedAreaCount}, " +
+                          $"extra layers {map.ExtraAreaLayers} ({map.ExtraCoarseLayers} coarse)");
+        Console.WriteLine($"[cover] visible areas with nothing to draw: {uncovered.Count} " +
+                          $"{(uncovered.Count == 0 ? "" : "→ #" + string.Join(", #", uncovered.Select(a => a.Index + 1)))}");
+        Shot(w, "cover_world");
+        var blankAtWorldZoom = uncovered.Count;
+
+        // Mid zoom is the harder case: the shrunk overviews are too coarse there, so the window has to read
+        // the visible tiles back from disk. Blank pieces must not survive past that load.
+        double midPpb = Math.Min(map.Bounds.Width / (wW * 0.25), map.Bounds.Height / (wH * 0.25));
+        map.CentreOn((world.MinX + world.MaxX) / 2.0, (world.MinZ + world.MaxZ) / 2.0, midPpb);
+        var sw = Stopwatch.StartNew();
+        int blankAtMid = -1;
+        while (sw.Elapsed.TotalSeconds < 30)
+        {
+            Pump(0.5);
+            blankAtMid = map.UncoveredVisibleAreas().Count;
+            if (blankAtMid == 0) break;
+        }
+        Console.WriteLine($"[cover] mid zoom {midPpb:0.###} px/block: {map.UncoveredVisibleAreas().Count} blank area(s) " +
+                          $"after {sw.ElapsedMilliseconds} ms, cached maps {map.CachedAreaCount}, " +
+                          $"extra layers {map.ExtraAreaLayers} ({map.ExtraCoarseLayers} coarse)");
+        Shot(w, "cover_mid");
+        Console.WriteLine(blankAtWorldZoom == 0 && blankAtMid == 0
+            ? "DONE"
+            : $"FAILED: {blankAtWorldZoom} blank area(s) at world zoom, {blankAtMid} at mid zoom");
+        CloseNow(w);
+    }
+
+    /// <summary>
+    ///     The background warm pass on a big save, end to end: open the save, do nothing, and wait for the
+    ///     window itself to report "Map ready: N tile(s) prepared" — that is the proof that every tile was
+    ///     built and stored without the user touching the map.
+    /// </summary>
+    private static void Warm(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        var sw = Stopwatch.StartNew();
+        w.OpenStartupFile(save);
+        var ok = WaitFor(w, "StatusText", "Map ready:", 1500);
+        Console.WriteLine($"[warm] cache dir: {Environment.GetEnvironmentVariable("VSSAVEEDITOR_MAP_CACHE") ?? "(profile default)"}");
+        Console.WriteLine($"[warm] reported in {sw.ElapsedMilliseconds} ms: {(ok ? "yes" : "NO")}");
+        Console.WriteLine("[warm] status: " + TextOf(w, "StatusText"));
+        Console.WriteLine("[warm] scan: " + TextOf(w, "ScanStatusText"));
+        Console.WriteLine("[warm] meta: " + Cut((w.FindNamed<TextBlock>("MetaText")?.Text ?? "").Replace("\n", " · ")));
+
+        // Switch through areas spread over the whole map, including ones the RAM budget cannot hold:
+        // that is the user-visible cost the whole pass is for, and it has to be measured per tile.
+        var map = (TerrainView)w.FindNamed<Control>("Map")!;
+        if (map.Areas is { Areas.Count: > 1 } areas && map.Terrain?.Area is { } first)
+        {
+            var all = areas.Areas;
+            var picks = new List<ChunkArea>();
+            int stepCount = Math.Min(6, all.Count);
+            for (int i = 1; i <= stepCount; i++) picks.Add(all[(int)((double)i * all.Count / (stepCount + 1))]);
+            foreach (var target in picks.Distinct())
+            {
+                var sw2 = Stopwatch.StartNew();
+                map.CentreOn(target.CentreX, target.CentreZ, 1.0);
+                var end = DateTime.UtcNow.AddSeconds(120);
+                while (DateTime.UtcNow < end && !ReferenceEquals(map.Terrain?.Area, target)) Pump(0.05);
+                var okSwitch = ReferenceEquals(map.Terrain?.Area, target);
+                Console.WriteLine($"[warm] switch #{target.Index + 1} (bbox {target.BlockCells / 1e6:F1}M columns): " +
+                                  $"{sw2.ElapsedMilliseconds} ms, area now={AreaName(map.Terrain!)}, reached={okSwitch}");
+            }
+            if (picks.LastOrDefault() is { } back && !ReferenceEquals(map.Terrain?.Area, first))
+            {
+                var sw3 = Stopwatch.StartNew();
+                map.CentreOn(first.CentreX, first.CentreZ, 1.0);
+                var end = DateTime.UtcNow.AddSeconds(120);
+                while (DateTime.UtcNow < end && !ReferenceEquals(map.Terrain?.Area, first)) Pump(0.05);
+                Console.WriteLine($"[warm] back to the first area: {sw3.ElapsedMilliseconds} ms, " +
+                                  $"area now={AreaName(map.Terrain!)}");
+            }
+        }
+
+        Console.WriteLine(ok ? "DONE" : "FAILED: the background warm pass did not report completion");
+        CloseNow(w);
     }
 
     /// <summary>
@@ -4347,8 +4540,19 @@ internal static class Harness
         ResetStatus(w);
         w.OpenStartupFile(bigSave);
         bool sawLabel = false, sawBar = false, scanSeen = false;
+        // "opened: …" lives on the App channel only until the map publishes its own line there ("Showing area
+        // 1 of 1") — both can land inside one poll interval, so the channel history is recorded, not sampled.
+        var appHistory = new List<string>();
+        w.Status.Changed += () =>
+        {
+            var t = w.Status.TextOf(StatusChannel.App);
+            lock (appHistory)
+            {
+                if (t.Length > 0 && (appHistory.Count == 0 || appHistory[^1] != t)) appHistory.Add(t);
+            }
+        };
         var deadline = DateTime.UtcNow.AddSeconds(900);
-        while (DateTime.UtcNow < deadline && !(scanSeen && TextOf(w, "StatusText").StartsWith("opened:")))
+        while (DateTime.UtcNow < deadline && !scanSeen)
         {
             var pl = w.FindNamed<TextBlock>("ProgressLabel");
             var pb = w.FindNamed<ProgressBar>("LoadProgress");
@@ -4357,6 +4561,10 @@ internal static class Harness
             scanSeen |= TextOf(w, "ScanStatusText").StartsWith("Scan complete");
             Pump(0.5);
         }
+
+        bool openedSeen;
+        lock (appHistory) openedSeen = appHistory.Any(t => t.StartsWith("opened:"));
+        Console.WriteLine("[status] the App channel reported 'opened: …' during loading=" + openedSeen);
         Console.WriteLine("[status] during loading: progress label visible=" + sawLabel + ", bar visible=" + sawBar
             + "; after loading the label is visible=" + (w.FindNamed<TextBlock>("ProgressLabel")?.IsVisible)
             + " line='" + Cut(StatusLineOf(w)) + "'"
@@ -4513,6 +4721,133 @@ internal static class Harness
 
     private static readonly System.Reflection.BindingFlags Priv = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
     private static object? PrivField(object o, string name) => o.GetType().GetField(name, Priv)?.GetValue(o);
+
+    /// <summary>
+    ///     The global catch-all: a background failure that surfaces late (an unobserved Task — a DBus error
+    ///     rethrown by the finalizer thread is the case that was reported) must reach the console, must not
+    ///     take over the status line of a running scan and must not clear the busy flag. When nothing owns
+    ///     the line it is shown — with the innermost cause, not the "were not observed" wrapper text.
+    /// </summary>
+    /// <summary>Starts a Task nobody awaits and drops it, so the finalizer reports it as unobserved.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void DropFaultedTask()
+    {
+        _ = Task.Run(() => throw new InvalidOperationException("probe-unobserved"));
+    }
+
+    /// <summary>Stands in for Tmds.DBus.Protocol.DBusException: the classification keys off the type name.</summary>
+    private sealed class DBusException(string message) : Exception(message);
+
+    /// <summary>What Avalonia leaves behind on a machine without xdg-desktop-portal: an unawaited D-Bus task.</summary>
+    private static void DropFaultedDBusTask()
+    {
+        _ = Task.Run(() => throw new DBusException(
+            "org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable"));
+    }
+
+    private static void AppLogProbe()
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(0.6);
+        var ok = true;
+        // The harness boots with SetupWithoutStarting, so no desktop lifetime exists and the real App never
+        // installs them: the probe installs the very same handlers instead of a copy of the logic.
+        App.InstallGlobalHandlers(w);
+
+        // exactly what the finalizer hands us: the faulted Task's AggregateException
+        var wrapped = Task.FromException(new InvalidOperationException("The name is not activatable")).Exception!;
+        Console.WriteLine("[applog] console line: " + AppLog.Describe("ERROR", "background task failed and nobody awaited it", wrapped));
+
+        // 1) mid-scan: the scan owns the line, the late failure must stay in the log
+        w.Status.ClearAll();
+        w.Status.Set(StatusChannel.Scan, "Scanning save data... 40 %");
+        w.GetType().GetField("_busy", Priv)?.SetValue(w, true);
+        Pump(0.3);
+        var duringScan = StatusLineOf(w);
+        w.ReportUnhandled(wrapped, resetBusy: false);
+        Pump(0.3);
+        var afterLate = StatusLineOf(w);
+        var appDuringScan = w.Status.TextOf(StatusChannel.App);
+        var busyAfter = (bool?)PrivField(w, "_busy") ?? false;
+        ok &= afterLate == duringScan && appDuringScan.Length == 0 && busyAfter;
+        Console.WriteLine("[applog] during a scan: line='" + Cut(afterLate) + "' unchanged=" + (afterLate == duringScan)
+            + ", App channel='" + Cut(appDuringScan) + "' (expected empty), busy still=" + busyAfter);
+
+        // 2) idle: shown, and it names the cause instead of the wrapper
+        w.GetType().GetField("_busy", Priv)?.SetValue(w, false);
+        w.Status.ClearAll();
+        Pump(0.2);
+        w.ReportUnhandled(wrapped, resetBusy: false);
+        Pump(0.2);
+        var idle = StatusLineOf(w);
+        var namesCause = idle.Contains("The name is not activatable") && !idle.Contains("were not observed");
+        ok &= namesCause;
+        Console.WriteLine("[applog] when idle: line='" + Cut(idle) + "', names the cause=" + namesCause);
+
+        // 3) the catch-all itself: a Task nobody awaits is finalized, the App handler must put it in the log
+        var logged = new List<string>();
+        var prevSink = AppLog.Sink;
+        AppLog.Sink = l => { lock (logged) logged.Add(l); };
+        var caught = false;
+        try
+        {
+            DropFaultedTask();
+            for (var i = 0; i < 10 && !caught; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                Pump(0.4);
+                lock (logged) caught = logged.Any(l => l.Contains("probe-unobserved"));
+            }
+        }
+        finally
+        {
+            AppLog.Sink = prevSink;
+        }
+
+        ok &= caught;
+        Console.WriteLine("[applog] unobserved Task logged by the catch-all=" + caught
+            + (caught ? " → '" + Cut(logged.LastOrDefault(l => l.Contains("probe-unobserved")) ?? "") + "'" : ""));
+
+        // 4) the DBus case the user hit: a missing portal must be one WARN line, no stack, and no status line
+        var dbusLines = new List<string>();
+        AppLog.Reset();
+        AppLog.Sink = l => { lock (dbusLines) dbusLines.Add(l); };
+        w.Status.ClearAll();
+        Pump(0.2);
+        bool seen = false;
+        try
+        {
+            DropFaultedDBusTask();
+            for (var i = 0; i < 10 && !seen; i++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                Pump(0.4);
+                lock (dbusLines) seen = dbusLines.Any(l => l.Contains("no desktop D-Bus service"));
+            }
+        }
+        finally
+        {
+            AppLog.Sink = prevSink;
+        }
+
+        string? dbusLine;
+        lock (dbusLines) dbusLine = dbusLines.FirstOrDefault(l => l.Contains("no desktop D-Bus service"));
+        var dbusOk = seen
+                     && dbusLine!.StartsWith("[app][WARN]", StringComparison.Ordinal)
+                     && dbusLine.Contains("DBusException")
+                     && StatusLineOf(w).Length == 0;
+        ok &= dbusOk;
+        Console.WriteLine("[applog] missing D-Bus service → one WARN, no status line=" + dbusOk
+            + " → '" + Cut(dbusLine ?? "(nothing)") + "'");
+
+        Console.WriteLine("[applog] RESULT: " + (ok ? "OK" : "FAIL"));
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
 
     /// <summary>Closes the window without raising the unsaved working copy confirmation:
     /// a headless probe cannot answer a modal dialog.</summary>

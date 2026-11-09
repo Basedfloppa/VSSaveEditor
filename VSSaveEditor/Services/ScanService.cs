@@ -103,18 +103,25 @@ public static class ScanDumpBuilder
         var bes = r.Chunks.SelectMany(c => c.BlockEntities).ToList();
         items.Add($"-- Block entities ({bes.Count}) --");
 
-        items.Add("-- Map regions (layers) --");
-        foreach (var rg in r.Regions)
+        items.Add($"-- Map regions ({r.Regions.Count}, {r.Regions.Sum(g => (long)g.DataLength) / 1024} KiB of blobs) --");
+        // The blobs are not read on open: layers are parsed on demand. The dump shows them for a sample and
+        // says so, otherwise building it straight after the scan would read every region again (677 MB).
+        const int RegionLayerSample = 8;
+        foreach (var rg in r.Regions.Take(RegionLayerSample))
         {
             items.Add($"   region {rg.Position} len={rg.DataLength}");
             foreach (var l in rg.Layers.Take(20)) items.Add($"      {l}");
         }
+        if (r.Regions.Count > RegionLayerSample)
+            items.Add($"   ... and {r.Regions.Count - RegionLayerSample} more regions (layers not read: " +
+                      $"the scan keeps positions and sizes, the blob is parsed when asked)");
 
-        items.Add($"-- Mapchunks (client map, {r.Mapchunks.Count}) --");
+        items.Add($"-- Mapchunks (client map, {r.Meta.MapchunkCount}) --");
         items.Add($"   raw retained: {r.Mapchunks.Count(m => m.Raw != null)}");
         foreach (var m in r.Mapchunks.Take(50))
             items.Add($"   {m.Position} len={m.DataLength} fields=[{string.Join("; ", m.Fields.Take(6))}]");
-        if (r.Mapchunks.Count > 50) items.Add($"   ... and {r.Mapchunks.Count - 50} more");
+        if (r.Meta.MapchunkCount > r.Mapchunks.Count)
+            items.Add($"   ... and {r.Meta.MapchunkCount - r.Mapchunks.Count} more (not parsed: the scan reads a sample)");
 
         items.Add("-- Raw blobs --");
         items.Add($"   chunk raws retained: {r.Chunks.Count(c => c.Raw != null)} (in memory)");

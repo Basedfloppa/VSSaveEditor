@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <!-- Throwaway headless profile of the open path on a real save: no window, no display.
+         Run: dotnet run -c Release (project tools/perf-probe) [save.vcdbs] -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <ServerGarbageCollection>true</ServerGarbageCollection>
+        <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+    </PropertyGroup>
+    <ItemGroup>
+        <ProjectReference Include="../../VSCore/VSCore.csproj"/>
+    </ItemGroup>
+</Project>

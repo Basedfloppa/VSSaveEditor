@@ -59,11 +59,15 @@ public class WorkingCopyTests : IDisposable
     {
         using var save = VSSaveFile.OpenForEditing(_src);
         Assert.Equal(_src, save.SourcePath);
-        Assert.NotEqual(Path.GetFullPath(_src), Path.GetFullPath(save.Path));
+        // nothing has been written yet: the session still reads the original, so the full snapshot
+        // (24 s and 12 GB of disk traffic on a server save) has not been taken
+        Assert.Equal(Path.GetFullPath(_src), Path.GetFullPath(save.Path));
         Assert.Equal(3, save.ReadChunk(_chunkPos)!.Length);
 
         var rows = save.ApplyChanges(new[] { ("chunk", _chunkPos, new byte[] { 4, 5, 6, 7 }) });
         Assert.Equal(1, rows);
+        // the first write moved the session onto its own copy
+        Assert.NotEqual(Path.GetFullPath(_src), Path.GetFullPath(save.Path));
         Assert.Equal(new byte[] { 4, 5, 6, 7 }, save.ReadChunk(_chunkPos));
 
         // the working copy is a separate file and the original stays byte-for-byte as it was
@@ -71,15 +75,32 @@ public class WorkingCopyTests : IDisposable
         Assert.Equal(new byte[] { 1, 2, 3 }, original.ReadChunk(_chunkPos));
     }
 
-    [Fact(DisplayName = "Working copy: created in the disk-backed root, not in the temp folder")]
+    [Fact(DisplayName = "Working copy: opening writes nothing; the first edit creates it in the disk-backed root")]
     public void WorkingCopy_UsesTheDiskBackedRoot()
     {
         var save = VSSaveFile.OpenForEditing(_src);
+        Assert.Equal(Path.GetFullPath(_src), Path.GetFullPath(save.Path));
+        save.ApplyChanges(new[] { ("chunk", _chunkPos, new byte[] { 1 }) });
         var copy = Path.GetFullPath(save.Path);
         Assert.StartsWith(Path.GetFullPath(VSSaveFile.WorkingCopyRoot), copy, StringComparison.Ordinal);
         Assert.True(File.Exists(copy));
         save.Dispose();
         Assert.False(File.Exists(copy)); // the throwaway directory is removed with the session
+    }
+
+    [Fact(DisplayName = "OpenForEditing: no snapshot is created until the first write")]
+    public void OpenForEditing_DoesNotSnapshotOnOpen()
+    {
+        var before = Directory.Exists(VSSaveFile.WorkingCopyRoot)
+            ? Directory.GetDirectories(VSSaveFile.WorkingCopyRoot).Length
+            : 0;
+        using var save = VSSaveFile.OpenForEditing(_src);
+        var after = Directory.Exists(VSSaveFile.WorkingCopyRoot)
+            ? Directory.GetDirectories(VSSaveFile.WorkingCopyRoot).Length
+            : 0;
+        Assert.Equal(before, after);
+        Assert.Equal(Path.GetFullPath(_src), Path.GetFullPath(save.Path));
+        Assert.Equal(new byte[] { 1, 2, 3 }, save.ReadChunk(_chunkPos));
     }
 
     [Fact(DisplayName = "DeleteChunks: deletes the column only in the working copy, the original stays intact")]
@@ -188,6 +209,7 @@ public class WorkingCopyTests : IDisposable
     public void Dispose_RemovesWorkingDirectory()
     {
         var save = VSSaveFile.OpenForEditing(_src);
+        save.ApplyChanges(new[] { ("chunk", _chunkPos, new byte[] { 1 }) });
         var workDir = Path.GetDirectoryName(save.Path)!;
         Assert.True(Directory.Exists(workDir));
         save.Dispose();

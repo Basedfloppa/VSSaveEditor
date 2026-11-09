@@ -1,7 +1,32 @@
+using System.Diagnostics;
 using System.Text;
 using VSCore.Format;
 
 namespace VSCore;
+
+/// <summary>Per-section timings of one <see cref="SaveScanner.Scan"/> run. Filled only when the caller
+/// passes an instance: the chunk loop then takes three timestamp reads per chunk, which is measurable but
+/// small (~0.5 % of a 12-GB scan). A normal scan passes null and pays nothing.</summary>
+public sealed class ScanTimings
+{
+    public long MetaTicks, RegionsTicks, ChunkReadTicks, EntityTicks, HistogramTicks, BlockCodeTicks,
+        AggregationTicks, MapchunkReadTicks, MapchunkParseTicks, PlayerTicks, TotalTicks;
+
+    public static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+
+    public double MetaMs => Ms(MetaTicks);
+    public double RegionsMs => Ms(RegionsTicks);
+    public double ChunkReadMs => Ms(ChunkReadTicks);
+    public double EntityMs => Ms(EntityTicks);
+    public double HistogramMs => Ms(HistogramTicks);
+    public double BlockCodeMs => Ms(BlockCodeTicks);
+    public double AggregationMs => Ms(AggregationTicks);
+    public double MapchunkReadMs => Ms(MapchunkReadTicks);
+    public double MapchunkParseMs => Ms(MapchunkParseTicks);
+    public double MapchunkMs => Ms(MapchunkReadTicks) + Ms(MapchunkParseTicks);
+    public double PlayerMs => Ms(PlayerTicks);
+    public double TotalMs => Ms(TotalTicks);
+}
 
 // ============================= DATA MODEL =============================
 
@@ -21,7 +46,17 @@ public sealed class SaveScanResult
 
     /// <summary>World-wide counters aggregated by block code (liquids included).</summary>
     public Dictionary<string, long> WorldBlockCodeCounts { get; } = new();
+
+    internal void ReplaceWorldBlockCodeCounts(Dictionary<string, long> counts)
+    {
+        WorldBlockCodeCounts.Clear();
+        foreach (var kv in counts) WorldBlockCodeCounts[kv.Key] = kv.Value;
+    }
     public long TotalSolid, TotalFluid, TotalAir;
+
+    /// <summary>False while the block histogram has not been decoded yet (see <see cref="SaveScanner.ComputeBlockStats" />):
+    /// the per-chunk solid/fluid/air counts and the code counts read as zero until then.</summary>
+    public bool BlockStatsComputed { get; set; }
     public int EntityCount { get; set; }
     public int BlockEntityCount { get; set; }
 
@@ -208,12 +243,40 @@ public sealed class BlockEntityInfo
 }
 
 /// <summary>Region (mapregion): worldgen/geological layers.</summary>
+/// <remarks>
+///     The layers are parsed lazily: a big save carries ~2000 region blobs (677 MB on the 12-GB one), and the
+///     scan used to read and parse every one of them just to put a few lines into the text dump. The record
+///     keeps the position and the length from the table, and the blob is read the first time
+///     <see cref="Layers" /> is asked for.
+/// </remarks>
 public sealed class RegionScanData
 {
     public long Position { get; set; }
     public int DataLength { get; set; }
-    public List<string> Layers { get; } = new();
+
+    /// <summary>Reads and parses the blob on first use; assigned by the scan, null for a bare record.</summary>
+    public Func<List<string>>? LayerLoader { get; set; }
+
+    private List<string>? _layers;
+
+    public List<string> Layers => _layers ??= LoadLayers(LayerLoader, Position);
+
+    /// <summary>True when the blob has already been read (the dump shows layers only for those).</summary>
+    public bool LayersLoaded => _layers is not null;
+
     public RawBlob? Raw { get; set; }
+
+    private static List<string> LoadLayers(Func<List<string>>? loader, long position)
+    {
+        if (loader is null) return new List<string>();
+        try { return loader(); }
+        catch (Exception ex)
+        {
+            // A closed save or a torn blob must not take the whole dump down: report it, show no layers.
+            ScanDiagnostics.Warn($"mapregion at {position} could not be parsed", ex);
+            return new List<string>();
+        }
+    }
 }
 
 /// <summary>Client map chunk (mapchunk).</summary>
@@ -270,71 +333,115 @@ public static class SaveScanner
         "oxygen", "entityDead", "deathReason", "emotionstates", "totalHoursDead"
     };
 
-    public static SaveScanResult Scan(VSSaveFile save, IProgress<double>? progress = null, bool captureRaw = false)
+    /// <param name="computeBlockStats">
+    ///     Decode the block histogram (solids/fluids/air plus the per-chunk code counts). It is 98 % of the
+    ///     chunk loop on a 12-GB save, and nothing needs it before the model is published, so the UI passes
+    ///     false and runs <see cref="ComputeBlockStats" /> afterwards while the tabs are already usable.
+    /// </param>
+    public static SaveScanResult Scan(VSSaveFile save, IProgress<long>? progress = null, bool captureRaw = false,
+        ScanTimings? timings = null, bool computeBlockStats = true)
     {
         var res = new SaveScanResult();
+        // timings is null on every normal scan: the timestamp reads below are guarded so a production
+        // run measures nothing and pays nothing.
+        var timed = timings is not null;
+        long scanStart = timed ? Stopwatch.GetTimestamp() : 0;
         // One vocabulary per scan: the model keeps the strings, the pool itself dies with the result.
         var pool = new StringPool();
         var reg = save.BlockRegistry;
         var itemReg = save.ItemRegistry;
 
         // ---- Meta / gamedata ----
+        long tMeta = timed ? Stopwatch.GetTimestamp() : 0;
         res.Meta.Version = save.DetectVersion();
         res.Meta.Seed = save.DetectSeed();
         res.Meta.TableNames = save.TableNames;
         res.Meta.GamedataLength = save.GamedataLength.GetValueOrDefault();
         res.Meta.RegionCount = save.MapRegions.Count;
-        res.Meta.ChunkCount = save.Chunks.Count;
+        // The chunk count is filled from the pages below: SELECT count(*) walks the whole table b-tree
+        // (12 GB, 43 s on a cold file) and the scan reads every row anyway.
         var gd = save.ReadGamedata();
         if (captureRaw && gd is { Length: > 0 })
             res.GamedataRaw = MakeRaw("gamedata", 1, null, gd);
+        if (timed) timings!.MetaTicks = Stopwatch.GetTimestamp() - tMeta;
 
         // ---- Mapregions (worldgen/geology) ----
+        // Positions and sizes come free from the table rows. The blobs (677 MB, ~2000 rows on a 12-GB save)
+        // are NOT read here: the layers are decoration of the text dump, and paying 3-9 s of I/O at every
+        // open for them was the wrong trade. They are parsed on first access (RegionScanData.Layers).
+        long tReg = timed ? Stopwatch.GetTimestamp() : 0;
         foreach (var mr in save.MapRegions)
         {
             var rd = new RegionScanData { Position = mr.Position, DataLength = mr.DataLength };
-            var b = save.ReadRegion(mr.Position) ?? Array.Empty<byte>();
-            if (captureRaw && b.Length > 0) rd.Raw = MakeRaw("mapregion", mr.Position, null, b);
-            foreach (var f in PbReader.ReadMessage(b, maxDepth: 1, maxFields: 2000))
-            {
-                if (f.WireType != 2 || f.Bytes is null) continue;
-                var marker = FirstAscii(f.Bytes, 14);
-                rd.Layers.Add($"f{f.Field} len={f.Length}" + (marker.Length > 0 ? $" marker='{marker}'" : ""));
-            }
+            var position = mr.Position;
+            rd.LayerLoader = () => ParseRegionLayers(save, position, captureRaw, rd);
             res.Regions.Add(rd);
         }
+        if (timed) timings!.RegionsTicks = Stopwatch.GetTimestamp() - tReg;
 
         // ---- Chunks (blocks/liquids/entities/block entities) ----
-        // Positions first, then pages of blobs: retaining every chunk blob (518 MiB on the large save)
-        // made the scan peak depend on the save size instead of on the model it actually builds.
-        var positions = save.ChunkPositions;
-        int n = positions.Count;
-        var chunks = new ChunkScanData[n];
-        int total = Math.Max(1, n), done = 0, start = 0;
+        // Pages of blobs, never the full set at once: retaining every chunk blob (518 MiB on the large
+        // save) made the scan peak depend on the save size instead of on the model it actually builds.
+        // One pass, not two. The positions used to be read as a separate full-table scan, and the paged
+        // reader below then walked the same b-tree again - on a cold 12-GB save that is a second 42-second
+        // pass over the file. The page reader already yields every position in order, so the array is
+        // filled from the pages and the extra walk disappears.
+        var chunks = new List<ChunkScanData>();
+        int done = 0;
         long last = long.MinValue;
         const int PageSize = 4096;
-        var po = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 8) };
-        while (start < n)
+        // 8 was a guess when the cap was added; measured on a 24-core/8P+16E machine the histogram
+        // keeps scaling to ~12 (69.7 s -> 61.0 s) and gains almost nothing beyond it.
+        var po = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 12) };
+        var timingLock = new object();
+        while (true)
         {
+            long tRead = timed ? Stopwatch.GetTimestamp() : 0;
             var page = save.ReadChunkRowsPage(last, PageSize);
+            if (timed) timings!.ChunkReadTicks += Stopwatch.GetTimestamp() - tRead; // main thread only
             if (page.Count == 0) break;
-            // capture the page index range; the lambda must not see the loop's moving `start`
-            int pageStart = start;
-            Parallel.For(0, page.Count, po, idx =>
-            {
-                var row = page[idx];
-                var cd = new ChunkScanData();
-                ProcessChunk(row.Position, row.Data, reg, itemReg, cd, captureRaw, pool);
-                chunks[pageStart + idx] = cd;
-                int d = Interlocked.Increment(ref done);
-                if (progress != null && (d % 32 == 0 || d == n)) progress.Report((double)d / total);
-            });
-            start += page.Count;
+            var pageResults = new ChunkScanData[page.Count];
+            Parallel.For(0, page.Count, po,
+                () => (Ent: 0L, Hist: 0L, Codes: 0L),
+                (idx, _, tl) =>
+                {
+                    var row = page[idx];
+                    var cd = new ChunkScanData();
+                    long a = timed ? Stopwatch.GetTimestamp() : 0;
+                    InitChunk(cd, row.Position, row.Data);
+                    ParseChunkEntities(cd, row.Data, reg, itemReg, captureRaw, pool);
+                    long b = timed ? Stopwatch.GetTimestamp() : 0;
+                    if (computeBlockStats)
+                    {
+                        MeasureChunkHistogram(cd, row.Data);
+                        BuildChunkBlockCodes(cd, reg);
+                    }
+                    long c = timed ? Stopwatch.GetTimestamp() : 0;
+                    if (timed) tl.Ent += b - a;
+                    if (timed) tl.Hist += c - b;
+                    if (timed) tl.Codes += Stopwatch.GetTimestamp() - c;
+                    pageResults[idx] = cd;
+                    int d = Interlocked.Increment(ref done);
+                    if (progress != null && (d & 1023) == 0) progress.Report(d);
+                    return tl;
+                },
+                tl =>
+                {
+                    if (!timed) return;
+                    lock (timingLock)
+                    {
+                        timings!.EntityTicks += tl.Ent;
+                        timings.HistogramTicks += tl.Hist;
+                        timings.BlockCodeTicks += tl.Codes;
+                    }
+                });
+            chunks.AddRange(pageResults);
             last = page[^1].Position;
         }
-        progress?.Report(1.0);
+        progress?.Report(chunks.Count);
 
         // ---- Aggregation ----
+        long tAgg = timed ? Stopwatch.GetTimestamp() : 0;
         foreach (var cd in chunks)
         {
             res.Chunks.Add(cd);
@@ -351,9 +458,19 @@ public static class SaveScanner
                 res.WorldBlockCodeCounts[code] = v + cnt;
             }
         }
+        res.Meta.ChunkCount = res.Chunks.Count;
+        res.BlockStatsComputed = computeBlockStats;
+        if (timed) timings!.AggregationTicks = Stopwatch.GetTimestamp() - tAgg;
 
         // ---- Mapchunks (client map) ----
-        foreach (var mr in save.MapchunkRowsWithData)
+        // Only the first rows are ever displayed (the data dump prints 50), so a normal scan reads a sample
+        // instead of all 254 215 blobs. captureRaw still means "retain everything".
+        const int MapchunkSample = 64;
+        long tMapRead = timed ? Stopwatch.GetTimestamp() : 0;
+        var mapRows = captureRaw ? save.MapchunkRowsWithData : save.MapchunkRowsWithDataLimit(MapchunkSample);
+        if (timed) timings!.MapchunkReadTicks = Stopwatch.GetTimestamp() - tMapRead;
+        long tMap = timed ? Stopwatch.GetTimestamp() : 0;
+        foreach (var mr in mapRows)
         {
             var md = new MapchunkScanData { Position = mr.Position, DataLength = mr.Data.Length };
             var b = mr.Data ?? Array.Empty<byte>();
@@ -366,9 +483,11 @@ public static class SaveScanner
             }
             res.Mapchunks.Add(md);
         }
-        res.Meta.MapchunkCount = res.Mapchunks.Count;
+        res.Meta.MapchunkCount = captureRaw ? res.Mapchunks.Count : save.MapchunkRowCount;
+        if (timed) timings!.MapchunkParseTicks = Stopwatch.GetTimestamp() - tMap;
 
         // ---- Players (playerdata) ----
+        long tPlr = timed ? Stopwatch.GetTimestamp() : 0;
         foreach (var p in save.PlayerRows)
         {
             var pd = new PlayerScanData { PlayerId = p.Id, PlayerUid = p.Uid };
@@ -386,9 +505,11 @@ public static class SaveScanner
                     pd.Inventories = PlayerInventories(data, pd);
                     res.Inventories.AddRange(pd.Inventories);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // a damaged playerdata record must not cancel the scan of the other tables
+                    // a damaged playerdata record must not cancel the scan of the other tables, but the
+                    // reason has to reach the console: otherwise the player simply shows no inventory
+                    ScanDiagnostics.Warn($"playerdata id={p.Id} could not be parsed", ex);
                 }
             }
 
@@ -396,6 +517,8 @@ public static class SaveScanner
         }
         res.Meta.PlayerCount = res.Players.Count;
         res.ItemStackCount = res.Inventories.Sum(i => i.Items.Count);
+        if (timed) timings!.PlayerTicks = Stopwatch.GetTimestamp() - tPlr;
+        if (timed) timings!.TotalTicks = Stopwatch.GetTimestamp() - scanStart;
 
         return res;
     }
@@ -434,14 +557,21 @@ public static class SaveScanner
         return inv;
     }
 
-    private static void ProcessChunk(long position, byte[] blob, BlockRegistry reg, ItemRegistry itemReg,
-        ChunkScanData cd, bool captureRaw, StringPool pool)
+    /// <summary>Cheap head of the per-chunk work: position and size, before anything is parsed.
+    /// Split out so the scan can time the three phases of a chunk separately (see <see cref="ScanTimings"/>).</summary>
+    private static void InitChunk(ChunkScanData cd, long position, byte[] blob)
     {
         cd.Position = position;
         cd.DataLength = blob.Length;
         var (cx, cy, cz) = ChunkPosHelper.DecodeIndex((ulong)position);
         cd.ChunkX = cx; cd.ChunkY = cy; cd.ChunkZ = cz;
+    }
 
+    /// <summary>Walks the chunk payload and materialises only entities (field 6) and block entities (field 8).
+    /// This is the phase that grows with how much the world contains: inventories, species, custom names.</summary>
+    private static void ParseChunkEntities(ChunkScanData cd, byte[] blob, BlockRegistry reg, ItemRegistry itemReg,
+        bool captureRaw, StringPool pool)
+    {
         var occ6 = 0; // the order of field 6 here matches WalkTop — that is how an edit is addressed
         var occ8 = 0; // the same for field 8 (block entities): without the ordinal they cannot be opened in the editor
         // A span walker, not PbReader.ReadMessage: the latter copies every len-delimited payload and
@@ -454,26 +584,97 @@ public static class SaveScanner
             switch (r.Field)
             {
                 case 6:
-                    cd.AddEntity(ParseEntity(r.Bytes, cx, cy, cz, position, occ6++, reg, itemReg, pool));
+                    cd.AddEntity(ParseEntity(r.Bytes, cd.ChunkX, cd.ChunkY, cd.ChunkZ, cd.Position, occ6++, reg, itemReg, pool));
                     break;
                 case 8:
-                    cd.AddBlockEntity(ParseBlockEntity(r.Bytes, cx, cy, cz, position, occ8++, reg, itemReg, pool));
+                    cd.AddBlockEntity(ParseBlockEntity(r.Bytes, cd.ChunkX, cd.ChunkY, cd.ChunkZ, cd.Position, occ8++, reg, itemReg, pool));
                     break;
             }
         }
-        if (captureRaw && blob.Length > 0) cd.Raw = MakeRaw("chunk", position, null, blob);
+        if (captureRaw && blob.Length > 0) cd.Raw = MakeRaw("chunk", cd.Position, null, blob);
+    }
 
-        // Block statistics (solids field1 + liquids field16) in one fused pass: no 32 768-cell arrays,
-        // no per-cell CodeOf lookup. The per-thread histogram is reset through the touched list.
+    /// <summary>
+    ///     Decodes the block statistics the scan skipped: per-chunk solids/fluids/air, per-chunk code counts and
+    ///     the world totals. Re-reads the chunk blobs (a second 6-GB pass) but only when someone asks for the
+    ///     numbers; the model itself is complete without them.
+    /// </summary>
+    public static void ComputeBlockStats(SaveScanResult res, VSSaveFile save, IProgress<long>? progress = null)
+    {
+        var reg = save.BlockRegistry;
+        var po = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 12) };
+        const int PageSize = 4096;
+        long last = long.MinValue;
+        var at = 0;
+        var done = 0;
+        while (true)
+        {
+            var page = save.ReadChunkRowsPage(last, PageSize);
+            if (page.Count == 0) break;
+            if (at + page.Count > res.Chunks.Count ||
+                res.Chunks[at].Position != page[0].Position ||
+                res.Chunks[at + page.Count - 1].Position != page[^1].Position)
+                throw new InvalidOperationException(
+                    $"chunk pages changed under the scan (at {at}: expected {res.Chunks[at].Position}, got {page[0].Position})");
+            var baseIndex = at;
+            Parallel.For(0, page.Count, po,
+                idx =>
+                {
+                    var cd = res.Chunks[baseIndex + idx];
+                    MeasureChunkHistogram(cd, page[idx].Data);
+                    BuildChunkBlockCodes(cd, reg);
+                    var d = Interlocked.Increment(ref done);
+                    if (progress != null && (d & 1023) == 0) progress.Report(d);
+                });
+            at += page.Count;
+            last = page[^1].Position;
+        }
+        progress?.Report(done);
+
+        var counts = new Dictionary<string, long>(res.WorldBlockCodeCounts.Count);
+        long solid = 0, fluid = 0, air = 0, ents = 0, bes = 0;
+        foreach (var cd in res.Chunks)
+        {
+            solid += cd.SolidCells;
+            fluid += cd.FluidCells;
+            air += cd.AirCells;
+            ents += cd.Entities.Count;
+            bes += cd.BlockEntities.Count;
+            foreach (var (code, cnt) in cd.BlockCodeCounts)
+            {
+                counts.TryGetValue(code, out var v);
+                counts[code] = v + cnt;
+            }
+        }
+        // Published in one replace so a reader never sees a half-filled number.
+        res.ReplaceWorldBlockCodeCounts(counts);
+        res.TotalSolid = solid;
+        res.TotalFluid = fluid;
+        res.TotalAir = air;
+        res.EntityCount = (int)ents;
+        res.BlockEntityCount = (int)bes;
+        res.BlockStatsComputed = true;
+    }
+
+    /// <summary>Block statistics (solids field1 + liquids field16) in one fused pass: no 32 768-cell arrays,
+    /// no per-cell CodeOf lookup. The per-thread histogram is reset through the touched list.</summary>
+    private static void MeasureChunkHistogram(ChunkScanData cd, byte[] blob)
+    {
         var hist = _idHistogram ??= new long[ushort.MaxValue + 1];
         var touched = _histTouched ??= new List<int>(256);
         touched.Clear();
         ChunkBlockDecoder.DecodeChunkHistogram(blob, hist, touched, out cd.SolidCells, out cd.FluidCells, out cd.AirCells);
-        // The ids in `touched` are distinct by construction, so the per-chunk histogram is written once,
-        // without the code-string dictionary that used to be built (and thrown away) for every chunk row.
-        // A registry where two ids share a code is still packed by id: `BlockCodeCounts` merges the
-        // duplicates when someone enumerates it. The old by-code dictionary per chunk cost ~390 B/row on
-        // the modded 518-MB capture — more than the histogram data itself.
+    }
+
+    /// <summary>Folds the per-thread histogram into the chunk's id counts and clears it.
+    /// The ids in `touched` are distinct by construction, so the per-chunk histogram is written once,
+    /// without the code-string dictionary that used to be built (and thrown away) for every chunk row.
+    /// A registry where two ids share a code is still packed by id: `BlockCodeCounts` merges the
+    /// duplicates when someone enumerates it.</summary>
+    private static void BuildChunkBlockCodes(ChunkScanData cd, BlockRegistry reg)
+    {
+        var hist = _idHistogram ??= new long[ushort.MaxValue + 1];
+        var touched = _histTouched ??= new List<int>(256);
         cd.BlockCodeCounts.Reset(reg, touched.Count);
         foreach (var id in touched)
         {
@@ -841,6 +1042,24 @@ public static class SaveScanner
             else i++;
         }
         return res.Distinct().ToList();
+    }
+
+    /// <summary>
+    ///     Reads one mapregion blob and turns its top-level protobuf fields into one line each. Called lazily
+    ///     from <see cref="RegionScanData.Layers" />, never on the open/scan path.
+    /// </summary>
+    private static List<string> ParseRegionLayers(VSSaveFile save, long position, bool captureRaw, RegionScanData rd)
+    {
+        var layers = new List<string>();
+        var blob = save.ReadRegion(position) ?? Array.Empty<byte>();
+        if (captureRaw && blob.Length > 0) rd.Raw = MakeRaw("mapregion", position, null, blob);
+        foreach (var f in PbReader.ReadMessage(blob, maxDepth: 1, maxFields: 2000))
+        {
+            if (f.WireType != 2 || f.Bytes is null) continue;
+            var marker = FirstAscii(f.Bytes, 14);
+            layers.Add($"f{f.Field} len={f.Length}" + (marker.Length > 0 ? $" marker='{marker}'" : ""));
+        }
+        return layers;
     }
 
     private static string FirstAscii(ReadOnlySpan<byte> b, int max)

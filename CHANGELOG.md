@@ -31,6 +31,36 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 ### Performance
 
+- Working copies are created on the first edit instead of on open. Opening the 12 GB server save
+  copied 12 GB (24 GB of disk traffic) before the first chunk was decoded, and most sessions never
+  edit. The session now reads the original and takes the snapshot at the first write — measured
+  **24 s → 30 ms** to open, with the deferred snapshot at 9.4 s on a warm source. A read-only `-wal`
+  that cannot be opened without its `-shm` still falls back to the eager copy.
+- The scan no longer reads `chunk.position` in a separate pass before paging the blobs: the page
+  reader already yields every position in order, so a cold 12 GB save no longer pays a second
+  full-table walk (42 s measured cold). `BlockFilterScanner` counts rows with `COUNT(*)` instead of
+  materialising 4 M positions only to size a progress bar.
+- The block histogram decodes 32-cell words instead of single cells: an all-zero word is 32 copies
+  of `palette[0]` and is counted in one step, and a cell whose mask bit is clear skips the per-cell
+  decode. Both decoders were run over the same pages in one process on the 12 GB server save:
+  **61.4 → 49.5 s (1.24×)**, histograms identical on all 65 536 ids. The scan cap went from 8 to 12
+  workers (measured 69.7 → 61.0 s at 12; going to 24 gained almost nothing on this 8P+16E machine).
+  Full scan on the 12 GB save: **99.8 → 65.2 s**.
+- The whole open path was replayed headlessly (`tools/perf-probe --ui-path`), not just the scan: the
+  window starts the scan and the background preload of the neighbouring map tiles at the same time, and
+  both read through one SQLite connection under one lock. On the 12 GB save (**45 build tiles**) the
+  preload built every tile (149.8 s) while the scan crawled — **5 % of the scan took 44.6 s, 20 % took
+  85.7 s**, the whole scan 163.5 s instead of 65 s alone. Each tile also re-ran `SELECT position FROM
+  chunk` over the entire file, which is 42 s on a cold one, so a barely-warm save reached 20 % in the
+  five minutes the user measured. Three changes: the scan finishes before the preload starts, a tile
+  that does not fit the cache budget is not built at all (the old code built it and then discarded the
+  map), and chunk positions are cached per save so a tile filters a list instead of walking the table.
+  Replay after the fixes: **20 % at 26.9 s**, scan **66.6 s**, 14 tiles preloaded in 22.0 s, a tile
+  build **3.5 → 1.5 s**.
+- Read-only connections are opened with `PRAGMA query_only=1`, so an accidental write fails instead
+  of touching the user's save. Two other pragmas were measured and rejected: a 128 MiB `cache_size`
+  made a full positions pass 26 % slower (2.57 → 3.25 s), and `mmap_size` moved it by ~2 % — inside
+  the run-to-run noise — while mmap of a file the game may rewrite risks a SIGBUS.
 - Working copies are no longer created in the system temp folder. On Linux `/tmp` is often a tmpfs:
   opening the 6.3 GB server save copied 6.3 GB into RAM before the first edit and kept it there for the
   whole session (measured on the 1.7 GB save: the tmpfs copy raised `used` by ~1.7 GB and `shared` by
@@ -80,7 +110,62 @@ All notable changes to VS Save Editor are recorded here. The format follows
   group: on the 3.9 GB test save this reduced the first map from 10.7 s to 7.1 s and the total
   bounding-box area from 203M to 131M columns, with all tiles fitting the preload/cache budget.
 
+- Built map tiles are stored on disk (`TerrainMapCache`) and every tile of the world is prepared in
+  the background, not only the ones that fit the in-memory budget. On the 12 GB server save
+  (45 tiles, 389 M columns) the warm pass takes **117 s once** — 110 s of builds plus 6.6 s of
+  stores — and afterwards any region, including one never opened, loads in **110 ms (mean) / 309 ms
+  (max)**: a disk read instead of a 1.5–3.5 s rebuild. The 45 tiles occupy **450 MB** on disk
+  (~1.2 bytes per column, 9.4× smaller than the raw arrays), and the cache is bounded and pruned by
+  age. Only 120 M columns stay in RAM (~1.3 GB): the rest is evicted farthest-first and read back
+  when needed.
+- Map tiles are stored zstd-compressed with the relief bounds, overview pyramid, present-chunk set
+  and chisel materials; the block registry and the on-demand voxel source are re-attached on load.
+  The key covers the source file identity (path, length, mtime) and the content version, so a tile
+  built from an older or edited save is a miss, never stale rendering.
+
+### Changed
+- Map-region layers are parsed on demand instead of during the scan. A big save carries ~2000
+  `mapregion` blobs (677 MB on the 12-GB reference save) and every one of them was read and
+  parsed at open just to put a few lines into the text dump: on that save the regions section went
+  from 3.3 s warm / 9.3 s cold to **3 ms**, and 677 MB of I/O left the open path. The scan keeps
+  the position and the size from the table rows; the blob is read the first time the layers are
+  asked for, and a failing read (closed save, torn blob) reports and shows nothing rather than
+  taking the dump down. The dump prints layers for the first 8 regions and says how many were not
+  read.
+- Opening a save now warms the file in the background (`VSSaveFile.StartPrefetch`). The passes that follow read the same bytes, but SQLite pulls 4-KB pages one at a time: on a cold 12-GB save the positions pass took 43.3 s alone and 31.7 s right after a bulk sequential read of the same file (the map phase in the full open path went 15.2 s -> 7.5 s). Best effort: failures are ignored and it stops when the save is disposed.
+
 ### Fixed
+
+- Looking at a save no longer leaves `-wal`/`-shm` next to it. Opening a WAL world makes SQLite create
+  both files, and SQLite deletes them itself only when the last connection closes **with write access** —
+  a read-only reader never could, and connection pooling handed the connection back instead of closing
+  it, so every session left a 32-KB `-shm` and an empty `-wal` behind. Connections are now opened without
+  pooling, and on close the editor removes the pair it created, with two guards: files that already existed
+  before the session are left alone, and a WAL that still carries frames is never deleted (those frames are
+  committed transactions — e.g. the game running next to the editor). The working copy is checkpointed and
+  goes away with its folder. Verified on a 7.9-MB save: a WAL world opened and exited leaves just the
+  `.vcdbs`; with a live writer holding 16 KB of frames, the editor read 2801 chunks and left the WAL intact.
+- The map no longer leaves empty pieces of the world on screen after the background warm pass. A tile
+  evicted from the RAM budget used to vanish completely: looking at the whole map on a 12-GB save showed
+  **29 of 45 areas as black**, and nothing brought them back until the user scrolled into each one. An
+  evicted tile now leaves a shrunk copy of its pyramid (≤512 px, under a megabyte), eviction drops the
+  tiles off screen before the ones on it, and a visible area whose overview is too coarse for the current
+  zoom is read back from the on-disk tile cache (~0.1-0.5 s) instead of staying blank. Probe `cover` on the
+  12-GB save: 29 blank visible areas before, 0 at whole-map zoom and 0 at medium zoom (after 0.5 s).
+- A missing desktop D-Bus service is reported once, as a warning, and never touches the status line. On a machine without `xdg-desktop-portal`/IBus, Avalonia asks for a name that is not activatable from a task nobody awaits, so the finalizer rethrows `org.freedesktop.DBus.Error.ServiceUnknown` in the middle of a scan: the console showed a full stack under `[app][ERROR] background task failed`, and the window showed `Unexpected error`. Neither is the editor's failure — input and file dialogs simply fall back to the built-in ones. `AppLog.IsPlatformNoise` recognises that case (a D-Bus/portal exception whose message says the name is missing), `AppLog.PlatformNoise` writes one `[app][WARN] platform: no desktop D-Bus service …` line per run with the cause and no stack, and the handlers return before the UI is touched. Everything else keeps the full error path. Probe: `dotnet run --project .uisnap -- applog`.
+- The scan no longer crashes the window when it reports progress. `SaveScanner` reports rows from the worker threads of `Parallel.For`, the handler wrote the status line, and that line is a control only the UI thread may touch — a 12-GB save died 2 s in with `InvalidOperationException: Call from invalid thread` wrapped in an `AggregateException`. `AppStatus` now keeps its channels under a lock and raises `Changed` through `Status.Dispatch`, which the window points at the UI dispatcher; `OnStatusChanged` also re-posts itself if it is ever reached off-thread. The lock is not decoration: 4000 writes from 8 threads threw 2755 times and left the visible line disagreeing with `Status.Text`. Regression probe: `dotnet run --project .uisnap -- statusrace`.
+- A scan failure now names its real cause on the console: `ScanDiagnostics` unwraps the `AggregateException` that `Parallel.For` adds, so the header line reads `InvalidOperationException: Call from invalid thread` instead of `One or more errors occurred.`
+- Nothing that escapes a handler is silent any more. The three global nets (the domain, the UI thread,
+  and a background task nobody awaited) wrote to `Trace`, which a GUI launch never shows, so a failure
+  surfaced only as `Unexpected error: …` on the status line with no reason anywhere. They now log
+  through `AppLog` (`[app][ERROR] …` on stderr, stack included, identical consecutive lines collapsed
+  into a count) and name the innermost cause. A late failure also stops hijacking the window: an
+  unobserved task is rethrown by the finalizer thread during an unrelated action — usually a scan,
+  because it allocates heavily — and the old handler then replaced the progress line and cleared
+  `_busy` while the scan was still running. Reported case: `org.freedesktop.DBus.Error.ServiceUnknown`
+  (a D-Bus portal absent on the machine) arriving 2 s into a scan. `ReportUnhandled` now takes
+  `resetBusy`: a live UI-handler failure still clears the flags, a dead background task only reaches
+  the line when nothing else owns it. Regression probe: `dotnet run --project .uisnap -- applog`.
 
 - A pan or zoom-out that exposes a second build tile while the primary bitmap still covers the
   viewport now builds that tile's exact layer instead of leaving the newly visible tile blank.
@@ -156,3 +241,12 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 The first public build is not tagged yet. The project is released under the MIT No Attribution
 (MIT-0) license, and the binaries are unsigned; there is no auto-update or telemetry.
+
+## Scan diagnostics and deferred block statistics
+
+- Scan failures and per-record warnings now go to the console (`[scan][ERROR] …` / `[scan][WARN] …`,
+  with the stack trace) instead of only the status line; a damaged playerdata blob reports its id.
+- `SaveScanner.Scan(..., computeBlockStats: false)` skips the block histogram — 98 % of the chunk loop on
+  a 12-GB save — and `SaveScanner.ComputeBlockStats` fills it afterwards, so the map and the tabs are
+  usable while the statistics are still being decoded. The editor runs that pass in the background and
+  refreshes the dump, the filter list and the overlay when it lands.

@@ -345,7 +345,9 @@ public static class BlockFilterScanner
         if (blockIds.Count == 0) return new BlockFilterOverlay(new Dictionary<long, BlockFilterMap>());
 
         var wantedMask = MakeMask(blockIds);
-        long totalRows = save.ChunkPositions.Count;
+        // Count only: this used to materialise all 4 M positions (and read every chunk page) just to
+        // size the progress bar.
+        long totalRows = save.CountRows("chunk");
         long done = 0;
         long after = long.MinValue;
         var opts = new ParallelOptions

@@ -43,6 +43,22 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private bool _busy;
     private ChunkAreas? _areas; // areas (connected chunk groups) of the save - the map is built for one of them
     private readonly Dictionary<ChunkArea, TerrainMap> _areaMaps = new(); // built area maps, kept for instant switching
+    // Tiles kept in RAM: a column is ~11 bytes, so 120M columns is ~1.3 GB. The whole map of the largest checked
+    // save is 389M columns (44 tiles) — the rest lives on disk and comes back as a load, not a rebuild.
+    // VSSAVEEDITOR_MAP_RAM_CELLS overrides it: a machine with little memory may want far fewer tiles in RAM,
+    // and the probes use it to force the eviction path on a small save.
+    private static readonly long AreaCacheBudgetCells = ResolveAreaCacheBudget();
+    // An evicted tile leaves a shrunk pyramid behind (under a megabyte each): at whole-world zoom that is a
+    // coarse picture of the area instead of a blank piece of the map.
+    private const int OverviewMaxDimension = 512;
+
+    private static long ResolveAreaCacheBudget()
+    {
+        var raw = Environment.GetEnvironmentVariable("VSSAVEEDITOR_MAP_RAM_CELLS");
+        if (!string.IsNullOrWhiteSpace(raw) && long.TryParse(raw, out var cells) && cells > 0) return cells;
+        return 120_000_000;
+    }
+    private readonly TerrainMapCache _mapCache = new(); // tiles on disk: what the background warm pass prepares
     private readonly Dictionary<ChunkArea, TerrainPyramid> _areaOverviews = new(); // cheap overviews when a full map is too large
     private TerrainNeeds _terrainNeeds = TerrainNeeds.All; // fields of the current render mode
     private ChunkArea? _areaLoading; // which area is being built now (guard against a duplicate request)
@@ -83,6 +99,13 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         _chunkView = new ChunkViewService(this);
         _players = new PlayersTabService(this);
         Status.Changed += OnStatusChanged;
+        // The scan reports progress from the worker threads of Parallel.For, and the status line is a control:
+        // a write from such a thread must reach the UI thread, not touch the TextBlock where it stands.
+        Status.Dispatch = action =>
+        {
+            if (Dispatcher.UIThread.CheckAccess()) action();
+            else Dispatcher.UIThread.Post(action);
+        };
         // The timer is needed only while there are messages with a lifetime (operation results).
         _statusTimer = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) =>
         {
@@ -109,6 +132,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         // The user scrolled to another area of the save - build its map in the background (P1-21).
         // Cached neighbours are already drawn as extra layers; this publishes the one under the centre.
         Map.AreaRequested += area => _ = LoadAreaAsync(area);
+        Map.AreasNeedMaps += areas => _ = LoadAreasFromDiskAsync(areas);
         // "rendering…" in the layer label: a Y slice decodes the chunks of the visible area - when zoomed out
         // this takes noticeable time, and the user should see that the map is still rebuilding.
         Map.RebuildStateChanged += _ => UpdateLayerLabel();
@@ -353,6 +377,14 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     /// <summary>Copies the current model message into the single line and keeps the expiry timer running.</summary>
     private void OnStatusChanged()
     {
+        // Belt and braces next to Status.Dispatch: whoever raises the event, a control is only touched
+        // from the UI thread, and reading Status.Text (which is thread-safe) happens there too.
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            Dispatcher.UIThread.Post(OnStatusChanged);
+            return;
+        }
+
         var text = Status.Text;
         // There is exactly one line and no wrapping: newlines in result messages (a file path)
         // would otherwise take several visual lines. The full text is in the tooltip.
@@ -385,14 +417,24 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     }
 
     /// <summary>
-    ///     Reports an unhandled exception to the user (called from the App global handler)
-    ///     and clears any stuck busy flags so the window stays usable.
+    ///     Reports an unhandled exception to the user (called from the App global handler).
     /// </summary>
-    public void ReportUnhandled(Exception ex)
+    /// <param name="ex">What was thrown; the message shows the innermost cause, not the wrapper text.</param>
+    /// <param name="resetBusy">
+    ///     True for a live failure of a UI handler: the flags are cleared so the window stays usable.
+    ///     False for a background task nobody awaited - it surfaces from the finalizer thread in the middle
+    ///     of some unrelated action (usually a scan), and the action is still running: clearing _busy or
+    ///     replacing the progress line there would break a healthy operation over a task that is already gone.
+    ///     Such a failure only reaches the status line when nothing else owns it.
+    /// </param>
+    public void ReportUnhandled(Exception ex, bool resetBusy = true)
     {
         try
         {
-            Status.Set(StatusChannel.App, $"Unexpected error: {ex.Message}", priority: AppStatus.PriorityError);
+            if (!resetBusy && _busy) return; // the scan (or an apply) owns the line and the progress bar
+            var cause = AppLog.Cause(ex) ?? ex;
+            Status.Set(StatusChannel.App, $"Unexpected error: {cause.Message}", priority: AppStatus.PriorityError);
+            if (!resetBusy) return;
             _busy = false;
             _applying = false;
             HideProgress();
@@ -723,7 +765,18 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             stage.Report($"Materialising {changeSet.Count} change(s)…");
             var changes = await Task.Run(() => EditSession.Materialize(save, changeSet));
             stage.Report($"Applying {changes.Count} change(s) to the working copy…");
-            var rows = await Task.Run(() => save.ApplyChanges(changes));
+            var rows = await Task.Run(() =>
+            {
+                // Before the write: the tiles that were built from the old blocks are stale from here on, and
+                // the cache key rotates with the content version, so this is the last moment to find them.
+                _mapCache.Invalidate(save);
+                return save.ApplyChanges(changes);
+            });
+            // The RAM copies are stale for the same reason: a rebuilt tile must come from the new content.
+            _areaMaps.Clear();
+            _areaOverviews.Clear();
+            Map.SetAreaMaps(_areaMaps);
+            Map.SetAreaOverviews(_areaOverviews);
             var recorded = _edits.CommitPending(); // pending -> History, not into the void
             _chunkView.EndEditing();
             _players.EndEditing();
@@ -814,9 +867,14 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             WorkingCopyLabel.IsVisible = editable;
             if (editable)
             {
-                WorkingCopyLabel.Text = _edits.UnsavedAppliedCount > 0 ? "working copy · unsaved" : "working copy";
-                ToolTip.SetTip(WorkingCopyLabel,
-                    $"Edits go to this disposable working copy:\n{_save!.Path}\nOriginal (unchanged): {_save.SourcePath}");
+                // Nothing is copied until the first edit now, so the label must not claim a working copy
+                // that does not exist yet: it shows the original until the snapshot is actually taken.
+                WorkingCopyLabel.Text = _save!.HasWorkingCopy
+                    ? (_edits.UnsavedAppliedCount > 0 ? "working copy · unsaved" : "working copy")
+                    : "original (read-only until the first edit)";
+                ToolTip.SetTip(WorkingCopyLabel, _save.HasWorkingCopy
+                    ? $"Edits go to this disposable working copy:\n{_save.Path}\nOriginal (unchanged): {_save.SourcePath}"
+                    : $"Nothing has been written yet — the original is open:\n{_save.Path}\nThe first edit creates a disposable working copy.");
             }
         }
     }
@@ -2010,6 +2068,10 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
+        // Warm the file in the background: the positions pass, the map and the scan all read the same
+        // 12 GB, and SQLite's 4-KB page reads are an order of magnitude slower than a bulk read.
+        newSave.StartPrefetch();
+
         var previous = _save;
         _save = newSave;
         _selectedSave = path;
@@ -2059,7 +2121,17 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 // a save with chunks at both ends of the world cannot be built as one map (P1-21).
                 areas = await Task.Run(() => ChunkAreas.Build(newSave));
                 _terrainNeeds = TerrainMap.NeedsForMode(_renderMode);
-                tm = await Task.Run(() => TerrainMap.BuildInArea(newSave, areas.Main, progress, _terrainNeeds, _renderMode));
+                // A tile left by a previous session is a load instead of a build. The cache key carries the
+                // source file identity, so a save changed since then simply misses.
+                var needs = _terrainNeeds;
+                var mode = _renderMode;
+                var firstArea = areas.Main;
+                tm = await Task.Run(() =>
+                    firstArea is not null && _mapCache.TryLoad(newSave, firstArea, needs, mode, out var cached)
+                                          && cached is not null
+                        ? cached
+                        : TerrainMap.BuildInArea(newSave, firstArea, progress, needs, mode));
+                if (progress is not null) progress.Report(1.0);
             }
             catch (Exception ex)
             {
@@ -2141,6 +2213,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
         catch (Exception ex)
         {
+            ScanDiagnostics.Error("save load failed (open path)", ex);
             Status.Set(StatusChannel.App, $"Failed to load save: {ex.Message}", priority: AppStatus.PriorityError);
         }
         finally
@@ -2162,57 +2235,180 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                "the neighbouring tiles are preloaded in the background\n";
     }
 
-    /// <summary>Builds the other tiles ahead of time. The budget keeps a many-tile save from caching
-    /// the whole world; tiles over it are built on first visit, as before.</summary>
+    /// <summary>
+    ///     Prepares EVERY tile of the map in the background, not only the ones that fit in memory: a tile is taken
+    ///     from the disk cache when a previous run left one, otherwise it is built and written there right away.
+    ///     That is what makes scrolling to a part of the world the user has never opened instant — before, a tile
+    ///     outside the memory budget was simply not prepared and every first visit paid the full build.
+    /// </summary>
     private async Task PreloadAreasAsync(VSSaveFile save, ChunkAreas areas, int epoch)
     {
-        long used = _areaMaps.Values.Sum(m => (long)m.Width * m.Height);
-        // The 16M target turns the 3.9 GB test save into 21 tiles totalling 131M columns, so this
-        // budget caches them all. Without the target the first two areas alone were 66M + 76M and
-        // the old 80M budget built the neighbour only to throw it away.
-        const long budgetCells = 160_000_000;
+        var main = Map.Terrain?.Area ?? areas.Main;
         // Preload the nearest neighbours first: the list is ordered by size, not by distance, so on a
         // save with several patches the first useful switch could otherwise wait behind a huge far one.
-        var main = Map.Terrain?.Area ?? areas.Main;
         var queue = areas.Areas
             .Where(a => !ReferenceEquals(a, main) && !_areaMaps.ContainsKey(a))
             .OrderBy(a => main is null ? a.Index : a.DistanceTo(main.CentreX, main.CentreZ))
             .ToList();
+        if (queue.Count == 0) return;
+
+        // The scan reads the same connection through the same lock, and it is the thing that makes the
+        // data tabs usable. Warming the neighbours while it runs starved it: on a 12-GB save with 45 build
+        // tiles the window reached only 20% of the scan in five minutes. Wait for it first - the tiles are
+        // still built on demand the moment the user scrolls to one (LoadAreaAsync).
+        while (_scan.IsRunning && epoch == _loadEpoch)
+            await Task.Delay(250);
+        if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+
+        int done = 0, built = 0, fromDisk = 0, failed = 0;
+        var needs = _terrainNeeds;
+        var mode = _renderMode;
         foreach (var area in queue)
         {
             if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            // The render mode can change mid-pass (its arrays differ), and a tile built for the old mode is
+            // useless: stop and let a new pass start from the current mode.
+            if (needs != _terrainNeeds || mode != _renderMode) return;
             if (ReferenceEquals(area, Map.Terrain?.Area) || _areaMaps.ContainsKey(area)) continue;
-            if (main is null || ReferenceEquals(Map.Terrain?.Area, main))
-                Status.Set(StatusChannel.App, $"Preloading {area.Label(areas.Areas.Count)}…");
-            TerrainMap map;
-            var buildTask = Task.Run(() => TerrainMap.BuildInArea(save, area, progress: null, _terrainNeeds, _renderMode));
-            _preloadBuilding = area;
-            _preloadTask = buildTask;
-            try { map = await buildTask; }
-            catch { continue; }
-            finally
-            {
-                if (ReferenceEquals(_preloadBuilding, area))
-                {
-                    _preloadBuilding = null;
-                    _preloadTask = null;
-                }
-            }
+            done++;
+
+            TerrainMap? map = null;
+            var cached = await Task.Run(() =>
+                _mapCache.TryLoad(save, area, needs, mode, out var hit) ? hit : null);
             if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
-            if (used + area.BlockCells <= budgetCells)
+            if (cached is not null)
             {
-                _areaMaps[area] = map;
-                used += area.BlockCells;
-                Map.SetAreaMaps(_areaMaps);
+                map = cached;
+                fromDisk++;
             }
-            else if (map.Pyramid is { } pyramid)
+            else
             {
-                // The full map is too large to keep, but its coarse pyramid is 4–16 MB and gives the
-                // whole-map overview without pinning another 60–80M-column array set.
-                _areaOverviews[area] = pyramid;
-                Map.SetAreaOverviews(_areaOverviews);
+                if (main is null || ReferenceEquals(Map.Terrain?.Area, main))
+                    Status.Set(StatusChannel.App,
+                        $"Preparing map tiles in the background: {done}/{queue.Count}…");
+                var buildTask = Task.Run(() => TerrainMap.BuildInArea(save, area, null, needs, mode));
+                _preloadBuilding = area;
+                _preloadTask = buildTask;
+                try { map = await buildTask; }
+                catch (Exception ex)
+                {
+                    failed++;
+                    ScanDiagnostics.Warn($"map tile {area.Label(areas.Areas.Count)} failed to build", ex);
+                    continue;
+                }
+                finally
+                {
+                    if (ReferenceEquals(_preloadBuilding, area))
+                    {
+                        _preloadBuilding = null;
+                        _preloadTask = null;
+                    }
+                }
+
+                if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+                built++;
+                // Store before caching in RAM: the eviction below may drop this very tile, and then the
+                // disk copy is the only thing that keeps the work done.
+                var built_map = map;
+                await Task.Run(() => _mapCache.Save(save, area, needs, mode, built_map));
+                if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            }
+
+            AddAreaMap(area, map);
+        }
+
+        if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+        Status.Set(StatusChannel.App,
+            $"Map ready: {areas.Areas.Count} tile(s) prepared — {built} built now, {fromDisk} from the disk cache" +
+            (failed > 0 ? $", {failed} failed" : "") +
+            $" (kept in memory: {_areaMaps.Count}, on disk: {_mapCache.BytesOnDisk() / (1024 * 1024)} MB)",
+            ttlSeconds: 20);
+    }
+
+    /// <summary>
+    ///     Puts a tile into the RAM cache, evicting the tiles farthest from the viewport when the budget is
+    ///     exceeded. The evicted tile is already on disk (the caller stores before adding), so coming back to it
+    ///     is a load — that is what lets the warm pass go through the whole map without unbounded memory.
+    /// </summary>
+    private void AddAreaMap(ChunkArea area, TerrainMap map)
+    {
+        _areaMaps[area] = map;
+        _areaOverviews.Remove(area); // the full map supersedes its coarse stand-in
+        long used = _areaMaps.Values.Sum(m => (long)m.Width * m.Height);
+        if (used > AreaCacheBudgetCells)
+        {
+            var shown = Map.Terrain?.Area;
+            var order = _areaMaps
+                .Where(kv => !ReferenceEquals(kv.Key, area) && !ReferenceEquals(kv.Key, shown))
+                .OrderByDescending(kv => DistanceFromViewport(kv.Key))
+                .ToList();
+            // Two passes: off-screen tiles go first, and an on-screen tile is only dropped when the
+            // budget cannot be met otherwise (at detail density that tile is what the cursor is on).
+            // At whole-map density everything is "visible", so protecting it would simply blow the budget.
+            var protectVisible = Map.PixelsPerBlock >= 1;
+            var ordered = protectVisible
+                ? order.OrderByDescending(kv => Map.AreaVisible(kv.Key) ? 1 : 0).ToList()
+                : order;
+            foreach (var victim in ordered)
+            {
+                if (used <= AreaCacheBudgetCells) break;
+                _areaMaps.Remove(victim.Key);
+                used -= (long)victim.Value.Width * victim.Value.Height;
+                // Keep a cheap picture of the evicted tile. Without it, zooming out after the warm pass
+                // showed a blank piece where this area is, and nothing brought it back until the user
+                // scrolled into it - that is the "empty pieces hanging on screen" symptom.
+                if (victim.Value.Pyramid is { } pyramid)
+                    _areaOverviews[victim.Key] = pyramid.Shrink(OverviewMaxDimension);
             }
         }
+
+        Map.SetAreaMaps(_areaMaps);
+        Map.SetAreaOverviews(_areaOverviews);
+    }
+
+    // Areas already being fetched from disk: zooming out can ask for the same tile from several rebuilds.
+    private readonly HashSet<ChunkArea> _areaLoadsPending = new();
+
+    /// <summary>
+    ///     Fills visible holes after the RAM budget dropped a tile: the area is read back from the on-disk
+    ///     tile cache instead of being built again. Without this, zooming out to see more than the budget
+    ///     holds left empty pieces of the map on screen until the user scrolled into each one.
+    /// </summary>
+    private async Task LoadAreasFromDiskAsync(IReadOnlyList<ChunkArea> areas)
+    {
+        var save = _save;
+        if (save is null) return;
+        var needs = _terrainNeeds;
+        var mode = _renderMode;
+        foreach (var area in areas)
+        {
+            if (!_areaLoadsPending.Add(area)) continue;
+            try
+            {
+                var loaded = await Task.Run(() =>
+                    _mapCache.TryLoad(save, area, needs, mode, out var hit) ? hit : null);
+                if (loaded is null || !ReferenceEquals(save, _save)) continue;
+                if (needs != _terrainNeeds || mode != _renderMode) continue;
+                AddAreaMap(area, loaded);
+            }
+            catch (Exception ex)
+            {
+                ScanDiagnostics.Warn($"map tile {area.Index + 1} from the disk cache failed", ex);
+            }
+            finally
+            {
+                _areaLoadsPending.Remove(area);
+            }
+        }
+    }
+
+    /// <summary>How far a tile is from what the user is looking at now — the eviction order is "farthest first".</summary>
+    private double DistanceFromViewport(ChunkArea area)
+    {
+        var tm = Map.Terrain;
+        if (tm is null) return -area.Index;
+        double cx = tm.MinX + tm.Width / 2.0, cz = tm.MinZ + tm.Height / 2.0;
+        return area.DistanceTo(cx, cz);
     }
 
     private Task PublishAreaAsync(TerrainMap tm, ChunkArea area, int count)
@@ -2292,16 +2488,33 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         var epoch = _loadEpoch;
         try
         {
-            var progress = new UiProgress(pct => Status.Set(StatusChannel.App,
-                $"Building map of area {area.Index + 1} of {count}… {pct}%"));
-            var tm = await Task.Run(() => TerrainMap.BuildInArea(save, area, progress, _terrainNeeds, _renderMode));
-            if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return; // the save changed while we were building
+            var needs = _terrainNeeds;
+            var mode = _renderMode;
+            // A tile the warm pass (or a previous session) left on disk is a load, not a build: this is the
+            // path that makes a region the user has never opened appear immediately.
+            var diskTile = await Task.Run(() =>
+                _mapCache.TryLoad(save, area, needs, mode, out var hit) ? hit : null);
+            if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            TerrainMap tm;
+            if (diskTile is not null)
+            {
+                tm = diskTile;
+            }
+            else
+            {
+                var progress = new UiProgress(pct => Status.Set(StatusChannel.App,
+                    $"Building map of area {area.Index + 1} of {count}… {pct}%"));
+                tm = await Task.Run(() => TerrainMap.BuildInArea(save, area, progress, needs, mode));
+                if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return; // the save changed while we were building
+                var built_map = tm;
+                await Task.Run(() => _mapCache.Save(save, area, needs, mode, built_map));
+                if (epoch != _loadEpoch || !ReferenceEquals(save, _save)) return;
+            }
+
             // Keep the map even when the viewport has already left: coming back is instant, and a
             // preload may need it as an extra layer.
-            _areaMaps[area] = tm;
             _areaOverviews.Remove(area);
-            Map.SetAreaMaps(_areaMaps);
-            Map.SetAreaOverviews(_areaOverviews);
+            AddAreaMap(area, tm);
             // While we were building, the user may have moved back: do not swap in an area they
             // have already left (a request for the current area will come with the next map movement).
             if (!Map.ViewportIntersects(area) || !Map.IsAreaStillWanted(area)) return;
@@ -2375,23 +2588,28 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
 
         var sw = Stopwatch.StartNew();
-        var progress = new UiProgress(pct =>
+        // The scan reports rows it has already read, not a percentage: an exact row count would cost a
+        // full pass over the chunk table before the first chunk is decoded (43 s on a cold 12-GB save).
+        var progress = new ScanProgress(n =>
         {
             if (_scan.IsCurrent(scan) && loadEpoch == _loadEpoch)
-                Status.Set(StatusChannel.Scan, $"Scanning save data... {pct}%");
+                Status.Set(StatusChannel.Scan, $"Scanning save data... {n:N0} chunks");
         });
         try
         {
             // save is passed explicitly: opening another save will not close this object under our feet
             // captureRaw:false — the full blob of every chunk is not retained; the cards re-read the
             // working copy on demand (ChunkViewService/PlayersTabService have a DB fallback).
-            var data = await Task.Run(() => SaveScanner.Scan(save, progress, captureRaw: false));
+            // The block histogram is 98 % of the chunk loop; it is decoded after the model is published,
+            // so the tabs and the map become usable ~50 s earlier on a 12-GB save.
+            var data = await Task.Run(() =>
+                SaveScanner.Scan(save, progress, captureRaw: false, computeBlockStats: false));
             if (loadEpoch != _loadEpoch) return; // a stale load
             if (!_scan.TryPublish(scan, data)) return; // a stale scan
             sw.Stop();
             var activeRows = data.Chunks.SelectMany(c => c.Entities).Count(e => e.HasInfo);
             Status.Set(StatusChannel.Scan,
-                $"Scan complete in {sw.ElapsedMilliseconds} ms — {activeRows} active of {data.EntityCount} entities, {data.BlockEntityCount} block entities, {data.Chunks.Count} chunks.");
+                $"Scan complete in {sw.ElapsedMilliseconds} ms — {activeRows} active of {data.EntityCount} entities, {data.BlockEntityCount} block entities, {data.Chunks.Count} chunks (block statistics computing).");
             RefreshDumpForSelection(Map.SelectionBounds);
             ApplyDataPanelVisibility(); // show the panel after the scan, respecting the saved state
             PopulateChunkPick(); // chunk index + found list, in the tab's scope
@@ -2402,9 +2620,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             _chunkView.RefreshAll(); // the open chunk card re-reads its blob from the working copy
             if (_settings.OverlayEnabled && _filterCodes.Count > 0)
                 BuildFilterOverlay(); // restore the overlay after a restart
+            _ = ComputeBlockStatsAsync(save, scan, data, loadEpoch, sw.ElapsedMilliseconds);
         }
         catch (Exception ex)
         {
+            // console first: the status line is gone as soon as the next action replaces it
+            ScanDiagnostics.Error($"scan failed after {sw.ElapsedMilliseconds} ms", ex);
             if (_scan.IsCurrent(scan))
                 Status.Set(StatusChannel.Scan, $"Scan failed: {ex.Message}", priority: AppStatus.PriorityError);
         }
@@ -2420,6 +2641,36 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 catch
                 {
                 }
+        }
+    }
+
+    /// <summary>Decodes the block statistics the scan skipped and refreshes everything that quotes them.</summary>
+    private async Task ComputeBlockStatsAsync(VSSaveFile save, int scan, SaveScanResult data, int loadEpoch, long scanMs)
+    {
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var progress = new ScanProgress(n =>
+            {
+                if (_scan.IsCurrent(scan) && loadEpoch == _loadEpoch)
+                    Status.Set(StatusChannel.Scan, $"Block statistics... {n:N0} chunks");
+            });
+            await Task.Run(() => SaveScanner.ComputeBlockStats(data, save, progress));
+            if (!_scan.IsCurrent(scan) || loadEpoch != _loadEpoch) return;
+            sw.Stop();
+            Status.Set(StatusChannel.Scan,
+                $"Scan complete in {scanMs} ms + block statistics in {sw.ElapsedMilliseconds} ms — " +
+                $"{data.EntityCount} entities, {data.BlockEntityCount} block entities, {data.Chunks.Count} chunks.");
+            RefreshDumpForSelection(Map.SelectionBounds);
+            PopulateFilterList();
+            if (_settings.OverlayEnabled && _filterCodes.Count > 0)
+                BuildFilterOverlay();
+        }
+        catch (Exception ex)
+        {
+            ScanDiagnostics.Error("block statistics failed", ex);
+            if (_scan.IsCurrent(scan))
+                Status.Set(StatusChannel.Scan, $"Block statistics failed: {ex.Message}", priority: AppStatus.PriorityError);
         }
     }
 
@@ -3031,6 +3282,30 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     ///     and throttles updates (~10/s) so the Dispatcher is not flooded. It replaces the
     ///     Progress&lt;T&gt; + manual Dispatcher.UIThread.Post pair (double delivery of the same tick).
     /// </summary>
+    /// <summary>Scan progress arrives as a chunk count. Throttled the same way as <see cref="UiProgress"/>:
+    /// the scan reports every 1024 rows and the status bar does not need more than ~5 updates a second.</summary>
+    private sealed class ScanProgress : IProgress<long>
+    {
+        private readonly Action<long> _apply;
+        private readonly object _gate = new();
+        private long _last = -1;
+        private long _lastTick;
+
+        public ScanProgress(Action<long> apply) => _apply = apply;
+
+        public void Report(long value)
+        {
+            lock (_gate)
+            {
+                long now = Environment.TickCount64;
+                if (value == _last || (now - _lastTick < 200 && value - _last < 65_536)) return;
+                _last = value;
+                _lastTick = now;
+            }
+            _apply(value);
+        }
+    }
+
     private sealed class UiProgress : IProgress<double>
     {
         private readonly Action<int> _apply;

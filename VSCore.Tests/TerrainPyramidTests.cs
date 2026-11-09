@@ -80,6 +80,31 @@ public class TerrainPyramidTests
     }
 
     [Fact]
+    public void Shrink_KeepsTheBlockRectangleAndShrinksTheGrid()
+    {
+        var pyramid = TerrainPyramid.Build(Flat(4096, 1), TerrainColorizer.ModeBlocks)!;
+        var small = pyramid.Shrink(512);
+        Assert.True(small.Width <= 512 && small.Height <= 512);
+        Assert.Equal(pyramid.MinX, small.MinX);
+        Assert.Equal(pyramid.MinZ, small.MinZ);
+        // One coarse pixel of the copy covers k×k pixels of the original, so the block span stays the same
+        // up to the rounding of one coarse pixel.
+        int spanOriginal = pyramid.Width * pyramid.CellBlocks, spanSmall = small.Width * small.CellBlocks;
+        Assert.True(Math.Abs(spanOriginal - spanSmall) <= small.CellBlocks * 2,
+            $"span {spanSmall} vs {spanOriginal} (cell {small.CellBlocks})");
+        Assert.True(small.CellBlocks > pyramid.CellBlocks);
+        Assert.Equal(small.Width * small.Height * 4, small.Pixels.Length);
+        Assert.Contains(small.Pixels, b => b != 0);
+    }
+
+    [Fact]
+    public void Shrink_LeavesAnAlreadySmallPyramidAlone()
+    {
+        var pyramid = TerrainPyramid.Build(Flat(4096, 1), TerrainColorizer.ModeBlocks)!;
+        Assert.Same(pyramid, pyramid.Shrink(4096));
+    }
+
+    [Fact]
     public void Needs_SelectTheRightArrays()
     {
         Assert.Equal(TerrainNeeds.Blocks, TerrainMap.NeedsForMode(TerrainColorizer.ModeBlocks));

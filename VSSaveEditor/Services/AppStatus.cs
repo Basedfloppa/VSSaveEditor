@@ -33,6 +33,7 @@ public sealed class AppStatus
 
     private readonly Dictionary<StatusChannel, Entry> _entries = new();
     private readonly Func<DateTime> _now;
+    private readonly object _gate = new();
     private long _seq;
     private string _shown = "";
 
@@ -41,18 +42,38 @@ public sealed class AppStatus
         _now = now ?? (() => DateTime.UtcNow);
     }
 
+    /// <summary>
+    ///     Where <see cref="Changed" /> is raised. The scan reports progress from the worker threads of
+    ///     Parallel.For, and the subscriber (the status line) is a control only the UI thread may touch;
+    ///     the window sets this to the UI dispatcher. Null - raise inline, which is what headless probes
+    ///     without a dispatcher need.
+    /// </summary>
+    public Action<Action>? Dispatch { get; set; }
+
     /// <summary>Whether a timer is worth running: a message with a limited lifetime still occupies the line.</summary>
     public bool NeedsTimer
     {
         get
         {
             var now = _now();
-            return _entries.Values.Any(e => e.ExpiresAt != DateTime.MaxValue && e.ExpiresAt > now);
+            lock (_gate)
+            {
+                return _entries.Values.Any(e => e.ExpiresAt != DateTime.MaxValue && e.ExpiresAt > now);
+            }
         }
     }
 
     /// <summary>Text of the single line: highest priority among NOT expired, and on a tie the latest.</summary>
-    public string Text => ComputeText(_now());
+    public string Text
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return ComputeText(_now());
+            }
+        }
+    }
 
     public event Action? Changed;
 
@@ -93,32 +114,53 @@ public sealed class AppStatus
 
         var prio = priority ?? DefaultPriority(channel);
         var ttl = ttlSeconds ?? (prio >= PriorityError ? 30 : DefaultTtlSeconds(channel));
-        _entries[channel] = new Entry
+        bool changed;
+        lock (_gate)
         {
-            Text = text,
-            Priority = prio,
-            ExpiresAt = ttl > 0 ? _now().AddSeconds(ttl) : DateTime.MaxValue,
-            Seq = ++_seq
-        };
-        Refresh();
+            _entries[channel] = new Entry
+            {
+                Text = text,
+                Priority = prio,
+                ExpiresAt = ttl > 0 ? _now().AddSeconds(ttl) : DateTime.MaxValue,
+                Seq = ++_seq
+            };
+            changed = RefreshLocked();
+        }
+
+        if (changed) Raise();
     }
 
     public void Clear(StatusChannel channel)
     {
-        if (_entries.Remove(channel)) Refresh();
+        bool changed;
+        lock (_gate)
+        {
+            changed = _entries.Remove(channel) && RefreshLocked();
+        }
+
+        if (changed) Raise();
     }
 
     public void ClearAll()
     {
-        if (_entries.Count == 0) return;
-        _entries.Clear();
-        Refresh();
+        bool changed;
+        lock (_gate)
+        {
+            if (_entries.Count == 0) return;
+            _entries.Clear();
+            changed = RefreshLocked();
+        }
+
+        if (changed) Raise();
     }
 
     /// <summary>The latest message of the channel - regardless of whether it is visible on the line right now.</summary>
     public string TextOf(StatusChannel channel)
     {
-        return _entries.TryGetValue(channel, out var e) ? e.Text : "";
+        lock (_gate)
+        {
+            return _entries.TryGetValue(channel, out var e) ? e.Text : "";
+        }
     }
 
     private string ComputeText(DateTime now)
@@ -137,25 +179,39 @@ public sealed class AppStatus
     /// <summary>
     ///     Recomputes the visible line at <paramref name="now" />: expired messages
     ///     stop occupying it but stay in the channel. Returns true when the visible text changed.
-    ///     Not exposed publicly: the next timer tick recomputes the line from real time anyway.
+    ///     Caller holds <see cref="_gate" />; the event is raised by <see cref="Raise" />, outside the lock,
+    ///     so that a synchronous marshaller (Send rather than Post) cannot deadlock on it.
     /// </summary>
-    private bool Expire(DateTime now)
+    private bool ExpireLocked(DateTime now)
     {
         var text = ComputeText(now);
         if (string.Equals(text, _shown, StringComparison.Ordinal)) return false;
         _shown = text;
-        Changed?.Invoke();
         return true;
     }
 
     public bool Expire()
     {
-        return Expire(_now());
+        bool changed;
+        lock (_gate)
+        {
+            changed = ExpireLocked(_now());
+        }
+
+        if (changed) Raise();
+        return changed;
     }
 
-    private void Refresh()
+    private bool RefreshLocked()
     {
-        Expire(_now());
+        return ExpireLocked(_now());
+    }
+
+    private void Raise()
+    {
+        var dispatch = Dispatch;
+        if (dispatch is null) Changed?.Invoke(); // no dispatcher (headless probe): inline
+        else dispatch(() => Changed?.Invoke());
     }
 
     private sealed class Entry
