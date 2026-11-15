@@ -349,6 +349,22 @@ public class TerrainView : Control
         InvalidateVisual();
     }
 
+    /// <summary>
+    ///     Replaces the selection with the given chunks — the "Areas" list of the Find-blocks row edits the chunk
+    ///     selection through this. The view is deliberately left exactly where it is: what is selected must not
+    ///     decide where the user is looking (and a filter overlay on screen must survive the change).
+    /// </summary>
+    public void SetSelectedChunks(IEnumerable<(int cx, int cz)> chunks)
+    {
+        var next = new HashSet<(int cx, int cz)>(chunks);
+        if (next.SetEquals(_selectedChunks)) return;
+        _selectedChunks.Clear();
+        foreach (var c in next) _selectedChunks.Add(c);
+        _shiftSelect = next.Count > 0;
+        SelectedChunksChanged?.Invoke();
+        InvalidateVisual();
+    }
+
     private void ToggleChunk(int cx, int cz)
     {
         var c = (cx, cz);

@@ -3,23 +3,42 @@
              x:Class="VSSaveEditor.Components.ScopeBar">
     <!-- One search scope per tab, shown on its own row under the toolbar. It is a row rather than a few
          more controls in the toolbar: the toolbars already reach the right edge of a 1280 px window, and a
-         scope combo plus a rectangle editor would push them past it. The width of the label is capped for the
-         same reason: an area label names two coordinate ranges and can be longer than the whole window. -->
-    <Grid ColumnDefinitions="Auto,Auto,Auto,*,Auto" Margin="6,0,6,4">
-        <TextBlock Grid.Column="0" Text="Search in:" FontWeight="Bold" VerticalAlignment="Center" />
-        <TextBlock Grid.Column="1" x:Name="ScopeLabel" Margin="8,0,8,0" MaxWidth="300"
+         scope combo plus a rectangle editor would push them past it.
+         The row WRAPS instead of overflowing: with the area list of "Find blocks" on it, the parts no longer fit
+         one line when the window is narrow, and a horizontal StackPanel would paint them over each other and
+         over the neighbouring tab content. A wrapped line is taller but every control stays reachable. -->
+    <WrapPanel x:Name="ScopeRow" Orientation="Horizontal" Margin="6,0,6,4">
+        <TextBlock Text="Search in:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,0,2" />
+        <TextBlock x:Name="ScopeLabel" Margin="8,0,8,2" MaxWidth="280"
                    TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
                    Foreground="{DynamicResource TextAccentBrush}"
                    Text="the whole save — every record in the save" />
         <!-- The enter key applies the typed scope instead of closing the drawer: a scope is applied explicitly,
              like "Search" in the Chunks tab, because a half-typed range would turn the list empty on every keystroke -->
-        <TextBox Grid.Column="2" x:Name="ScopeBox" Width="280" VerticalAlignment="Center"
+        <TextBox x:Name="ScopeBox" Width="200" VerticalAlignment="Center" Margin="0,0,8,2"
                  Watermark="cx,cz or cx1,cz1,cx2,cz2 — or pick below"
                  ToolTip.Tip="A chunk column (15991, 15983) or a rectangle of columns (15991, 15983, 16010, 16000). Space or comma between the numbers; an area can be picked below." />
-        <StackPanel Grid.Column="3" x:Name="ScopeButtons" Orientation="Horizontal" Spacing="4"
-                    Margin="8,0,0,0" VerticalAlignment="Center" />
-        <Button Grid.Column="4" x:Name="ScopeClearBtn" Content="Whole save" Padding="8,1"
-                Margin="8,0,0,0" VerticalAlignment="Center"
+        <StackPanel x:Name="ScopeButtons" Orientation="Horizontal" Spacing="4"
+                    Margin="0,0,0,2" VerticalAlignment="Center" />
+        <!-- The area list of "Find blocks": only the areas that contain the ticked blocks, which is why it is
+             empty (and hidden) in every other tab and before anything is ticked. The strip is a window of fixed
+             width over the buttons, so a save with twelve areas cannot widen the row: ‹ › page through it. -->
+        <StackPanel x:Name="AreaGroup" Orientation="Horizontal" Spacing="2" Margin="8,0,0,2"
+                    VerticalAlignment="Center" IsVisible="False">
+            <TextBlock Text="Areas:" VerticalAlignment="Center" Margin="0,0,2,0" />
+            <Button x:Name="AreaPrevBtn" Content="‹" Padding="6,1" VerticalAlignment="Center"
+                    ToolTip.Tip="Previous areas" />
+            <ScrollViewer x:Name="AreaScroll" Width="168" VerticalAlignment="Center"
+                          VerticalScrollBarVisibility="Disabled" HorizontalScrollBarVisibility="Hidden">
+                <StackPanel x:Name="AreaStrip" Orientation="Horizontal" Spacing="2" />
+            </ScrollViewer>
+            <Button x:Name="AreaNextBtn" Content="›" Padding="6,1" VerticalAlignment="Center"
+                    ToolTip.Tip="More areas" />
+            <Button x:Name="AreaClearBtn" Content="Clear" Padding="6,1" VerticalAlignment="Center"
+                    ToolTip.Tip="Untick every area — search the whole save again" />
+        </StackPanel>
+        <Button x:Name="ScopeClearBtn" Content="Whole save" Padding="8,1" Margin="8,0,0,2"
+                VerticalAlignment="Center"
                 ToolTip.Tip="Search the whole save again" />
-    </Grid>
+    </WrapPanel>
 </UserControl>

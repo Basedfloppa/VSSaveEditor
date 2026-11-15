@@ -65,13 +65,17 @@ Each search tab has a **Search in:** row under its toolbar. It limits that tab �
 
 | What | How |
 |---|---|
-| The whole save | **Whole save** (the default). |
+| The whole save | **Whole save** (the default); in **Find blocks** the same button is **All**. |
 | One chunk | Type `15991, 15983` (chunk X and Z) and press Enter, or click **This chunk on the map**. |
 | A rectangle of chunks | Type `15991, 15983, 16010, 16000` — `cx1, cz1, cx2, cz2`. |
 | The map selection | Tick chunks on the map, then click **The selection (N chunk(s))**. |
-| One map area | Click **Area N of M**; a save with distant pregen patches or a large connected patch has several build tiles. |
+| Map areas of the current selection | In **Find blocks**: the **Areas:** list edits the chunk selection — click an area number to add the chunks of it (with block codes ticked: only those that contain them), then click **The selection (N chunk(s))** (or type `areas=1,3`). |
 
 The label next to the box names the active scope, and the status line reports how much it found. A rectangle that lies outside every area says so instead of quietly searching the whole save.
+
+The **Areas:** list is in **Find blocks** only, and it is an editor of the **chunk selection**, not of the block-code search: a number is ticked when the chunks selected on the map reach into that area, and clicking it adds the chunks of that area to the selection (or drops them, when the whole area is already in it). **With block codes ticked a click takes only the chunks that hold them** — those are the chunks the overlay can show anything in, so the rest of the area is not dragged into the selection: tick `rock-andesite`, press **All**, and the selection is exactly the chunks where that rock is, not every chunk of every area. With nothing ticked there is no block to restrict to, and an area brings all of its chunks. That is why the list is there with nothing ticked — it is how a selection is grown by whole areas. **All** selects every area (with the same restriction), **Clear** empties the selection. Block codes restored from the previous session that this save does not contain are unticked as soon as the block statistics arrive, and the status line names them — otherwise a click could quietly select nothing. None of these moves the map: the camera stays where you left it, and a block overlay that is already on the map stays exactly as it is — only **Show on map** rebuilds it, and the status line then says which scope the picture was built for. Names of two coordinate ranges do not fit a row, so the buttons carry the area numbers and the tooltip names the area, its block ranges and what is selected. `‹ ›` page through a long list, the list has a fixed width and never pushes the row past the window, and the row wraps onto a second line on a narrow window instead of painting the controls over each other. Selecting several areas means the selection holds the chosen chunks of each of them (with block codes ticked: the ones that hold those blocks); searching that selection as one rectangle is what **The selection** proposal does, and a typed `areas=1,3` searches the **union** of their rectangles — not the box around them, which would also take the empty gap between two distant areas.
+
+The other four tabs have no area list: the selection is one thing for the whole window, and editing it from every tab would only repeat the same row four times.
 
 A scope is two-dimensional: every Y level of the chosen chunks is inside it. Typing a scope into one tab leaves the other tabs' scopes alone, so the Chunks tab can show one chunk while Items shows the whole save.
 
@@ -143,7 +147,11 @@ The **Players** tab lists `playerdata` records. It supports filtering, inventory
 Use **Find blocks** to clean up blocks from a removed mod or replace one block code with another:
 
 1. Search for a block code. A colon (`:`) keeps only modded codes.
-2. Tick the codes you want to change.
+2. Tick the codes you want to change — or use **Select all shown** / **Deselect all shown** under the list
+   header. The pair acts on **exactly the rows the search shows**: codes ticked before the search was typed
+   are not in the list and keep their tick, so typing `torch`, pressing **Select all shown** and clearing the
+   search leaves everything else as it was. When the search matches more codes than the list draws (250 rows),
+   the status line says how many matches were left out and the buttons still cover only the shown ones.
 3. Choose **Remove selected…** to turn them into air, or **Replace selected…** and pick a target block from the save.
 4. Confirm the operation.
 

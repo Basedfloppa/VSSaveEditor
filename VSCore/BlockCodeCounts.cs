@@ -121,6 +121,35 @@ public sealed class BlockCodeCounts : IReadOnlyDictionary<string, long>
 
     public bool ContainsKey(string key) => TryGetValue(key, out _);
 
+    /// <summary>
+    ///     Cells of this chunk that carry any of the ids in <paramref name="idMask" /> (indexed by block id), or any
+    ///     of <paramref name="codes" /> for a hand-built histogram — those never hold ids, so the mask cannot answer.
+    ///     Both inputs exist because the scan keeps ids and never materialises code strings, while the tests and
+    ///     fixtures keep codes: asking a chunk "how much of this selection is in you" must work for both without
+    ///     the caller allocating a string per distinct block of every chunk of the save.
+    /// </summary>
+    public long SumSelected(bool[] idMask, IReadOnlySet<string>? codes)
+    {
+        if (_manual is not null)
+        {
+            if (codes is null || codes.Count == 0) return 0;
+            long manualTotal = 0;
+            foreach (var kv in _manual)
+                if (codes.Contains(kv.Key))
+                    manualTotal += kv.Value;
+            return manualTotal;
+        }
+
+        long total = 0;
+        for (var i = 0; i < _count; i++)
+        {
+            var id = (int)(_entries[i] >> 16);
+            if (id < idMask.Length && idMask[id]) total += CountOf(_entries[i]);
+        }
+
+        return total;
+    }
+
     public bool TryGetValue(string key, out long value)
     {
         if (_manual is not null) return _manual.TryGetValue(key, out value);

@@ -92,6 +92,76 @@ namespace VSCore.Tests
             Assert.False(s.ContainsChunk(10, 25));
         }
 
+        // ---------------------------------------------------------------- several areas at once
+
+        // Two areas with a gap between them along both axes: the box around them also covers cx 41..44, cz 51..54,
+        // which belongs to neither. A union must say "outside" there, a box around both would say "inside".
+        private static ChunkArea Area(int index, int minCx, int minCz, int maxCx, int maxCz)
+            => new() { Index = index, MinCx = minCx, MinCz = minCz, MaxCx = maxCx, MaxCz = maxCz,
+                       Columns = (maxCx - minCx + 1) * (maxCz - minCz + 1) };
+
+        [Fact]
+        public void Several_areas_are_a_union_not_the_box_around_them()
+        {
+            var a1 = Area(0, 10, 20, 20, 30);
+            var a3 = Area(2, 45, 60, 55, 70);
+            var s = SearchScope.ForAreas(new[] { a1, a3 }, 12);
+
+            Assert.Equal(SearchScope.ScopeKind.Areas, s.Kind);
+            Assert.True(s.HasRegion);
+            // each chosen area's own columns are inside
+            Assert.True(s.ContainsChunk(15, 25));
+            Assert.True(s.ContainsChunk(50, 65));
+            Assert.True(s.ContainsPoint(15 * 32 + 5, 25 * 32 + 5));
+            // the gap between them is inside the bounding box and outside the scope
+            Assert.False(s.ContainsChunk(30, 45));
+            Assert.Equal((10, 20, 55, 70), (s.MinCx, s.MinCz, s.MaxCx, s.MaxCz));
+            // a column outside every area and outside the box
+            Assert.False(s.ContainsChunk(0, 0));
+            Assert.False(s.ContainsChunk(56, 65));
+            // the label names the chosen numbers out of the total and sums their columns
+            Assert.Equal("areas 1, 3 of 12 — 242 chunks", s.Label);
+        }
+
+        [Fact]
+        public void Several_areas_keep_the_area_numbers_the_user_sees()
+        {
+            // sorted by area index, not by the order they were passed in: "areas 2, 3 of 4" must read in order
+            var s = SearchScope.ForAreas(new[] { Area(2, 0, 0, 1, 1), Area(1, 10, 10, 11, 11) }, 4);
+            Assert.StartsWith("areas 2, 3 of 4", s.Label);
+            Assert.Equal(new[] { 1, 2 }, s.Areas.Select(a => a.Index).ToArray());
+        }
+
+        [Fact]
+        public void One_area_in_a_set_is_an_ordinary_area_scope()
+        {
+            // "area=2" and "areas=2" must mean the same thing, label included: otherwise the same choice
+            // would be worded differently depending on which control made it
+            var area = Area(1, 10, 20, 12, 24);
+            var one = SearchScope.ForAreas(new[] { area }, 3);
+            var single = SearchScope.ForArea(area, 3);
+            Assert.Equal(SearchScope.ScopeKind.Area, one.Kind);
+            Assert.Equal(single.Label, one.Label);
+            Assert.True(one.ContainsChunk(11, 22));
+            Assert.False(one.ContainsChunk(13, 22));
+        }
+
+        [Fact]
+        public void An_empty_set_is_the_whole_save()
+        {
+            var s = SearchScope.ForAreas(Array.Empty<ChunkArea>(), 4);
+            Assert.True(s.IsEverything);
+            Assert.True(s.ContainsChunk(int.MinValue, int.MaxValue));
+        }
+
+        [Fact]
+        public void Area_set_labels_are_not_parsed_back()
+        {
+            // the numbering depends on the save, so the caller resolves "areas=1,3" against its own area list
+            var ex = Assert.Throws<FormatException>(() => SearchScope.Parse("areas=1,3"));
+            Assert.Contains("areas=", ex.Message);
+        }
+
         // ---------------------------------------------------------------- exact points
 
         [Fact]

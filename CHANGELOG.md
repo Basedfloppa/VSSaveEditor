@@ -5,6 +5,29 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 ## [Unreleased] — planned first public release `0.1.0`
 
+### Highlights
+
+The changes of this working session in one screen; the detailed entries are below.
+
+- **The areas list lives in `Find blocks` only.** The `Area 1 of 4` buttons are gone from Chunks,
+  Entities, Items and Players; the list has a fixed width, pages with `‹ ›` and wraps on a narrow
+  window instead of painting over its neighbours.
+- **The list edits the chunk selection, not the block search.** A number is ticked when the chunks
+  selected on the map reach into that area; a click adds that area's chunks (or removes them when the
+  whole area is already in), **All** ticks every area, **Clear** empties the selection.
+- **Only the chunks that hold the ticked blocks.** With `rock-andesite` ticked, **All** selects
+  exactly the chunks containing that rock, not every chunk of every area.
+- **A built overlay survives, and the camera stays put.** Changing the selection or the scope no
+  longer throws the overlay away; the status line says which scope it was built for, and none of
+  these actions moves the map.
+- **Select all shown / Deselect all shown** next to the block list tick only the rows the current
+  search shows: a code ticked before the search was typed keeps its tick, and the status line names
+  the matches beyond the 250 rows the list draws.
+- **Restored codes the save does not contain are unticked** (waiting for the block statistics),
+  because such a code can never be found here and would turn every area click into an empty selection.
+- **Several areas are a union, not a box around them:** a typed `areas=1,3` searches both rectangles
+  and skips the empty gap between two distant areas.
+
 ### Added
 
 - 2D terrain map rendered in the in-game map's colours, with render modes, LOD, chunk grid and
@@ -124,6 +147,30 @@ All notable changes to VS Save Editor are recorded here. The format follows
   built from an older or edited save is a miss, never stale rendering.
 
 ### Changed
+- **Select all shown / Deselect all shown** in the block list of **Find blocks**: one click ticks or unticks every
+  code the current search shows and nothing else. A code ticked before the search was typed is not in the list, so
+  it keeps its tick — the bulk action is local to the filter, which is what "select all" has to mean next to a
+  search box. With more matches than the 250 rows the list draws, the status line names the matches that were left
+  out instead of pretending they were covered.
+- The area list of the “Search in” row lives in **Find blocks** only and edits the **chunk selection**,
+  not the block-code search. Before, every tab drew one button per map area (`Area 1 of 4`, …) inside a
+  horizontal strip: with four or more areas the buttons ran past the window and over the neighbours, and
+  in tabs that search records they offered somewhere to look but nothing to find. The list then became a
+  filter over the ticked block codes — which meant the picture on the map and the chosen area were
+  welded together: any area choice threw the built overlay away. Now a number is ticked when the chunks
+  selected on the map reach into that area, clicking it adds the chunks of the area to the selection (or
+  drops them when the whole area is already in it), **All** selects every area and **Clear** empties the
+  selection. With block codes ticked the click takes **only the chunks that hold them** — the ones the
+  overlay can show anything in — so “tick `rock-andesite`, press All” selects exactly the chunks where
+  that rock is, not every chunk of every area; with nothing ticked an area brings all of its chunks.
+  Block codes restored from the previous session that the opened save does not contain are unticked when
+  the block statistics arrive (the status line names them): left in, they could never be found here and
+  would silently turn every area click into an empty selection.
+  Changing the selection or the scope no longer drops a built overlay — it stays on the map and the
+  status line says which scope it was built for — and none of these actions moves the camera. The list
+  pages with `‹ ›` in a fixed-width window and the row wraps on a narrow window instead of painting the
+  controls over each other. A typed `areas=1,3` still searches the *union* of the areas' rectangles, not
+  the box around them: the gap between two distant areas belongs to no area and is not searched.
 - Map-region layers are parsed on demand instead of during the scan. A big save carries ~2000
   `mapregion` blobs (677 MB on the 12-GB reference save) and every one of them was read and
   parsed at open just to put a few lines into the text dump: on that save the regions section went

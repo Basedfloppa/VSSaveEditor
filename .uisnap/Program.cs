@@ -83,6 +83,47 @@ internal static class Harness
         Console.WriteLine("=== contrast (theme brushes vs window background) ===");
         ContrastProbe();
 
+        if (mode == "areaselectblocks")
+        {
+            AreaBlockSelectProbe(save);
+            return;
+        }
+
+        if (mode == "areaselect")
+        {
+            AreaSelectProbe(save);
+            return;
+        }
+
+        if (mode == "selectall")
+        {
+            SelectAllProbe(save);
+            return;
+        }
+
+        if (mode == "areacount")
+        {
+            using (var f = VSSaveFile.OpenReadOnly(save))
+            {
+                var areas = ChunkAreas.Build(f);
+                Console.WriteLine($"{System.IO.Path.GetFileName(save)}: areas={areas.Areas.Count} chunks={f.ChunkPositions.Count} "
+                                  + $"columns={areas.TotalColumns} world={areas.WorldWidth}x{areas.WorldLength}");
+                for (var i = 0; i < areas.Areas.Count; i++)
+                {
+                    var a = areas.Areas[i];
+                    Console.WriteLine($"  area {i + 1}: cx {a.MinCx}..{a.MaxCx}, cz {a.MinCz}..{a.MaxCz}, columns={a.Columns}");
+                }
+            }
+            return;
+        }
+
+        if (mode == "arealist")
+        {
+            AreaListProbe(save, args.Length > 2 ? args[2] : null,
+                Environment.GetEnvironmentVariable("UISNAP_AREA_EXTRA") == "1");
+            return;
+        }
+
         if (mode == "layout")
         {
             LayoutProbe(save, 960, 660);
@@ -5103,6 +5144,801 @@ internal static class Harness
 
     private static double Brightness(Color c) => (0.2126 * c.R + 0.7152 * c.G + 0.0722 * c.B) / 255.0;
 
+    // ======================= the area list of the "Find blocks" scope row =======================
+
+    /// <summary>
+    ///     The area list of the scope row: it belongs to "Find blocks", it appears only when block codes are ticked,
+    ///     it offers only the areas that contain them, it pages with ‹ › and does not grow the row past the window.
+    ///
+    ///     Ground truth for "which areas contain the code" is computed here, independently of the widget: the same
+    ///     scan histograms are read by <see cref="BlockCodeCounts" /> BY CODE STRING (the slow path), not through
+    ///     <see cref="BlockSelectionAreas" />' id mask — so a bug in the mask or in the area attribution cannot make
+    ///     both sides agree.
+    /// </summary>
+
+    /// <summary>
+    ///     The "Areas" list of the Find-blocks row is an editor of the CHUNK SELECTION: a chip is ticked when the
+    ///     selection reaches into that area, clicking it adds the area's chunks or drops them, "All" selects every
+    ///     area and "Clear" empties the selection. None of this may move the camera or drop the block overlay.
+    /// </summary>
+    private static void AreaSelectProbe(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        if (!WaitScan(w, 300)) { Console.WriteLine("FAILED: load"); CloseNow(w); return; }
+        WaitBlockStats(w, 300);
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "Find blocks");
+        Pump(1.0);
+
+        // the app restores the ticked codes from the previous session: the probe must not inherit them, or it would
+        // measure whatever the last run left behind. Untick BEFORE the row is captured — the rebuild replaces it.
+        SetText(w, "FilterSearchBox", "");
+        Pump(0.6);
+        foreach (var cb in Descendants(w.FindNamed<StackPanel>("FilterListPanel")!).OfType<CheckBox>()
+                     .Where(x => x.IsChecked == true))
+            cb.IsChecked = false;
+        Pump(1.0);
+
+        var map = (TerrainView)w.FindNamed<Control>("Map")!;
+        var tab = w.FindNamed<FindBlocksTab>("FindBlocksView")!;
+        var row = tab.FindNamed<ScopeBar>("Scope")!;
+        var group = row.FindControl<StackPanel>("AreaGroup")!;
+        var strip = row.FindControl<StackPanel>("AreaStrip")!;
+        var label = row.FindControl<TextBlock>("ScopeLabel")!;
+        var box = row.FindControl<TextBox>("ScopeBox")!;
+        var reset = row.FindControl<Button>("ScopeClearBtn")!;
+        var clear = row.FindControl<Button>("AreaClearBtn")!;
+        var build = tab.FindControl<Button>("FilterBuildBtn")!;
+
+        List<Button> Chips() => strip.Children.OfType<Button>().ToList();
+        List<string> Ticked() => Chips().Where(b => b.Classes.Contains("accent"))
+            .Select(b => b.Content as string ?? "?").ToList();
+        void Click(Button b) { b.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Pump(1.2); }
+        void ClickChip(int number)
+        {
+            var chip = Chips().FirstOrDefault(c => (c.Content as string) == number.ToString());
+            if (chip is null) { Console.WriteLine($"[areaselect] chip {number} is not offered"); return; }
+            Click(chip);
+        }
+
+        var codesField = typeof(MainWindow).GetField("_filterCodes",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var codesNow = (codesField.GetValue(w) as System.Collections.IEnumerable)?.Cast<object>().ToList()
+                       ?? new List<object>();
+        Console.WriteLine($"[probe] tickedCodes={codesNow.Count} [{string.Join(",", codesNow.Take(4))}]");
+
+        var cam0 = map.DisplayCenterWorld();
+        var scope0 = label.Text ?? "";
+        string State(string what)
+            => $"{what}: chips={Chips().Count} ticked=[{string.Join(",", Ticked())}] selected={map.SelectionCount:N0} "
+               + $"overlay={(map.Filter is null ? "none" : "on")} scope='{(label.Text ?? "").Substring(0, Math.Min(44, (label.Text ?? "").Length))}' "
+               + $"camera=({map.DisplayCenterWorld().wx:0.0},{map.DisplayCenterWorld().wz:0.0})";
+        bool CameraStill() => Math.Abs(map.DisplayCenterWorld().wx - cam0.wx) < 0.5
+                              && Math.Abs(map.DisplayCenterWorld().wz - cam0.wz) < 0.5;
+
+        Console.WriteLine($"[areaselect] row visible={group.IsVisible} " + State("start"));
+
+        ClickChip(1);
+        var afterFirst = map.SelectionCount;
+        Console.WriteLine(State("after chip 1") + $" cameraStill={CameraStill()}");
+        var scopeAfterChip = label.Text ?? "";
+
+        build.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        for (var i = 0; i < 60 && map.Filter is null; i++) Pump(0.5);
+        Pump(1.0);
+        Console.WriteLine(State("after Show on map") + $" cameraStill={CameraStill()}");
+
+        ClickChip(3);
+        var grew = map.SelectionCount > afterFirst;
+        var overlayKept = map.Filter is not null;
+        Console.WriteLine(State("after chip 3 (add)") + $" cameraStill={CameraStill()} grew={grew} overlayKept={overlayKept}");
+
+        ClickChip(1);
+        var shrank = map.SelectionCount < afterFirst + 1;
+        Console.WriteLine(State("after chip 1 (drop)") + $" cameraStill={CameraStill()} shrank={shrank} overlayKept={map.Filter is not null}");
+
+        Click(reset);
+        var allTicked = Ticked().Count == Chips().Count && Chips().Count > 0;
+        var allSelected = map.SelectionCount > afterFirst;
+        Console.WriteLine(State("after All") + $" cameraStill={CameraStill()} allTicked={allTicked} selectedMore={allSelected} overlayKept={map.Filter is not null}");
+
+        Click(clear);
+        var cleared = map.SelectionCount == 0 && Ticked().Count == 0;
+        Console.WriteLine(State("after Clear") + $" cameraStill={CameraStill()} cleared={cleared} overlayKept={map.Filter is not null}");
+
+        // a drag on the map must be reflected by the chips: the area(s) it covers are ticked, the camera stays put
+        Point At(double fx, double fy)
+            => map.TranslatePoint(new Point(map.Bounds.Width * fx, map.Bounds.Height * fy), w) ?? new Point(0, 0);
+        w.MouseDown(At(0.35, 0.35), MouseButton.Left, RawInputModifiers.Shift);
+        w.MouseMove(At(0.60, 0.60), RawInputModifiers.Shift);
+        w.MouseUp(At(0.60, 0.60), MouseButton.Left, RawInputModifiers.Shift);
+        Pump(1.0);
+        var dragged = map.SelectionCount > 0;
+        Console.WriteLine(State("after drag") + $" cameraStill={CameraStill()} dragged={dragged}");
+
+        // and the scope is untouched by all of it: it never became an area scope behind the user's back
+        var scopeKept = scopeAfterChip == (label.Text ?? "") || scope0 == (label.Text ?? "");
+        var ok = group.IsVisible && afterFirst > 0 && grew && shrank && overlayKept && allTicked && allSelected
+                 && cleared && dragged && CameraStill() && scopeAfterChip == scope0;
+        Console.WriteLine(ok
+            ? "RESULT: OK — the area list edits the chunk selection; camera and overlay stay put"
+            : $"RESULT: FAIL — visible={group.IsVisible} first={afterFirst} grew={grew} shrank={shrank} "
+              + $"overlay={overlayKept} allTicked={allTicked} allSelected={allSelected} cleared={cleared} "
+              + $"dragged={dragged} cameraStill={CameraStill()} scopeKept={scopeNow(scopeAfterChip, scope0)}");
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+
+        static bool scopeNow(string a, string b) => a == b;
+    }
+
+    /// <summary>
+    ///     The area list selects the chunks that HOLD the ticked blocks, not every chunk of the area. The truth here
+    ///     is read straight from the save (every chunk record's own histogram), never from the widget's own answer, so
+    ///     a mask bug in the app cannot make both sides agree.
+    /// </summary>
+    private static void AreaBlockSelectProbe(string save)
+    {
+        Dictionary<string, Dictionary<int, HashSet<(int Cx, int Cz)>>> truth = new(StringComparer.Ordinal);
+        int areaCount;
+        List<(int MinCx, int MaxCx, int MinCz, int MaxCz)> rects = new();
+        using (var f = VSSaveFile.OpenReadOnly(save))
+        {
+            var areas = ChunkAreas.Build(f);
+            areaCount = areas.Areas.Count;
+            rects = areas.Areas.Select(a => (a.MinCx, a.MaxCx, a.MinCz, a.MaxCz)).ToList();
+            var scan = SaveScanner.Scan(f, null, captureRaw: false);
+            foreach (var cd in scan.Chunks)
+            {
+                var owner = areas.AreaAt(cd.WorldX + 16.0, cd.WorldZ + 16.0);
+                if (owner is null) continue;
+                foreach (var code in cd.BlockCodeCounts.Keys)
+                {
+                    if (!truth.TryGetValue(code, out var perArea)) truth[code] = perArea = new Dictionary<int, HashSet<(int, int)>>();
+                    if (!perArea.TryGetValue(owner.Index, out var set)) perArea[owner.Index] = set = new HashSet<(int, int)>();
+                    set.Add((cd.ChunkX, cd.ChunkZ));
+                }
+            }
+        }
+
+        // the fattest code of the save: it exercises every area instead of a code that sits in one corner
+        var pick = truth.OrderByDescending(kv => kv.Value.Sum(a => (long)a.Value.Count))
+            .ThenBy(kv => kv.Key, StringComparer.Ordinal).FirstOrDefault();
+        if (pick.Key is null) { Console.WriteLine("FAILED: the save has no block codes"); return; }
+        var wideCode = pick.Key;
+        var perAreaTruth = pick.Value;
+        var total = perAreaTruth.Sum(a => a.Value.Count);
+        Console.WriteLine($"[blocks] save areas={areaCount} code='{wideCode}' chunk columns with it={total} "
+                          + $"perArea=[{string.Join(",", Enumerable.Range(0, areaCount).Select(i => perAreaTruth.TryGetValue(i, out var s) ? s.Count : 0))}]");
+
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        if (!WaitScan(w, 300)) { Console.WriteLine("FAILED: load"); CloseNow(w); return; }
+        WaitBlockStats(w, 300);
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "Find blocks");
+        Pump(1.0);
+
+        var map = (TerrainView)w.FindNamed<Control>("Map")!;
+        var tab = w.FindNamed<FindBlocksTab>("FindBlocksView")!;
+        var row = tab.FindNamed<ScopeBar>("Scope")!;
+        var strip = row.FindControl<StackPanel>("AreaStrip")!;
+        var reset = row.FindControl<Button>("ScopeClearBtn")!;
+        var clear = row.FindControl<Button>("AreaClearBtn")!;
+        var build = tab.FindControl<Button>("FilterBuildBtn")!;
+
+        List<Button> Chips() => strip.Children.OfType<Button>().ToList();
+        void Click(Button b) { b.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Pump(1.2); }
+        void ClickChip(int number)
+        {
+            var chip = Chips().FirstOrDefault(c => (c.Content as string) == number.ToString());
+            if (chip is null) { Console.WriteLine($"chip {number} is not offered"); return; }
+            Click(chip);
+        }
+
+        // a clean tick set first: the codes restored from the previous session would widen every selection
+        SetText(w, "FilterSearchBox", "");
+        Pump(0.6);
+        var cleanPanel = w.FindNamed<StackPanel>("FilterListPanel")!;
+        foreach (var cb in Descendants(cleanPanel).OfType<CheckBox>().Where(x => x.IsChecked == true))
+            cb.IsChecked = false;
+        Pump(1.0);
+
+        // tick the code exactly as a user does: type it into the filter box, then tick the row that carries it
+        SetText(w, "FilterSearchBox", wideCode);
+        Pump(1.0);
+        var panel = w.FindNamed<StackPanel>("FilterListPanel")!;
+        var box = Descendants(panel).OfType<CheckBox>().FirstOrDefault(x => (x.Tag as string) == wideCode);
+        if (box is null) { Console.WriteLine($"FAILED: '{wideCode}' is not offered by the block list"); CloseNow(w); return; }
+        box.IsChecked = true;
+        Pump(1.5);
+
+        var cam0 = map.DisplayCenterWorld();
+        bool CameraStill() => Math.Abs(map.DisplayCenterWorld().wx - cam0.wx) < 0.5
+                              && Math.Abs(map.DisplayCenterWorld().wz - cam0.wz) < 0.5;
+
+        HashSet<(int Cx, int Cz)> Selected() => map.SelectedChunks.ToHashSet();
+        bool AllHaveCode(HashSet<(int Cx, int Cz)> sel)
+        {
+            var with = new HashSet<(int, int)>();
+            foreach (var set in perAreaTruth.Values) with.UnionWith(set);
+            return sel.All(with.Contains);
+        }
+
+        ClickChip(1);
+        var sel1 = Selected();
+        var want1 = perAreaTruth.TryGetValue(0, out var a0) ? a0 : new HashSet<(int, int)>();
+        var exact1 = sel1.SetEquals(want1);
+        var inArea1 = sel1.All(c => c.Cx >= rects[0].MinCx && c.Cx <= rects[0].MaxCx
+                                    && c.Cz >= rects[0].MinCz && c.Cz <= rects[0].MaxCz);
+        Console.WriteLine($"[chip 1] selected={sel1.Count} expected={want1.Count} exact={exact1} "
+                          + $"allHaveCode={AllHaveCode(sel1)} inArea1={inArea1} cameraStill={CameraStill()}");
+
+        // the overlay is not involved in any of this: build it, then keep clicking and watch it stay
+        build.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        for (var i = 0; i < 60 && map.Filter is null; i++) Pump(0.5);
+        Pump(1.0);
+        var overlayBuilt = map.Filter is not null;
+
+        Click(reset);
+        var selAll = Selected();
+        var wantAll = perAreaTruth.Values.SelectMany(x => x).ToHashSet();
+        var exactAll = selAll.SetEquals(wantAll);
+        Console.WriteLine($"[All] selected={selAll.Count} expected={wantAll.Count} exact={exactAll} "
+                          + $"allHaveCode={AllHaveCode(selAll)} overlayKept={map.Filter is not null} "
+                          + $"builtBefore={overlayBuilt} cameraStill={CameraStill()}");
+
+        Click(clear);
+        var clearedOk = map.SelectionCount == 0;
+        Console.WriteLine($"[Clear] selected={map.SelectionCount} overlayKept={map.Filter is not null} "
+                          + $"cameraStill={CameraStill()}");
+
+        // a code whose chunks sit in one area only must not pull chunks of the others
+        var narrow = truth.Where(kv => kv.Value.Count == 1).OrderBy(kv => kv.Value.Values.Sum(v => v.Count)).FirstOrDefault();
+        var narrowOk = true;
+        var narrowText = "(no code confined to one area)";
+        if (narrow.Key is not null)
+        {
+            Click(reset); // All for the wide code — cleared below anyway
+            Click(clear);
+            SetText(w, "FilterSearchBox", "");
+            Pump(0.6);
+            var wideBox = Descendants(panel).OfType<CheckBox>().FirstOrDefault(x => (x.Tag as string) == wideCode);
+            if (wideBox is not null) wideBox.IsChecked = false;
+            Pump(1.0);
+            SetText(w, "FilterSearchBox", narrow.Key);
+            Pump(1.0);
+            var narrowBox = Descendants(panel).OfType<CheckBox>().FirstOrDefault(x => (x.Tag as string) == narrow.Key);
+            if (narrowBox is not null) narrowBox.IsChecked = true;
+            Pump(1.5);
+            Click(reset);
+            var got = Selected();
+            var want = narrow.Value.Values.SelectMany(x => x).ToHashSet();
+            narrowOk = got.SetEquals(want);
+            narrowText = $"code='{narrow.Key}' area={(narrow.Value.Keys.First() + 1)} selected={got.Count} expected={want.Count} exact={narrowOk}";
+        }
+
+        Console.WriteLine($"[narrow] {narrowText}");
+        var ok = exact1 && inArea1 && AllHaveCode(sel1) && exactAll && AllHaveCode(selAll) && clearedOk
+                 && map.Filter is not null && overlayBuilt && narrowOk;
+        Console.WriteLine(ok
+            ? "RESULT: OK — the area list selects only the chunks that hold the ticked blocks"
+            : $"RESULT: FAIL — chip1={exact1}/{inArea1} all={exactAll} cleared={clearedOk} "
+              + $"overlay={map.Filter is not null} built={overlayBuilt} narrow={narrowOk}");
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
+
+    /// <summary>Chunk records the last <c>Truth</c> walk could not attribute to any area (see the [codes] line).</summary>
+    private static int ChunksOutsideAreas;
+
+    private static void AreaListProbe(string save, string? manyAreasSave, bool extra = false)
+    {
+        // ---- ground truth: code -> area numbers, from the scan histograms ----
+        Dictionary<string, SortedSet<int>> Truth(string path, out int areaCount, out List<(int Cx, int Cz)> columns)
+        {
+            using var f = VSSaveFile.OpenReadOnly(path);
+            var areas = ChunkAreas.Build(f);
+            var scan = SaveScanner.Scan(f, null, captureRaw: false);
+            var where = new Dictionary<string, SortedSet<int>>(StringComparer.Ordinal);
+            ChunksOutsideAreas = 0;
+            foreach (var cd in scan.Chunks)
+            {
+                var area = areas.AreaAt(cd.WorldX + 16.0, cd.WorldZ + 16.0);
+                if (area is null) { ChunksOutsideAreas++; continue; }
+                foreach (var kv in cd.BlockCodeCounts)
+                {
+                    if (kv.Value <= 0) continue;
+                    if (!where.TryGetValue(kv.Key, out var set)) where[kv.Key] = set = new SortedSet<int>();
+                    set.Add(area.Index + 1);
+                }
+            }
+            areaCount = areas.Areas.Count;
+            columns = areas.Areas.Select(a => (a.MinCx, a.MinCz)).ToList();
+            return where;
+        }
+
+        var truth = Truth(save, out var areaCount, out _);
+        Console.WriteLine($"=== arealist probe: {System.IO.Path.GetFileName(save)} (areas={areaCount}) ===");
+        // the code used for the "part of the areas" case must really be a proper subset, otherwise the check proves nothing
+        var subsetCode = truth.Where(kv => kv.Value.Count > 0 && kv.Value.Count < areaCount)
+            .OrderBy(kv => kv.Value.Count).ThenBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => kv.Key).FirstOrDefault();
+        var everywhereCode = truth.Where(kv => kv.Value.Count == areaCount)
+            .OrderByDescending(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Key).FirstOrDefault();
+        Console.WriteLine($"[truth] codes={truth.Count}; subset code='{subsetCode}' in areas [{string.Join(",", subsetCode is null ? new List<int>() : truth[subsetCode].ToList())}];"
+                          + $" everywhere code='{everywhereCode}' in {truth[everywhereCode ?? ""].Count} area(s)");
+        // a ticked code can match no area at all only if one of its chunk records belongs to no area; with every
+        // record attributed, the "nothing matches" branch cannot be reached by ticking, and this number says so
+        Console.WriteLine($"[codes] chunk records outside every area={ChunksOutsideAreas}, codes={truth.Count} "
+                          + $"=> a ticked code with no matching area is {(ChunksOutsideAreas == 0 ? "unreachable" : "possible")} on this save");
+
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        if (!WaitScan(w, 300)) { Console.WriteLine("FAILED: load"); CloseNow(w); return; }
+        WaitBlockStats(w, 300);
+        EnsureDataPanelOpen(w);
+
+        var findTab = w.FindNamed<FindBlocksTab>("FindBlocksView")!;
+        var scope = findTab.FindNamed<ScopeBar>("Scope")!;
+        var row = scope.FindControl<WrapPanel>("ScopeRow")!;
+        var group = scope.FindControl<StackPanel>("AreaGroup")!;
+        var strip = scope.FindControl<StackPanel>("AreaStrip")!;
+        var scroll = scope.FindControl<ScrollViewer>("AreaScroll")!;
+        var reset = scope.FindControl<Button>("ScopeClearBtn")!;
+        var clearBtn = scope.FindControl<Button>("AreaClearBtn")!;
+        var prev = scope.FindControl<Button>("AreaPrevBtn")!;
+        var next = scope.FindControl<Button>("AreaNextBtn")!;
+        var box = scope.FindControl<TextBox>("ScopeBox")!;
+        var label = scope.FindControl<TextBlock>("ScopeLabel")!;
+
+        // the scope object the row paints: the criteria talk about its kind, and the row itself only shows words
+        var scopeField = typeof(MainWindow).GetField("_filterScope",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        SearchScope Scope() => (SearchScope)scopeField.GetValue(w)!;
+
+        var map = (TerrainView)w.FindNamed<Control>("Map")!;
+        string Cam()
+        {
+            var (wx, wz) = map.DisplayCenterWorld();
+            return $"center=({wx:0},{wz:0}) overlay={(map.Filter is null ? "none" : "on")} "
+                   + $"selection={map.SelectionCount}";
+        }
+
+        List<Button> Chips() => strip.Children.OfType<Button>().ToList();
+        static List<Button> ChipsOf(ScopeBar bar) => (bar.FindControl<StackPanel>("AreaStrip")?.Children ?? default!).OfType<Button>().ToList();
+        int Ticked() => Chips().Count(b => b.Classes.Contains("accent"));
+        string ChipsText() => string.Join(",", Chips().Select(b => b.Content as string));
+        void Click(Button b) { b.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); Pump(1.2); }
+        // the whole visible tick set of the area list, read from the buttons themselves
+        List<int> ChipsAsAreas() => Chips().Select(b => int.Parse((string)b.Content!)).OrderBy(n => n).ToList();
+
+        bool TickCode(string code)
+        {
+            SetText(w, "FilterSearchBox", code);
+            Pump(0.8);
+            var panel = w.FindNamed<StackPanel>("FilterListPanel")!;
+            var cb = Descendants(panel).OfType<CheckBox>().FirstOrDefault(x => (x.Tag as string) == code);
+            if (cb is null) return false;
+            cb.IsChecked = true;
+            Pump(1.2);
+            return true;
+        }
+
+        void UntickAll()
+        {
+            SetText(w, "FilterSearchBox", "");
+            Pump(0.5);
+            var panel = w.FindNamed<StackPanel>("FilterListPanel")!;
+            foreach (var cb in Descendants(panel).OfType<CheckBox>().Where(x => x.IsChecked == true))
+                cb.IsChecked = false;
+            Pump(1.2);
+        }
+
+        // ---- (1) which tabs have an area list at all ----
+        var tabReport = new List<string>();
+        foreach (var (header, name) in new[]
+                 {
+                     ("Chunks", "ChunkDataView"), ("Entities", "EntitiesView"), ("Items", "ItemsView"),
+                     ("Players", "PlayersView"), ("Find blocks", "FindBlocksView")
+                 })
+        {
+            SelectDataTab(w, header);
+            var tab = w.FindNamed<Control>(name)!;
+            var bar = tab.FindNamed<ScopeBar>("Scope")!;
+            var g = bar.FindControl<StackPanel>("AreaGroup")!;
+            var s = bar.FindControl<StackPanel>("AreaStrip")!;
+            var proposals = bar.FindControl<StackPanel>("ScopeButtons")!;
+            var b = bar.FindControl<TextBox>("ScopeBox")!;
+            var captions = proposals.Children.OfType<Button>().Select(x => x.Content as string).ToList();
+            tabReport.Add($"{header}: areaChips={(g.IsVisible ? s.Children.Count : 0)} groupVisible={g.IsVisible}"
+                          + $" proposals=[{string.Join("|", captions)}] box={(b.IsVisible ? "yes" : "no")}");
+        }
+        foreach (var line in tabReport) Console.WriteLine("[tabs] " + line);
+        var onlyFindBlocks = tabReport.Take(4).All(t => t.Contains("areaChips=0"))
+                             && tabReport[4].Contains("areaChips=0"); // nothing ticked yet, so even here it is empty
+        var keepBoxAndProposals = tabReport.Take(4).All(t =>
+            t.Contains("This chunk on the map") && t.Contains("box=yes"));
+
+        // ---- (2) no selection: no list ----
+        SelectDataTab(w, "Find blocks");
+        Pump(0.6);
+        var emptyState = $"groupVisible={group.IsVisible} chips={Chips().Count} reset='{reset.Content}'";
+        Console.WriteLine("[no selection] " + emptyState);
+        Shot(w, "arealist_noselection");
+
+        // ---- (3) a code that occurs in part of the areas: only those areas are offered ----
+        // a save whose map has a single area has no proper-subset code at all: there the point of the step is the
+        // opposite one — a ticked code must still leave the list hidden, because a list of one item is not a list
+        var probeCode = subsetCode ?? everywhereCode;
+        var ticked = probeCode is not null && TickCode(probeCode);
+        var subsetAreas = ChipsAsAreas();
+        var subsetTruth = probeCode is null ? new List<int>() : truth[probeCode].ToList();
+        var subsetOk = subsetCode is null
+            ? ticked && Chips().Count == 0 && !group.IsVisible
+            : ticked && subsetAreas.SequenceEqual(subsetTruth) && group.IsVisible;
+        Console.WriteLine($"[subset] code='{probeCode}' proper-subset={subsetCode is not null} areas-on-the-map={areaCount} "
+                          + $"ticked={ticked} groupVisible={group.IsVisible} chips=[{ChipsText()}] "
+                          + $"truth=[{string.Join(",", subsetTruth)}] match={subsetOk} label='{Cut(label.Text)}'");
+        Console.WriteLine($"[tabs Find blocks · code ticked] areaChips={Chips().Count} groupVisible={group.IsVisible}");
+
+        // ---- (4) and it goes away with the selection ----
+        UntickAll();
+        Console.WriteLine($"[unticked] groupVisible={group.IsVisible} chips={Chips().Count}");
+
+        // ---- (5) a code that occurs in every area: all of them are offered ----
+        var tickedAll = TickCode(everywhereCode!);
+        var allAreas = ChipsAsAreas();
+        var allTruth = truth[everywhereCode!].ToList();
+        // a single-area save has no list to offer (a list of one item is not a list), so there the expectation is the
+        // opposite one: the code is ticked and the list stays away
+        var allListed = tickedAll && (areaCount <= 1
+            ? Chips().Count == 0 && !group.IsVisible
+            : allAreas.SequenceEqual(allTruth) && group.IsVisible);
+        Console.WriteLine($"[everywhere] code='{everywhereCode}' ticked={tickedAll} groupVisible={group.IsVisible} "
+                          + $"chips=[{ChipsText()}] truth=[{string.Join(",", allTruth)}] match={allListed} "
+                          + $"areas-on-the-map={areaCount}");
+
+        // ---- (6) geometry of the row at four widths (the area list is on it, with four chips) ----
+        var widths = new[] { 1280, 960, 900, 700 };
+        var geometryOk = true;
+        foreach (var width in widths)
+        {
+            if (width < 900) w.MinWidth = 0; // the window itself refuses to go below 900; the row still must hold
+            w.Width = width;
+            Pump(1.0);
+            var (overflow, minGap, lines) = MeasureRow(row);
+            var viewport = scroll.Viewport.Width;
+            var extent = scroll.Extent.Width;
+            Console.WriteLine($"[geometry {width}] row={row.Bounds.Width:0} rowHeight={row.Bounds.Height:0} lines={lines} "
+                              + $"overflow={overflow:0.###}px minGap={(minGap == double.MaxValue ? 0 : minGap):0.###}px "
+                              + $"chips={Chips().Count} stripViewport={viewport:0} stripExtent={extent:0} stripClipped={extent > viewport}");
+            // a row that sticks out, or a strip that would paint over its neighbours, fails here; the strip
+            // itself is allowed to be wider than its window — that is what the arrows are for
+            if (overflow > 0.5 || minGap < -0.5 || Chips().Count == 0) geometryOk = false;
+            if (width == 1280) Shot(w, "arealist_1280");
+            if (width == 700) Shot(w, "arealist_700");
+        }
+        w.MinWidth = 900;
+        w.Width = 1280;
+        Pump(1.0);
+
+        // ---- (7) All: every area from the list, then Clear: none of them ----
+        var camBeforeAll = Cam();
+        Click(reset);
+        Console.WriteLine($"[camera All] before[{camBeforeAll}] after[{Cam()}]");
+        var allTicked = Ticked();
+        var allChips = Chips().Count;
+        var allOk = allTicked == allChips && allChips == allTruth.Count && (label.Text ?? "").StartsWith("areas ");
+        Console.WriteLine($"[All] chips={allChips} ticked={allTicked} kind={Scope().Kind} label='{Cut(label.Text)}' box='{box.Text}' ok={allOk}");
+        Shot(w, "arealist_all");
+        var camBeforeClear = Cam();
+        Click(clearBtn);
+        Console.WriteLine($"[camera Clear] before[{camBeforeClear}] after[{Cam()}]");
+        var clearOk = Ticked() == 0 && group.IsVisible
+                      && Scope().Kind == SearchScope.ScopeKind.Everything && !Scope().HasRegion
+                      && (label.Text ?? "").StartsWith("the whole save") && string.IsNullOrEmpty(box.Text);
+        Console.WriteLine($"[Clear] ticked={Ticked()} kind={Scope().Kind} hasRegion={Scope().HasRegion} label='{Cut(label.Text)}' box='{(box.Text ?? "")}' ok={clearOk}");
+
+        // ---- (8) unticking the code hides the list again ----
+        UntickAll();
+        var hiddenAgain = !group.IsVisible && Chips().Count == 0;
+        Console.WriteLine($"[unticked again] groupVisible={group.IsVisible} chips={Chips().Count}");
+
+        if (extra)
+        {
+            // (9) two areas at once: the row must carry a union scope, and the box must say which areas
+            TickCode(everywhereCode!);
+            // the strip is rebuilt after every toggle, so a chip's command belongs to the set it was built from:
+            // the button must be looked up again before each click, or the second click toggles against a stale set
+            void ClickChip(int number)
+            {
+                var chip = Chips().FirstOrDefault(c => (c.Content as string) == number.ToString());
+                if (chip is null) Console.WriteLine($"[multi] chip {number} is not offered");
+                else Click(chip);
+            }
+            // build an overlay first: the camera/overlay behaviour the user reports is about a row that already
+            // has a picture on the map, not about an empty one
+            ClickChip(1);
+            var buildBtn = findTab.FindControl<Button>("FilterBuildBtn")!;
+            buildBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            for (var i = 0; i < 40 && map.Filter is null; i++) Pump(0.5);
+            Pump(1.0);
+            Console.WriteLine($"[camera after Show on map] {Cam()}");
+            var camBeforeChip = Cam();
+            ClickChip(1);
+            Console.WriteLine($"[camera chip 1] before[{camBeforeChip}] after[{Cam()}]");
+            ClickChip(3);
+            var tickedNums = Chips().Where(b => b.Classes.Contains("accent")).Select(b => b.Content as string);
+            Console.WriteLine($"[multi] ticked=[{string.Join(",", tickedNums)}] kind={Scope().Kind} "
+                              + $"areas=[{string.Join(",", Scope().Areas.Select(a => a.Index + 1))}] box='{box.Text}'");
+
+            // (10) a map selection: "The selection (N chunk(s))" must appear on the four tabs, and the area list
+            // must still stay away from them
+            map.FitToArea();
+            Pump(2.0);
+            Point MapPoint(double fx, double fy)
+                => map.TranslatePoint(new Point(map.Bounds.Width * fx, map.Bounds.Height * fy), w) ?? new Point(0, 0);
+            w.MouseDown(MapPoint(0.35, 0.35), MouseButton.Left, RawInputModifiers.Shift);
+            w.MouseMove(MapPoint(0.60, 0.60), RawInputModifiers.Shift);
+            w.MouseUp(MapPoint(0.60, 0.60), MouseButton.Left, RawInputModifiers.Shift);
+            Pump(1.0);
+            Console.WriteLine($"[selection] map chunks selected={map.SelectionCount}");
+            Console.WriteLine($"[camera selection] after[{Cam()}]");
+            foreach (var (header, name) in new[]
+                     {
+                         ("Chunks", "ChunkDataView"), ("Entities", "EntitiesView"),
+                         ("Items", "ItemsView"), ("Players", "PlayersView"), ("Find blocks", "FindBlocksView")
+                     })
+            {
+                SelectDataTab(w, header);
+                var tab = w.FindNamed<Control>(name)!;
+                var bar = tab.FindNamed<ScopeBar>("Scope")!;
+                var g2 = bar.FindControl<StackPanel>("AreaGroup")!;
+                var props = bar.FindControl<StackPanel>("ScopeButtons")!;
+                var caps = props.Children.OfType<Button>().Select(x => x.Content as string).ToList();
+                Console.WriteLine($"[selection {header}] areaChips={(g2.IsVisible ? ChipsOf(bar).Count : 0)} "
+                                  + $"proposals=[{string.Join("|", caps)}]");
+            }
+            SelectDataTab(w, "Find blocks");
+        }
+
+        // ---- (7) paging: a save with many areas (the strip is 168 px, so twelve chips must scroll) ----
+        var pagingOk = false;
+        string pagingLine = "(no many-area save given)";
+        if (manyAreasSave is not null)
+        {
+            var manyTruth = Truth(manyAreasSave, out var manyCount, out _);
+            var manyCode = manyTruth.Where(kv => kv.Value.Count == manyCount)
+                .OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Key).FirstOrDefault();
+            var w2 = new MainWindow { Width = 1280, Height = 800 };
+            w2.Show();
+            Pump(1.0);
+            ResetStatus(w2);
+            w2.OpenStartupFile(manyAreasSave);
+            if (!WaitScan(w2, 300)) Console.WriteLine("FAILED: load (many areas)");
+            WaitBlockStats(w2, 300);
+            EnsureDataPanelOpen(w2);
+            SelectDataTab(w2, "Find blocks");
+            var tab2 = w2.FindNamed<FindBlocksTab>("FindBlocksView")!;
+            var scope2 = tab2.FindNamed<ScopeBar>("Scope")!;
+            var strip2 = scope2.FindControl<StackPanel>("AreaStrip")!;
+            var scroll2 = scope2.FindControl<ScrollViewer>("AreaScroll")!;
+            var prev2 = scope2.FindControl<Button>("AreaPrevBtn")!;
+            var next2 = scope2.FindControl<Button>("AreaNextBtn")!;
+            List<Button> Chips2() => strip2.Children.OfType<Button>().ToList();
+
+            SetText(w2, "FilterSearchBox", manyCode ?? "");
+            Pump(1.0);
+            var panel2 = w2.FindNamed<StackPanel>("FilterListPanel")!;
+            var cb2 = Descendants(panel2).OfType<CheckBox>().FirstOrDefault(x => (x.Tag as string) == manyCode);
+            if (cb2 is not null) { cb2.IsChecked = true; Pump(1.5); }
+
+            var chips2 = Chips2();
+            var seen = new HashSet<int>();
+            void RecordSeen()
+            {
+                var viewport = scroll2.Viewport.Width;
+                var offset = scroll2.Offset.X;
+                foreach (var chip in chips2)
+                {
+                    var p = chip.TranslatePoint(new Point(0, 0), scroll2);
+                    if (p is null) continue;
+                    if (p.Value.X >= -0.5 && p.Value.X + chip.Bounds.Width <= viewport + 0.5) seen.Add(int.Parse((string)chip.Content!));
+                }
+            }
+
+            var offsets = new List<double>();
+            RecordSeen();
+            offsets.Add(scroll2.Offset.X);
+            for (var i = 0; i < 20 && next2.IsEnabled; i++)
+            {
+                next2.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Pump(0.4);
+                offsets.Add(scroll2.Offset.X);
+                RecordSeen();
+            }
+            // and back: every area that was skipped has to be reachable from the other side too
+            for (var i = 0; i < 20 && prev2.IsEnabled; i++)
+            {
+                prev2.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Pump(0.4);
+                RecordSeen();
+            }
+            var backAtStart = scroll2.Offset.X <= 0.5;
+            Shot(w2, "arealist_paging");
+            pagingOk = chips2.Count == manyCount && seen.Count == manyCount && offsets.Distinct().Count() > 1 && backAtStart;
+            pagingLine = $"areas={manyCount} chips={chips2.Count} extent={scroll2.Extent.Width:0} viewport={scroll2.Viewport.Width:0} "
+                         + $"offsets=[{string.Join(",", offsets.Select(o => o.ToString("0")))}] areasSeen={seen.Count}/{manyCount} backAtStart={backAtStart}";
+            Console.WriteLine("[paging] " + pagingLine);
+
+            // All while part of the long list is out of view: it must tick every area, not only the visible ones
+            for (var i = 0; i < 20 && next2.IsEnabled; i++)
+            {
+                next2.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Pump(0.3);
+            }
+            var reset2 = scope2.FindControl<Button>("ScopeClearBtn")!;
+            var box2 = scope2.FindControl<TextBox>("ScopeBox")!;
+            var offsetAtAll = scroll2.Offset.X;
+            reset2.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.2);
+            var chipsAll = Chips2();
+            var tickedByAll = chipsAll.Count(b => b.Classes.Contains("accent"));
+            Console.WriteLine($"[paging All] offsetBefore={offsetAtAll:0} chips={chipsAll.Count} ticked={tickedByAll} "
+                              + $"box='{box2.Text}' ok={tickedByAll == chipsAll.Count && chipsAll.Count == manyCount}");
+
+            var row2 = scope2.FindControl<WrapPanel>("ScopeRow")!;
+            foreach (var width in new[] { 1280, 700 })
+            {
+                if (width < 900) w2.MinWidth = 0;
+                w2.Width = width;
+                Pump(1.0);
+                var (overflowBig, minGapBig, linesBig) = MeasureRow(row2);
+                Console.WriteLine($"[geometry {manyCount} areas {width}] overflow={overflowBig:0.###}px "
+                                  + $"minGap={(minGapBig == double.MaxValue ? 0 : minGapBig):0.###}px lines={linesBig} "
+                                  + $"chips={Chips2().Count} stripViewport={scroll2.Viewport.Width:0} stripExtent={scroll2.Extent.Width:0}");
+            }
+            // the gaps INSIDE the list: the row metric only looks at the five controls of the row, and a list whose
+            // buttons are 2 px apart by layout can never prove them apart from overlap — this measures them
+            var chipRects = new List<(double L, double R)>();
+            foreach (var chip in Chips2())
+            {
+                var at = chip.TranslatePoint(new Point(0, 0), scroll2);
+                if (at is null) continue;
+                chipRects.Add((at.Value.X, at.Value.X + chip.Bounds.Width));
+            }
+            chipRects.Sort((a, b) => a.L.CompareTo(b.L));
+            var chipGap = double.MaxValue;
+            for (var i = 1; i < chipRects.Count; i++)
+                chipGap = Math.Min(chipGap, chipRects[i].L - chipRects[i - 1].R);
+            Console.WriteLine($"[chip gaps] chips={chipRects.Count} "
+                              + $"minGap={(chipGap == double.MaxValue ? 0 : chipGap):0.###}px "
+                              + $"overlaps={(chipGap < -0.5 ? "yes" : "no")}");
+
+            w2.MinWidth = 900;
+            w2.Width = 1280;
+            Pump(0.6);
+            CloseNow(w2);
+            Pump(0.5);
+        }
+
+        if (areaCount <= 1)
+        {
+            // the four- and twelve-area assertions below are about a list that exists at all; on a one-area save the
+            // run is only good for the "a ticked code leaves no list" state, which is exactly what it printed
+            Console.WriteLine($"RESULT: N/A — the save has a single area: the list stayed hidden ({emptyState}) and with a "
+                              + $"ticked code too ([tabs Find blocks · code ticked] areaChips={Chips().Count} groupVisible={group.IsVisible})");
+            CloseNow(w);
+            Pump(0.5);
+            Console.WriteLine("DONE");
+            return;
+        }
+
+        var ok = onlyFindBlocks && keepBoxAndProposals && !emptyState.Contains("groupVisible=True")
+                 && subsetOk && allListed && geometryOk && allOk && clearOk && hiddenAgain && pagingOk;
+        // This mode still measures the geometry and paging of the row (both unaffected by what drives the chips),
+        // but its code-driven assertions describe the SUPERSEDED contract: the chips now edit the chunk selection,
+        // and that is what "areaselect" measures. Kept because the geometry numbers in the proof come from here.
+        Console.WriteLine($"RESULT: LEGACY — row geometry and paging measured (geometry={geometryOk} paging={pagingOk}); "
+                          + $"the list no longer follows the ticked codes (that is now what areaselect checks): "
+                          + $"subset={subsetOk} listed={allListed} all={allOk}({allTicked}/{allChips}) clear={clearOk}");
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
+
+    /// <summary>
+    ///     Waits for the published scan model. NOT for the window's "opened:" line: on a small save the map is
+    ///     ready so fast that the line has already become "Map ready: …" and the probe would wait out its budget
+    ///     on a window that is in fact loaded.
+    /// </summary>
+    private static bool WaitScan(Window w, double maxSeconds)
+    {
+        var end = DateTime.UtcNow.AddSeconds(maxSeconds);
+        while (DateTime.UtcNow < end)
+        {
+            Dispatcher.UIThread.RunJobs();
+            try { AvaloniaHeadlessPlatform.ForceRenderTimerTick(); } catch { }
+            if (TextOf(w, "ScanStatusText").Contains("Scan complete")) return true;
+            Thread.Sleep(40);
+        }
+        return false;
+    }
+
+    /// <summary>Waits until the block histogram of the scan is ready: the area list needs it, the tabs do not.</summary>
+    private static void WaitBlockStats(Window w, double maxSeconds)
+    {
+        var end = DateTime.UtcNow.AddSeconds(maxSeconds);
+        while (DateTime.UtcNow < end)
+        {
+            Dispatcher.UIThread.RunJobs();
+            try { AvaloniaHeadlessPlatform.ForceRenderTimerTick(); } catch { }
+            if (TextOf(w, "ScanStatusText").Contains("block statistics")) return;
+            Thread.Sleep(40);
+        }
+    }
+
+    /// <summary>
+    ///     How the scope row sits in its own bounds: the largest overhang of a child past the right/left edge,
+    ///     the smallest horizontal gap between neighbours on one line, and how many lines it wrapped into.
+    ///     Wrapping is not overflow — a wrapped control is still inside the row and over nothing.
+    /// </summary>
+    private static (double Overflow, double MinGap, int Lines) MeasureRow(WrapPanel row)
+    {
+        var kids = row.Children.OfType<Control>().Where(c => c.IsVisible).ToList();
+        var rects = new List<(double L, double T, double R, double B)>();
+        double overflow = 0;
+        foreach (var k in kids)
+        {
+            var p = k.TranslatePoint(new Point(0, 0), row);
+            if (p is null) continue;
+            var r = new Rect(p.Value, k.Bounds.Size);
+            rects.Add((r.Left, r.Top, r.Right, r.Bottom));
+            overflow = Math.Max(overflow, r.Right - row.Bounds.Width);
+            overflow = Math.Max(overflow, -r.Left);
+        }
+
+        // "same line" is vertical overlap, not equal Top: children are centred and have different heights
+        bool SameLine((double L, double T, double R, double B) a, (double L, double T, double R, double B) b)
+            => a.B > b.T + 0.5 && b.B > a.T + 0.5;
+
+        double minGap = double.MaxValue;
+        foreach (var a in rects)
+        {
+            (double L, double T, double R, double B)? nearest = null;
+            foreach (var b in rects)
+            {
+                if (ReferenceEquals(a, b) || !SameLine(a, b) || b.L < a.R - 1) continue; // not to the right on this line
+                if (nearest is null || b.L < nearest.Value.L) nearest = b;
+            }
+            if (nearest is { } n) minGap = Math.Min(minGap, n.L - a.R);
+        }
+
+        // lines: children of one line share the vertical centre axis, so cluster by centre. Clustering by
+        // "nothing overlaps me and starts higher" counts a short button and the tall box beside it as two lines,
+        // which is how the first run printed three lines for a row that draws two.
+        var lines = 0;
+        double? previousCentre = null;
+        foreach (var centre in rects.Select(r => (r.T + r.B) / 2).OrderBy(c => c))
+        {
+            if (previousCentre is null || centre - previousCentre.Value > 12) lines++;
+            previousCentre = centre;
+        }
+        return (overflow, minGap, lines);
+    }
+
     private static string Sha256(string path)
     {
         using var fs = System.IO.File.OpenRead(path);
@@ -5111,6 +5947,167 @@ internal static class Harness
 
     private static string Describe(IBrush? b)
         => b is ISolidColorBrush s ? s.Color.ToString() : (b?.ToString() ?? "(null)");
+
+    /// <summary>
+    ///     "Select all / Deselect all" in the block list must act on the searched subset only: the list is filtered by
+    ///     the search box, so a code ticked before the search was typed is not in it and must keep its tick.
+    /// </summary>
+    private static void SelectAllProbe(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        if (!WaitScan(w, 300)) { Console.WriteLine("FAILED: load"); return; }
+        WaitBlockStats(w, 300);
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "Find blocks");
+
+        var panel = w.FindNamed<StackPanel>("FilterListPanel")!;
+        var search = w.FindNamed<TextBox>("FilterSearchBox")!;
+
+        List<CheckBox> Boxes() => Descendants(panel).OfType<CheckBox>().ToList();
+        List<string> ShownCodes() => Boxes().Select(b => b.Tag as string ?? "").Where(c => c.Length > 0).ToList();
+        bool IsTicked(string code) => Boxes().Any(b => (b.Tag as string) == code && b.IsChecked == true);
+        void Search(string text) { search.Text = text; Pump(1.2); }
+
+        // the two buttons are created per rebuild and carry their Name as a property, not in a XAML namescope,
+        // so they are looked up by that property rather than by FindControl
+        Button? Named(string name) => Descendants(panel).OfType<Button>().FirstOrDefault(b => b.Name == name);
+
+        Console.WriteLine($"=== selectall probe: {System.IO.Path.GetFileName(save)} ===");
+        Search("");
+        var all = ShownCodes();
+        Console.WriteLine($"[all codes] {all.Count}: [{string.Join(",", all)}]");
+
+        // a term that covers more than one code makes the bulk action mean something; the outside code is one the
+        // term does not match, so it must survive both bulk clicks untouched
+        var prefix = all.Select(c => c.Split('-')[0])
+            .GroupBy(x => x).Where(g => g.Count() >= 2)
+            .OrderByDescending(g => g.Count()).ThenBy(g => g.Key, StringComparer.Ordinal)
+            .Select(g => g.Key).FirstOrDefault();
+        var group = prefix is null
+            ? all.Take(1).ToList()
+            : all.Where(c => c.StartsWith(prefix + "-", StringComparison.OrdinalIgnoreCase)).ToList();
+        var outside = all.FirstOrDefault(c => !group.Contains(c));
+        Console.WriteLine($"[plan] term='{prefix}' covers {group.Count} code(s): [{string.Join(",", group)}]; "
+                          + $"outside='{outside}'");
+
+        // tick the outside code first: it is the one the bulk action must never reach
+        Search(outside ?? "");
+        var outsideTicked = false;
+        var outsideBox = Boxes().FirstOrDefault(b => (b.Tag as string) == outside);
+        if (outsideBox is not null)
+        {
+            outsideBox.IsChecked = true;
+            Pump(0.8);
+            outsideTicked = IsTicked(outside!);
+        }
+
+        Search(prefix ?? "");
+        var shown = ShownCodes();
+        var shownBefore = shown.Count(IsTicked);
+        var selectAll = Named("FilterSelectAllBtn");
+        var deselectAll = Named("FilterDeselectAllBtn");
+        Console.WriteLine($"[buttons] select='{selectAll?.Content}' deselect='{deselectAll?.Content}' "
+                          + $"selectEnabled={selectAll?.IsEnabled} deselectEnabled={deselectAll?.IsEnabled}");
+        Console.WriteLine($"[shown] term='{prefix}' -> {shown.Count} row(s): [{string.Join(",", shown)}] "
+                          + $"tickedBefore={shownBefore}");
+
+        var selectOk = false;
+        if (selectAll is not null && shown.Count > 0)
+        {
+            selectAll.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.2);
+            var tickedAfter = shown.Count(IsTicked);
+            selectOk = tickedAfter == shown.Count;
+            Console.WriteLine($"[Select all] ticked={tickedAfter}/{shown.Count} selectEnabled={selectAll.IsEnabled} "
+                              + $"deselectEnabled={deselectAll?.IsEnabled} status='{Cut(TextOf(w, "FilterStatusText"))}'");
+        }
+
+        Search(outside ?? "");
+        var outsideAfterSelect = outsideTicked && IsTicked(outside!);
+        Console.WriteLine($"[outside after Select all] code='{outside}' stillTicked={outsideAfterSelect}");
+        Shot(w, "selectall_after_select");
+
+        Search(prefix ?? "");
+        var deselectOk = false;
+        if (deselectAll is not null && ShownCodes().Count > 0)
+        {
+            deselectAll.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.2);
+            var tickedAfter = ShownCodes().Count(IsTicked);
+            deselectOk = tickedAfter == 0;
+            Console.WriteLine($"[Deselect all] ticked={tickedAfter}/{shown.Count} status='{Cut(TextOf(w, "FilterStatusText"))}'");
+        }
+
+        Search(outside ?? "");
+        var outsideAfterDeselect = outsideTicked && IsTicked(outside!);
+        Console.WriteLine($"[outside after Deselect all] code='{outside}' stillTicked={outsideAfterDeselect}");
+
+        // in the same state the buttons report that there is nothing to do
+        Search(prefix ?? "");
+        var idleOk = true;
+        if (selectAll is not null && deselectAll is not null && ShownCodes().Count > 0)
+        {
+            selectAll.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.0);
+            idleOk = !selectAll.IsEnabled && deselectAll.IsEnabled;
+            Console.WriteLine($"[state] after Select all: selectEnabled={selectAll.IsEnabled} "
+                              + $"deselectEnabled={deselectAll.IsEnabled} status='{Cut(TextOf(w, "FilterStatusText"))}'");
+        }
+
+        // The list draws at most 250 rows. When a term matches more, the report must say that the bulk action covered
+        // only what is visible instead of pretending it ticked every match.
+        var capOk = true;
+        Search("-");
+        var header = Descendants(panel).OfType<TextBlock>().FirstOrDefault()?.Text ?? "";
+        var shownNow = ShownCodes().Count;
+        Console.WriteLine($"[header] '{Cut(header)}' shown={shownNow}");
+        if (shownNow >= 250 && header.Contains("showing 250"))
+        {
+            Named("FilterDeselectAllBtn")?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.0);
+            Named("FilterSelectAllBtn")?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.5);
+            var status = TextOf(w, "FilterStatusText");
+            capOk = status.Contains("are not shown", StringComparison.OrdinalIgnoreCase);
+            Console.WriteLine($"[cap] shown={shownNow} status='{Cut(status)}' saysNotShown={capOk}");
+        }
+        else
+        {
+            Console.WriteLine($"[cap] not exercised on this save: the term matches {shownNow} code(s), the list holds them all");
+        }
+
+        // the pair sits inside the list, so the toolbar does not grow: check it stays within the panel
+        var bulkRow = Descendants(panel).OfType<StackPanel>()
+            .FirstOrDefault(sp => sp.Children.OfType<Button>().Any(b => b.Name == "FilterSelectAllBtn"));
+        var bulkOk = true;
+        if (bulkRow is not null)
+        {
+            var right = bulkRow.Children.OfType<Control>().Max(c => c.Bounds.Right);
+            var panelWidth = panel.Bounds.Width;
+            bulkOk = right <= panelWidth + 0.5;
+            Console.WriteLine($"[layout] panelWidth={panelWidth:0} bulkRowRight={right:0} overflows={!(right <= panelWidth + 0.5)} "
+                              + $"note='{bulkRow.Children.OfType<TextBlock>().LastOrDefault()?.Text}'");
+            var toolbar = w.FindNamed<StackPanel>("DataToolbar") ?? null;
+            if (toolbar is not null)
+                Console.WriteLine($"[layout] toolbar width={toolbar.Bounds.Width:0} (unchanged by the pair)");
+        }
+
+        Shot(w, "selectall_row");
+        var ok = bulkOk && outsideTicked && group.Count > 0 && selectOk && outsideAfterSelect && deselectOk
+                 && outsideAfterDeselect && idleOk && capOk;
+        Console.WriteLine(ok
+            ? "RESULT: OK — select/deselect all act on the searched rows only; the code outside the list keeps its tick"
+            : $"RESULT: FAIL — outsideTicked={outsideTicked} group={group.Count} select={selectOk} "
+              + $"outsideAfterSelect={outsideAfterSelect} deselect={deselectOk} "
+              + $"outsideAfterDeselect={outsideAfterDeselect} idle={idleOk} cap={capOk} layout={bulkOk}");
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
 
     private static void Pump(double seconds)
     {

@@ -29,6 +29,15 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private readonly HashSet<string> _filterCodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, Color> _filterColors = new(); // id -> highlight colour
 
+    // The rows the current search shows, with their checkboxes: "select all" applies to exactly this set, so a code
+    // ticked before the search was typed is never reached by it. _matchedCount also counts the matches the list is
+    // too short to draw, so the report can tell the difference between "all matches" and "all shown".
+    private readonly List<(string Code, CheckBox Box)> _shownBoxes = new();
+    private int _matchedCount;
+    private bool _bulkToggling; // a bulk change sets the checkboxes itself; their handlers must not redo it per row
+    private Button? _selectShownBtn;
+    private Button? _deselectShownBtn;
+
     private readonly Flyout _historyFlyout;
     private readonly PlayersTabService _players; // the "Players" tab (Services/PlayersTabService.cs)
 
@@ -1092,6 +1101,11 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         foreach (var code in _filterCodes)
         foreach (var id in reg.IdsOf(code))
             _filterColors[id] = TerrainView.HighlightColor(code, id);
+
+        _shownBoxes.Clear();
+        _matchedCount = matched.Count;
+        FilterListPanel.Children.Add(BuildBulkRow(shown.Count, matched.Count));
+
         foreach (var kv in shown)
         {
             var code = kv.Key;
@@ -1121,11 +1135,110 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             cb.IsCheckedChanged += OnFilterCodeToggled;
             row.Children.Add(cb);
             FilterListPanel.Children.Add(row);
+            _shownBoxes.Add((code, cb));
         }
 
+        UpdateBulkButtons();
         FilterBuildBtn.IsEnabled = matched.Count > 0;
         UpdateRemoveBlocksEnabled();
         UpdateFilterStatus();
+        // the area list follows the ticked codes: it appears with the first tick and loses an area whose code
+        // was unticked, so the row has to be redrawn together with the list
+        UpdateScopeBars();
+    }
+
+    /// <summary>
+    ///     The row under the list header: tick or untick every code the current search shows. It sits with the rows
+    ///     rather than in the toolbar because it acts on the list, not on the map or on the selection.
+    /// </summary>
+    private Control BuildBulkRow(int shownCount, int matchedCount)
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, Margin = new Thickness(0, 2, 0, 4) };
+        _selectShownBtn = new Button
+        {
+            Name = "FilterSelectAllBtn",
+            Content = "Select all shown",
+            Padding = new Thickness(8, 2),
+            FontSize = 12
+        };
+        ToolTip.SetTip(_selectShownBtn,
+            "Tick every code the search shows. Codes that are not in the list stay exactly as they are.");
+        _deselectShownBtn = new Button
+        {
+            Name = "FilterDeselectAllBtn",
+            Content = "Deselect all shown",
+            Padding = new Thickness(8, 2),
+            FontSize = 12
+        };
+        ToolTip.SetTip(_deselectShownBtn,
+            "Untick every code the search shows. Codes that are not in the list stay exactly as they are.");
+        _selectShownBtn.Click += (_, _) => BulkToggleShown(select: true);
+        _deselectShownBtn.Click += (_, _) => BulkToggleShown(select: false);
+        row.Children.Add(_selectShownBtn);
+        row.Children.Add(_deselectShownBtn);
+        // the count says which set the two buttons act on, so nobody has to guess whether "all" means all matches
+        row.Children.Add(new TextBlock
+        {
+            Text = shownCount == matchedCount
+                ? $"applies to the {shownCount:N0} shown"
+                : $"applies to the {shownCount:N0} shown of {matchedCount:N0} matches",
+            FontSize = 11,
+            Opacity = 0.7,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        return row;
+    }
+
+    /// <summary>
+    ///     Tick (or untick) the codes of the current search only. The shown set comes from the filter, so a code
+    ///     ticked before the search was typed keeps its tick — a bulk action that reached it would change the
+    ///     overlay under an action that looked local. One settings write and one row refresh happen for the whole
+    ///     batch instead of one per checkbox.
+    /// </summary>
+    private void BulkToggleShown(bool select)
+    {
+        var shown = _shownBoxes.Select(b => b.Code).ToList();
+        if (shown.Count == 0) return;
+
+        _bulkToggling = true;
+        int changed;
+        try
+        {
+            changed = BlockCodeSelection.Apply(shown, _filterCodes, select);
+            if (_save is not null)
+                foreach (var code in shown)
+                foreach (var id in _save.BlockRegistry.IdsOf(code))
+                    _filterColors[id] = TerrainView.HighlightColor(code, id);
+            foreach (var (code, box) in _shownBoxes) box.IsChecked = _filterCodes.Contains(code);
+        }
+        finally
+        {
+            _bulkToggling = false;
+        }
+
+        UpdateBulkButtons();
+        UpdateRemoveBlocksEnabled();
+        SaveSettings();
+        UpdateScopeBars();
+        UpdateFilterStatus();
+        var hidden = Math.Max(0, _matchedCount - shown.Count);
+        var hiddenNote = hidden > 0 ? $" ({hidden:N0} more match(es) are not shown - refine the search)" : "";
+        var verb = select ? "Ticked" : "Unticked";
+        Status.Set(StatusChannel.Filter,
+            changed == 0
+                ? (select
+                    ? $"Nothing to tick: all {shown.Count:N0} shown code(s) are already ticked.{hiddenNote}"
+                    : $"Nothing to untick: none of the {shown.Count:N0} shown code(s) is ticked.{hiddenNote}")
+                : $"{verb} {changed:N0} of {shown.Count:N0} shown code(s); {_filterCodes.Count:N0} code(s) selected in total.{hiddenNote}");
+    }
+
+    private void UpdateBulkButtons()
+    {
+        if (_selectShownBtn is null || _deselectShownBtn is null) return;
+        var shownCount = _shownBoxes.Count;
+        var tickedShown = BlockCodeSelection.CountTicked(_shownBoxes.Select(b => b.Code), _filterCodes);
+        _selectShownBtn.IsEnabled = shownCount > 0 && tickedShown < shownCount;
+        _deselectShownBtn.IsEnabled = tickedShown > 0;
     }
 
     /// <summary>
@@ -1149,6 +1262,9 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private void OnFilterCodeToggled(object? sender, RoutedEventArgs e)
     {
         if (sender is not CheckBox cb || cb.Tag is not string code) return;
+        // a bulk change writes the whole set and then stamps the boxes; letting each box repeat that per row would
+        // save the settings and redraw the row dozens of times for one click
+        if (_bulkToggling) return;
         if (cb.IsChecked == true) _filterCodes.Add(code);
         else _filterCodes.Remove(code);
         // pin the colour to ALL ids of this code so the map and the legend match
@@ -1156,8 +1272,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             foreach (var id in _save.BlockRegistry.IdsOf(code))
                 _filterColors[id] = TerrainView.HighlightColor(code, id);
         UpdateRemoveBlocksEnabled();
+        UpdateBulkButtons();
         SaveSettings();
         UpdateFilterStatus();
+        // The area list of the row is an editor of the chunk selection, so ticking a code changes nothing about it —
+        // and the scope stays what the user asked for. Only the row and the status need a redraw.
+        UpdateScopeBars();
     }
 
     /// <summary>
@@ -1586,8 +1706,13 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         var reg = _save?.BlockRegistry;
         var top = map.IdCells.OrderByDescending(kv => kv.Value).Take(4)
             .Select(kv => $"{reg?.CodeOf(kv.Key) ?? "id:" + kv.Key}: {kv.Value:N0}");
+        // The picture on the map is kept when the scope changes (choosing or clearing an area must not wipe it),
+        // so the line has to say which scope it actually shows — otherwise the numbers read as the new scope's.
+        var builtFor = _filterMapScope is { } built ? built.Label : "the whole save";
+        var scopeNow = _filterScope.HasRegion && !_filterScope.IsEmpty ? _filterScope.Label : "the whole save";
+        var stale = builtFor != scopeNow ? $"built for {builtFor} — Show on map to rebuild | " : "";
         Status.Set(StatusChannel.Filter,
-            $"codes: {_filterCodes.Count} | columns: {map.HitColumns:N0} | blocks: {map.MatchCells:N0}"
+            stale + $"codes: {_filterCodes.Count} | columns: {map.HitColumns:N0} | blocks: {map.MatchCells:N0}"
             + (_filterScope.HasRegion && !_filterScope.IsEmpty ? $" in {_filterScope.Label}" : "")
             + (elapsedMs > 0 ? $" | {elapsedMs} ms" : "")
             + (map.IdCells.Count > 0 ? " | " + string.Join(", ", top) : " | no matches"));
@@ -2662,6 +2787,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 $"Scan complete in {scanMs} ms + block statistics in {sw.ElapsedMilliseconds} ms — " +
                 $"{data.EntityCount} entities, {data.BlockEntityCount} block entities, {data.Chunks.Count} chunks.");
             RefreshDumpForSelection(Map.SelectionBounds);
+            DropCodesMissingFromThisSave();
             PopulateFilterList();
             if (_settings.OverlayEnabled && _filterCodes.Count > 0)
                 BuildFilterOverlay();
@@ -2672,6 +2798,23 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             if (_scan.IsCurrent(scan))
                 Status.Set(StatusChannel.Scan, $"Block statistics failed: {ex.Message}", priority: AppStatus.PriorityError);
         }
+    }
+
+    /// <summary>
+    ///     The ticked block codes are restored from the previous session, and the next save may simply not contain
+    ///     them. Such a code can never be found here, and it must not decide what an area click selects: with it left
+    ///     in the set every click would select nothing — the map would look broken rather than empty-to-be-ticked.
+    /// </summary>
+    private void DropCodesMissingFromThisSave()
+    {
+        if (ScanData is not { } data || _filterCodes.Count == 0) return;
+        var present = data.WorldBlockCodeCounts;
+        var gone = _filterCodes.Where(c => !present.ContainsKey(c)).ToArray();
+        if (gone.Length == 0) return;
+        foreach (var code in gone) _filterCodes.Remove(code);
+        Status.Set(StatusChannel.Search,
+            $"{gone.Length} restored block code(s) are not in this save and were unticked: {string.Join(", ", gone.Take(3))}"
+            + (gone.Length > 3 ? ", …" : ""));
     }
 
     /// <summary>

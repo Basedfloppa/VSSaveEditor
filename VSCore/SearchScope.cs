@@ -1,9 +1,11 @@
 using System.Globalization;
+using System.Linq;
 
 namespace VSCore;
 
 /// <summary>
-///     How far a tab's search reaches: the whole save, one map area, a rectangle of chunks, or one chunk column.
+///     How far a tab's search reaches: the whole save, one map area, several areas at once, a rectangle of chunks,
+///     or one chunk column.
 ///     The scope is 2D and has no Y borders: it is a set of (cx,cz) columns, and every Y level of those columns is inside.
 ///
 ///     Not every record of a save can be placed in such a scope. Playerdata has no coordinates at all — the player's
@@ -22,11 +24,18 @@ public sealed class SearchScope
         Rectangle,
         Column,
 
+        /// <summary>Two or more whole areas at once: their union, not the box around them (see <see cref="ForAreas" />).</summary>
+        Areas,
+
         /// <summary>Only the records without a position (playerdata): the one part of the save a chunk scope cannot narrow.</summary>
         Unplaced
     }
 
     private int _minCx, _minCz, _maxCx, _maxCz;
+
+    // The chosen areas of an area scope (one or several), whose union IS the scope. A rectangle cannot express
+    // several of them: two distant areas would take the gap between them along, and the gap belongs to no area.
+    private IReadOnlyList<ChunkArea>? _members;
 
     private SearchScope(ScopeKind kind, string label)
     {
@@ -49,8 +58,34 @@ public sealed class SearchScope
     public static SearchScope ForArea(ChunkArea area, int total)
         => new(ScopeKind.Area, area.Label(total))
         {
+            _members = new[] { area },
             _minCx = area.MinCx, _minCz = area.MinCz, _maxCx = area.MaxCx, _maxCz = area.MaxCz
         };
+
+    /// <summary>
+    ///     Several whole areas at once. The scope is their union: a chunk is inside when it is inside any one of
+    ///     them, so the empty gap between two distant areas is outside (a box around both would take it in and
+    ///     make the tab search - and count - places the user did not pick).
+    ///     One area is not a set: it goes through <see cref="ForArea" /> so that "area=2" and "areas=2" mean the
+    ///     same scope, with the same label.
+    /// </summary>
+    public static SearchScope ForAreas(IReadOnlyList<ChunkArea> areas, int total)
+    {
+        if (areas.Count == 0) return Everything;
+        if (areas.Count == 1) return ForArea(areas[0], total);
+
+        var ordered = areas.OrderBy(a => a.Index).ToArray();
+        var numbers = string.Join(", ", ordered.Select(a => a.Index + 1));
+        long columns = ordered.Sum(a => (long)a.Columns);
+        return new SearchScope(ScopeKind.Areas, $"areas {numbers} of {total} — {columns:N0} chunks")
+        {
+            _members = ordered,
+            _minCx = ordered.Min(a => a.MinCx),
+            _minCz = ordered.Min(a => a.MinCz),
+            _maxCx = ordered.Max(a => a.MaxCx),
+            _maxCz = ordered.Max(a => a.MaxCz)
+        };
+    }
 
     /// <summary>Chunk columns, inclusive on both ends; the ends are swapped when they come in reversed.</summary>
     public static SearchScope ForRectangle(int cx1, int cz1, int cx2, int cz2)
@@ -75,7 +110,11 @@ public sealed class SearchScope
     public int MaxCz => _maxCz;
 
     /// <summary>Whether the scope has a rectangle of chunks at all.</summary>
-    public bool HasRegion => Kind is ScopeKind.Area or ScopeKind.Rectangle or ScopeKind.Column;
+    public bool HasRegion => Kind is ScopeKind.Area or ScopeKind.Areas or ScopeKind.Rectangle or ScopeKind.Column;
+
+    /// <summary>The chosen areas of an area scope — one for <see cref="ScopeKind.Area" />, several for
+    /// <see cref="ScopeKind.Areas" />, empty for every other kind. The tab reconciles its ticks against this.</summary>
+    public IReadOnlyList<ChunkArea> Areas => _members ?? (IReadOnlyList<ChunkArea>)Array.Empty<ChunkArea>();
 
     /// <summary>A named scope that turns out to contain nothing: the tab then shows "0 of N" with the reason instead
     /// of silently falling back to the whole save.</summary>
@@ -100,11 +139,12 @@ public sealed class SearchScope
     {
         var t = (text ?? "").Trim();
         string tail;
-        if (t.StartsWith("area=", StringComparison.OrdinalIgnoreCase))
+        if (t.StartsWith("area=", StringComparison.OrdinalIgnoreCase) ||
+            t.StartsWith("areas=", StringComparison.OrdinalIgnoreCase))
         {
-            // the numbering of areas depends on the save, so a label cannot be parsed back into a rectangle;
-            // the caller resolves "area=N" against its own area list and builds the scope with ForArea
-            throw new FormatException("'area=' scopes are resolved by the caller against the area list, not parsed");
+            // the numbering of areas depends on the save, so a label cannot be parsed back into rectangles;
+            // the caller resolves "area=N" and "areas=1,3" against its own area list (ForArea / ForAreas)
+            throw new FormatException("'area=' and 'areas=' scopes are resolved by the caller against the area list, not parsed");
         }
 
         if (t.StartsWith("rect=", StringComparison.OrdinalIgnoreCase)) tail = t[5..];
@@ -140,11 +180,19 @@ public sealed class SearchScope
     ///     Whether the chunk column (cx,cz) is inside the scope. A chunk-sized record (<c>ChunkScanData</c>) is inside
     ///     exactly when its own column is: the scope never cuts a chunk in half. An empty rectangle and
     ///     <see cref="UnplacedOnly" /> both contain nothing — the equality below is not a rectangle test for them.
+    ///     For <see cref="ScopeKind.Areas" /> a column is inside when it is inside any one of the chosen areas; the
+    ///     union bounding box is only a cheap rejection first, because every chunk of the save is tested here.
     /// </summary>
     public bool ContainsChunk(int cx, int cz)
-        => Kind == ScopeKind.Unplaced
-            ? false
-            : !HasRegion || (cx >= _minCx && cx <= _maxCx && cz >= _minCz && cz <= _maxCz);
+    {
+        if (Kind == ScopeKind.Unplaced) return false;
+        if (!HasRegion) return true;
+        if (cx < _minCx || cx > _maxCx || cz < _minCz || cz > _maxCz) return false;
+        if (_members is null) return true;
+        foreach (var area in _members)
+            if (area.ContainsChunk(cx, cz)) return true;
+        return false;
+    }
 
     /// <summary>
     ///     Whether a record with exact world coordinates (an entity, a block entity, a container) is inside.
