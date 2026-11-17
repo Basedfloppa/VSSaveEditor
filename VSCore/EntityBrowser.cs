@@ -221,4 +221,25 @@ public static class EntityBrowser
             .Select(kv => (kv.Key, kv.Value))
             .ToList();
     }
+
+    /// <summary>
+    ///     The type hint of the current selection: only the names that are still in <paramref name="rows"/>, with how
+    ///     many rows carry each, most frequent first. The row set is the caller's selection (already narrowed by scope
+    ///     and text filter), so a type the selection left out gets no entry at all — the hint must not offer what the
+    ///     list does not show.
+    ///
+    ///     In "All" mode the hint takes the top of each kind separately (<paramref name="perKind"/> of creatures plus
+    ///     <paramref name="perKind"/> of block entities): block entities outnumber creatures by an order of magnitude,
+    ///     and one shared top would drop the creatures from the hint entirely.
+    /// </summary>
+    public static List<(string Name, int Count)> TypeCounts(IEnumerable<EntityRow> rows, EntityCategory category,
+        int perKind)
+    {
+        if (category != EntityCategory.All)
+            return TopNames(Filter(rows, category, null), perKind);
+
+        return TopNames(Filter(rows, EntityCategory.Entities, null), perKind)
+            .Concat(TopNames(Filter(rows, EntityCategory.BlockEntities, null), perKind))
+            .ToList();
+    }
 }

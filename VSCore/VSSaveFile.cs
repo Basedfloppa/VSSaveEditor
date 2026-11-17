@@ -353,13 +353,16 @@ public sealed class VSSaveFile : IDisposable
     /// <summary>
     ///     Clears the selected block ids in the WORKING COPY (the cells become air). The original
     ///     does not change; the result is a <see cref="BlockRemovalOutcome"/> with the working copy and original paths.
+    ///     <paramref name="scope" /> restricts the pass to the chunk columns it contains: every other chunk keeps its
+    ///     palette byte for byte, and <see cref="BlockRemovalOutcome.ChunksScanned" /> counts only the chunks inside.
+    ///     A scope with no chunk region at all (playerdata-only) contains nothing and rewrites nothing.
     /// </summary>
-    public BlockRemovalOutcome RemoveBlocks(IReadOnlyCollection<int> blockIds,
+    public BlockRemovalOutcome RemoveBlocks(IReadOnlyCollection<int> blockIds, SearchScope? scope = null,
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
         if (blockIds.Count == 0) throw new ArgumentException("no block ids", nameof(blockIds));
         using var conn = OpenWriteConnection();
-        var stats = RewriteBlocksCore(conn, blockIds, 0, progress, ct);
+        var stats = RewriteBlocksCore(conn, blockIds, 0, scope, progress, ct);
         return new BlockRemovalOutcome(Path, SourcePath ?? "", stats.Scanned, stats.Changed,
             stats.Fields, stats.Cleared, stats.BytesBefore, stats.BytesAfter);
     }
@@ -368,13 +371,14 @@ public sealed class VSSaveFile : IDisposable
     ///     Replaces the selected block ids with <paramref name="targetId" /> in the WORKING COPY (0 — air).
     ///     The original does not change. Only the palette changes, so the remaining chunk fields stay
     ///     untouched byte for byte (see <see cref="ChunkBlockRewriter.ReplaceBlockIds" />).
+    ///     <paramref name="scope" /> has the same meaning as in <see cref="RemoveBlocks" />.
     /// </summary>
-    public BlockReplaceOutcome ReplaceBlocks(IReadOnlyCollection<int> blockIds, int targetId,
+    public BlockReplaceOutcome ReplaceBlocks(IReadOnlyCollection<int> blockIds, int targetId, SearchScope? scope = null,
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
         if (blockIds.Count == 0) throw new ArgumentException("no block ids", nameof(blockIds));
         using var conn = OpenWriteConnection();
-        var stats = RewriteBlocksCore(conn, blockIds, targetId, progress, ct);
+        var stats = RewriteBlocksCore(conn, blockIds, targetId, scope, progress, ct);
         return new BlockReplaceOutcome(Path, SourcePath ?? "", stats.Scanned, stats.Changed,
             stats.Fields, stats.Cleared, stats.BytesBefore, stats.BytesAfter);
     }
@@ -1123,14 +1127,14 @@ public sealed class VSSaveFile : IDisposable
     /// into memory as a whole, and the edits run in one transaction — the copy is either fully updated or not at all.
     /// </summary>
     public static BlockRemovalOutcome CopyAndRemoveBlocks(string srcPath, IReadOnlyCollection<int> blockIds,
-        IProgress<double>? progress = null, CancellationToken ct = default)
+        IProgress<double>? progress = null, CancellationToken ct = default, SearchScope? scope = null)
     {
         if (blockIds.Count == 0) throw new ArgumentException("no block ids", nameof(blockIds));
         var (dir, copy, backup) = CreateWorkingCopy(srcPath);
         try
         {
             using var conn = OpenConnection(copy, SqliteOpenMode.ReadWrite);
-            var stats = RewriteBlocksCore(conn, blockIds, 0, progress, ct);
+            var stats = RewriteBlocksCore(conn, blockIds, 0, scope, progress, ct);
             return new BlockRemovalOutcome(copy, backup, stats.Scanned, stats.Changed,
                 stats.Fields, stats.Cleared, stats.BytesBefore, stats.BytesAfter);
         }
@@ -1146,14 +1150,14 @@ public sealed class VSSaveFile : IDisposable
     ///     modified; the `.bak` is created before the edits. Chunks are read in pages, the edits run in one transaction.
     /// </summary>
     public static BlockReplaceOutcome CopyAndReplaceBlocks(string srcPath, IReadOnlyCollection<int> blockIds,
-        int targetId, IProgress<double>? progress = null, CancellationToken ct = default)
+        int targetId, IProgress<double>? progress = null, CancellationToken ct = default, SearchScope? scope = null)
     {
         if (blockIds.Count == 0) throw new ArgumentException("no block ids", nameof(blockIds));
         var (dir, copy, backup) = CreateWorkingCopy(srcPath);
         try
         {
             using var conn = OpenConnection(copy, SqliteOpenMode.ReadWrite);
-            var stats = RewriteBlocksCore(conn, blockIds, targetId, progress, ct);
+            var stats = RewriteBlocksCore(conn, blockIds, targetId, scope, progress, ct);
             return new BlockReplaceOutcome(copy, backup, stats.Scanned, stats.Changed,
                 stats.Fields, stats.Cleared, stats.BytesBefore, stats.BytesAfter);
         }
@@ -1167,11 +1171,25 @@ public sealed class VSSaveFile : IDisposable
     private readonly record struct BlockRewriteStats(
         int Scanned, int Changed, int Fields, long Cleared, long BytesBefore, long BytesAfter);
 
-    /// <summary>Shared chunk pass for block removal/replacement: used both for a copy and for the working copy.</summary>
+    /// <summary>
+    ///     Shared chunk pass for block removal/replacement: used both for a copy and for the working copy.
+    ///     <paramref name="scope" /> filters by chunk COLUMN, decoded from `position` exactly as
+    ///     <see cref="DeleteChunkColumns" /> does. The filter is applied in memory rather than in SQL on purpose:
+    ///     the chunk blob lives in the same b-tree, so a WHERE on the bit-packed position would still read every
+    ///     page — there is nothing to save by making the query cleverer (see tmp/perf/profile-report.md).
+    ///     The paging cursor (`position`) moves through ALL rows, so progress is reported by rows visited, while
+    ///     <c>Scanned</c> counts only the chunks inside the scope; <c>BytesBefore</c>/<c>BytesAfter</c> likewise
+    ///     cover the chunks of the scope, that is the ones the pass actually examined.
+    /// </summary>
     private static BlockRewriteStats RewriteBlocksCore(SqliteConnection conn, IReadOnlyCollection<int> blockIds,
-        int targetId, IProgress<double>? progress, CancellationToken ct)
+        int targetId, SearchScope? scope, IProgress<double>? progress, CancellationToken ct)
     {
         var wanted = new HashSet<int>(blockIds);
+        // A scope that names no chunk column at all (playerdata-only) contains no chunk: scanning the whole table
+        // to change nothing would be pure cost, and "scanned 0 chunks" is the honest report.
+        if (scope is { IsEverything: false, HasRegion: false })
+            return new BlockRewriteStats(0, 0, 0, 0, 0, 0);
+
         int total;
         using (var cnt = conn.CreateCommand())
         {
@@ -1180,7 +1198,7 @@ public sealed class VSSaveFile : IDisposable
         }
 
         const int pageSize = 256;
-        int scanned = 0, changed = 0, fields = 0;
+        int scanned = 0, visited = 0, changed = 0, fields = 0;
         long cleared = 0, bytesBefore = 0, bytesAfter = 0, lastPos = long.MinValue;
 
         using var txn = conn.BeginTransaction();
@@ -1211,6 +1229,15 @@ public sealed class VSSaveFile : IDisposable
 
             foreach (var row in rows)
             {
+                visited++;
+                // Decode only for the rows that survive the paging cursor: the bit fields are the same encoding
+                // ChunkPosHelper.DecodeIndex reads in DeleteChunkColumns and in the chunk scan.
+                if (scope is not null)
+                {
+                    var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+                    if (!scope.ContainsChunk(cx, cz)) continue;
+                }
+
                 scanned++;
                 bytesBefore += row.Data.Length;
                 var rewritten = targetId == 0
@@ -1226,7 +1253,9 @@ public sealed class VSSaveFile : IDisposable
                 up.ExecuteNonQuery();
             }
             lastPos = rows[^1].Position;
-            if (progress is not null && total > 0) progress.Report((double)scanned / total);
+            // rows VISITED, not rows rewritten: with a scope the pass still walks the whole table, and a bar that
+            // stops at the share of the scope would read as a hang
+            if (progress is not null && total > 0) progress.Report((double)visited / total);
         }
         txn.Commit();
         progress?.Report(1.0);

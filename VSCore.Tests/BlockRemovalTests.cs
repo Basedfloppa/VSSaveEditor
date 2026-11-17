@@ -375,6 +375,156 @@ public class BlockRemovalTests
         Assert.Throws<ArgumentException>(() => VSSaveFile.CopyAndRemoveBlocks(t.Src, Array.Empty<int>()));
     }
 
+    // ---------- scope: where the pass is allowed to look ----------
+
+    /// <summary>
+    ///     A scope is a promise about WHICH chunks the pass looks at, not a hint. The fixture puts the same blob in two
+    ///     columns, so any leak of the edit outside the chosen column would show up as a mismatch against the very same
+    ///     bytes the untouched chunk must keep.
+    /// </summary>
+    [Fact(DisplayName = "CopyAndRemoveBlocks with a column scope: only the chunks inside the column are rewritten")]
+    public void CopyAndRemoveBlocks_ColumnScope_OnlyTouchesInsideChunks()
+    {
+        using var t = new TempSave();
+        int[] palette = { 0, 42, 43, 77 };
+        var cells = Pattern(palette);
+        CreateSave(t.Src,
+            (10, 0, 20, ChunkBlob(BuildField(palette, cells, compressPalette: false))),
+            (10, 1, 20, ChunkBlob(BuildField(palette, cells, compressPalette: true))),
+            (40, 0, 50, ChunkBlob(BuildField(palette, cells, compressPalette: false))));
+
+        var wanted = new HashSet<int> { 42, 77 };
+        var scope = SearchScope.ForColumn(40, 50);
+        var outcome = VSSaveFile.CopyAndRemoveBlocks(t.Src, wanted, scope: scope);
+
+        Assert.Equal(1, outcome.ChunksScanned);          // the scope holds one chunk, not three
+        Assert.Equal(1, outcome.ChunksChanged);
+        Assert.Equal(2, outcome.PaletteEntriesCleared);  // 42 and 77 of that one chunk
+        using (var copy = VSSaveFile.OpenReadOnly(outcome.CopyPath))
+        {
+            foreach (var row in copy.ChunkRowsWithData)
+            {
+                var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+                if (scope.ContainsChunk(cx, cz))
+                    AssertOnlyWantedChanged(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data), wanted);
+                else
+                    Assert.Equal(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data)); // byte-for-byte the same cells
+            }
+        }
+        using (var orig = VSSaveFile.OpenReadOnly(t.Src))
+        {
+            foreach (var row in orig.ChunkRowsWithData)
+                Assert.Equal(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data));
+        }
+    }
+
+    [Fact(DisplayName = "CopyAndReplaceBlocks with a column scope: the target block appears only inside the column")]
+    public void CopyAndReplaceBlocks_ColumnScope_OnlyTouchesInsideChunks()
+    {
+        using var t = new TempSave();
+        int[] palette = { 0, 42, 43, 77 };
+        var cells = Pattern(palette);
+        CreateSave(t.Src,
+            (10, 0, 20, ChunkBlob(BuildField(palette, cells, compressPalette: false))),
+            (40, 0, 50, ChunkBlob(BuildField(palette, cells, compressPalette: false))));
+
+        var wanted = new HashSet<int> { 42, 77 };
+        var scope = SearchScope.ForColumn(40, 50);
+        var outcome = VSSaveFile.CopyAndReplaceBlocks(t.Src, wanted, 5, scope: scope);
+
+        Assert.Equal(1, outcome.ChunksScanned);
+        Assert.Equal(1, outcome.ChunksChanged);
+        Assert.Equal(2, outcome.PaletteEntriesReplaced);
+        using (var copy = VSSaveFile.OpenReadOnly(outcome.CopyPath))
+        {
+            foreach (var row in copy.ChunkRowsWithData)
+            {
+                var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+                if (scope.ContainsChunk(cx, cz))
+                    AssertReplaced(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data), wanted, 5);
+                else
+                    Assert.Equal(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data));
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Several areas are their union, not the box around them: a chunk that sits between two distant areas is inside
+    ///     the bounding box and inside neither area, and must keep its blocks.
+    /// </summary>
+    [Fact(DisplayName = "CopyAndRemoveBlocks with two areas: a chunk in the gap between them is outside the scope")]
+    public void CopyAndRemoveBlocks_AreasScope_LeavesTheGapBetweenAreasAlone()
+    {
+        using var t = new TempSave();
+        int[] palette = { 0, 42, 43, 77 };
+        var cells = Pattern(palette);
+        CreateSave(t.Src,
+            (0, 0, 0, ChunkBlob(BuildField(palette, cells, compressPalette: false))),
+            (25, 0, 25, ChunkBlob(BuildField(palette, cells, compressPalette: false))),
+            (50, 0, 50, ChunkBlob(BuildField(palette, cells, compressPalette: false))));
+
+        var left = new ChunkArea { Index = 0, MinCx = 0, MinCz = 0, MaxCx = 1, MaxCz = 1, Columns = 4, Rows = 4 };
+        var right = new ChunkArea { Index = 1, MinCx = 50, MinCz = 50, MaxCx = 51, MaxCz = 51, Columns = 4, Rows = 4 };
+        var scope = SearchScope.ForAreas(new[] { left, right }, 2);
+
+        var wanted = new HashSet<int> { 42, 77 };
+        var outcome = VSSaveFile.CopyAndRemoveBlocks(t.Src, wanted, scope: scope);
+
+        Assert.Equal(2, outcome.ChunksScanned);
+        Assert.Equal(2, outcome.ChunksChanged);
+        using var copy = VSSaveFile.OpenReadOnly(outcome.CopyPath);
+        foreach (var row in copy.ChunkRowsWithData)
+        {
+            var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+            if (cx == 25 && cz == 25)
+                Assert.Equal(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data));
+            else
+                AssertOnlyWantedChanged(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data), wanted);
+        }
+    }
+
+    [Fact(DisplayName = "An Everything scope rewrites exactly what no scope does")]
+    public void CopyAndRemoveBlocks_EverythingScope_MatchesNoScope()
+    {
+        using var t = new TempSave();
+        int[] palette = { 0, 42, 43, 77 };
+        var cells = Pattern(palette);
+        CreateSave(t.Src,
+            (10, 0, 20, ChunkBlob(BuildField(palette, cells, compressPalette: false))),
+            (10, 1, 20, ChunkBlob(BuildField(palette, cells, compressPalette: true))));
+
+        var wanted = new HashSet<int> { 42, 77 };
+        var none = VSSaveFile.CopyAndRemoveBlocks(t.Src, wanted);
+        var everything = VSSaveFile.CopyAndRemoveBlocks(t.Src, wanted, scope: SearchScope.Everything);
+
+        Assert.Equal(none.ChunksScanned, everything.ChunksScanned);
+        Assert.Equal(none.ChunksChanged, everything.ChunksChanged);
+        Assert.Equal(none.PaletteEntriesCleared, everything.PaletteEntriesCleared);
+        Assert.Equal(none.FieldsRewritten, everything.FieldsRewritten);
+    }
+
+    /// <summary>
+    ///     A scope over records without a position (playerdata) names no chunk column at all. Scanning the whole table
+    ///     to change nothing would be pure cost, and the honest report is "checked 0 chunks".
+    /// </summary>
+    [Fact(DisplayName = "A scope with no chunks (playerdata) rewrites nothing and touches no blob")]
+    public void CopyAndRemoveBlocks_UnplacedScope_ChangesNothing()
+    {
+        using var t = new TempSave();
+        int[] palette = { 0, 42, 43, 77 };
+        var cells = Pattern(palette);
+        CreateSave(t.Src, (10, 0, 20, ChunkBlob(BuildField(palette, cells, compressPalette: false))));
+
+        var outcome = VSSaveFile.CopyAndRemoveBlocks(t.Src, new HashSet<int> { 42, 77 }, scope: SearchScope.UnplacedOnly);
+
+        Assert.Equal(0, outcome.ChunksScanned);
+        Assert.Equal(0, outcome.ChunksChanged);
+        Assert.Equal(0, outcome.PaletteEntriesCleared);
+        using var copy = VSSaveFile.OpenReadOnly(outcome.CopyPath);
+        foreach (var row in copy.ChunkRowsWithData)
+            Assert.Equal(cells, ChunkBlockDecoder.DecodeChunkBlocks(row.Data));
+    }
+
     // ---------- real save ----------
 
     /// <summary>On a real save: removing modded ids touches no other cell and no other chunk

@@ -27,6 +27,10 @@ The changes of this working session in one screen; the detailed entries are belo
   because such a code can never be found here and would turn every area click into an empty selection.
 - **Several areas are a union, not a box around them:** a typed `areas=1,3` searches both rectangles
   and skips the empty gap between two distant areas.
+- **Remove/Replace in `Find blocks` stay inside the scope.** Choosing an area used to narrow the block
+  list and the overlay but not the action itself: with `area 2 of 4` in the search row, **Remove selected…**
+  erased the code in all four areas, and the confirmation quoted the whole save's cell count. Both actions
+  now rewrite only the chunks of the chosen scope, are counted in it, and say so.
 
 ### Added
 
@@ -147,6 +151,15 @@ The changes of this working session in one screen; the detailed entries are belo
   built from an older or edited save is a miss, never stale rendering.
 
 ### Changed
+- **The type buttons above the entity list follow the selection.** The “common names” row (a type, and how many
+  records of it) was built from the whole save, so it kept offering types the filter had already removed: with a
+  horse's name typed, one record was on the list while a dozen unrelated types stayed above it, and a click on one of
+  them threw the typed filter away. The row is now derived from the rows the list shows — only types with at least
+  one record in the current selection, and the number next to a type is how many of its records the selection holds.
+  It stays what it was meant to be, a short list: a dozen buttons, six creatures plus six block entities in **All**,
+  taken from the selection instead of from the whole save. With no match the row is empty instead of full. An empty
+  filter behaves as before: the most frequent types of the save, so block entities (an order of magnitude more of
+  them) cannot push the creatures out of the hint.
 - **Select all shown / Deselect all shown** in the block list of **Find blocks**: one click ticks or unticks every
   code the current search shows and nothing else. A code ticked before the search was typed is not in the list, so
   it keeps its tick — the bulk action is local to the filter, which is what "select all" has to mean next to a
@@ -183,6 +196,23 @@ The changes of this working session in one screen; the detailed entries are belo
 
 ### Fixed
 
+- **"Remove selected…" / "Replace selected…" reached outside the chosen scope.** The block list of **Find blocks**
+  is built from the scope (`Blocks in area 2 of 4 …: 2`), but the two bulk actions carried only the ticked codes
+  down to the pass, which then walked every row of the `chunk` table. On a four-area save with `area 2 of 4`
+  selected, removing one code erased 1,623 palette entries across all 12,984 chunk records and left **0** cells
+  outside the area where 1,246,206 had been — the list had shown 415,744 of them. The confirmation also quoted the
+  whole save (`1,661,950 block cell(s) in this world`) while the list next to it showed the scoped count. A
+  `SearchScope` now travels with the action into `RemoveBlocks`/`ReplaceBlocks` (`CopyAndRemoveBlocks`/
+  `CopyAndReplaceBlocks` too): the pass decodes `position` into a chunk column and skips the rows outside, so the
+  same run leaves 1,246,206 cells untouched, reports `Erased 406 palette entr(ies) (415,744 block cell(s)) across 406
+  of 3,248 chunk(s) in area 2 of 4; the rest of the working copy is untouched`, and the dialog counts the scope
+  instead of the world (`415,744 block cell(s) in area 2 of 4` against `1,661,952 block cell(s) in this world` for
+  the whole save). A scope that holds no chunk (playerdata, or a rectangle over the void between areas) is refused
+  with the reason rather than silently widened to the whole save. The pass still reads every chunk page (the blob
+  sits in the same b-tree), so rewriting 3 % of the rows is not 3 % of the time: the pass took 11 ms for one area of
+  four against 17–19 ms for the whole save, on a 24-MB save.
+  Probe `blockscope` on `artifacts/four-areas.vcdbs`: before — outside 1,246,206 → 0, `RESULT: FAIL`; after —
+  outside unchanged, target block only inside the area, `RESULT: OK`.
 - Looking at a save no longer leaves `-wal`/`-shm` next to it. Opening a WAL world makes SQLite create
   both files, and SQLite deletes them itself only when the last connection closes **with write access** —
   a read-only reader never could, and connection pooling handed the connection back instead of closing

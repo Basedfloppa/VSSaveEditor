@@ -100,19 +100,28 @@ public sealed class EntitiesTabService
 
         if (all.Count == 0)
         {
-            Apply(new List<EntityRow>(), category, text);
+            Apply(new List<EntityRow>(), new List<(string Name, int Count)>(), text);
             return;
         }
 
         _ = FilterAsync(seq, all, category, text);
     }
 
+    /// <summary>
+    ///     The filter and the type hint ("common names") are computed in one background pass: the hint is derived from
+    ///     the filtered rows, and on a 252 MB save that is 132 000 records - building it on the UI thread would add a
+    ///     visible stutter to every keystroke.
+    /// </summary>
     private async Task FilterAsync(int seq, List<EntityRow> all, EntityCategory category, string text)
     {
-        List<EntityRow> shown;
+        (List<EntityRow> Shown, List<(string Name, int Count)> Chips) result;
         try
         {
-            shown = await Task.Run(() => EntityBrowser.Filter(all, category, text));
+            result = await Task.Run(() =>
+            {
+                var shown = EntityBrowser.Filter(all, category, text);
+                return (shown, ChipsFor(shown, category));
+            });
         }
         catch (Exception ex)
         {
@@ -121,10 +130,10 @@ public sealed class EntitiesTabService
         }
 
         if (seq != _filterSeq) return; // a newer filter arrived - this result is already stale
-        Apply(shown, category, text);
+        Apply(result.Shown, result.Chips, text);
     }
 
-    private void Apply(List<EntityRow> shown, EntityCategory category, string text)
+    private void Apply(List<EntityRow> shown, List<(string Name, int Count)> chips, string text)
     {
         _shown = shown;
         _host.List.ItemsSource = _shown;
@@ -135,7 +144,7 @@ public sealed class EntitiesTabService
             : $"{_shown.Count} of {_all.Count} record(s)"
               + (label.Length > 0 ? $" matching \"{label}\"" : "");
 
-        RenderChips(ChipsFor(category));
+        RenderChips(chips);
 
         // The detail survives a rebuild only when the same record is still in the list: otherwise the selection
         // would point at a row that no longer exists.
@@ -252,18 +261,14 @@ public sealed class EntitiesTabService
     }
 
     /// <summary>
-    ///     What to show in "common names". In "All" mode some block entity types would drown out creatures
-    ///     by count (the save has an order of magnitude more of them), so the hint takes the top of each category
-    ///     separately - otherwise it would be impossible to tell who lives in the world at all.
+    ///     The type hint of the current selection ("common names"): only the types the shown rows still have, with how
+    ///     many of them the selection holds. A chip the filter left out would not only misdescribe the list - a click
+    ///     on it would also throw the typed filter away. In "All" mode the hint is split between the kinds (6 + 6):
+    ///     block entities outnumber creatures by an order of magnitude, and one shared top would hide the creatures.
+    ///     With an empty filter this is the top of the whole index, which is what makes the hint useful on a fresh tab.
     /// </summary>
-    private List<(string Name, int Count)> ChipsFor(EntityCategory category)
-    {
-        if (category != EntityCategory.All)
-            return EntityBrowser.TopNames(EntityBrowser.Filter(_all, category, null), 12);
-        var creatures = EntityBrowser.TopNames(EntityBrowser.Filter(_all, EntityCategory.Entities, null), 6);
-        var blocks = EntityBrowser.TopNames(EntityBrowser.Filter(_all, EntityCategory.BlockEntities, null), 6);
-        return creatures.Concat(blocks).ToList();
-    }
+    private static List<(string Name, int Count)> ChipsFor(List<EntityRow> shown, EntityCategory category)
+        => EntityBrowser.TypeCounts(shown, category, category == EntityCategory.All ? 6 : 12);
 
     /// <summary>Common names as buttons: a click puts the name into the filter.</summary>
     private void RenderChips(List<(string Name, int Count)> top)

@@ -152,6 +152,59 @@ namespace VSCore.Tests
         }
 
         [Fact]
+        public void Type_counts_describe_only_the_selection_they_are_given()
+        {
+            var all = EntityBrowser.Build(Fixture());
+
+            // the whole save as the selection: every type is offered, one record each
+            var every = EntityBrowser.TypeCounts(all, EntityCategory.All, 12);
+            Assert.Equal(5, every.Count);
+            Assert.All(every, t => Assert.Equal(1, t.Count));
+
+            // narrowed by the text: only the type the filter left, and no other
+            var wolves = EntityBrowser.Filter(all, EntityCategory.All, "wolf");
+            var facet = EntityBrowser.TypeCounts(wolves, EntityCategory.All, 12);
+            Assert.Single(facet);
+            Assert.Equal("wolf-eurasian-adult-male", facet[0].Name);
+            Assert.Equal(1, facet[0].Count);
+
+            // an empty selection has no types to offer: the old code showed the whole index here
+            Assert.Empty(EntityBrowser.TypeCounts(EntityBrowser.Filter(all, EntityCategory.All, "zzz-nothing"),
+                EntityCategory.All, 12));
+        }
+
+        [Fact]
+        public void Type_counts_take_the_top_of_each_kind_in_all_mode()
+        {
+            var all = EntityBrowser.Build(Fixture());
+
+            // "All" splits the hint between the kinds: one creature type and one block-entity type
+            var oneEach = EntityBrowser.TypeCounts(all, EntityCategory.All, 1);
+            Assert.Equal(new[] { "chicken-hen", "GenericTypedContainer" }, oneEach.Select(t => t.Name));
+
+            // a single category never lets the other kind in
+            Assert.Equal(new[] { "chicken-hen" },
+                EntityBrowser.TypeCounts(all, EntityCategory.Entities, 1).Select(t => t.Name));
+            Assert.Equal(new[] { "GenericTypedContainer" },
+                EntityBrowser.TypeCounts(all, EntityCategory.BlockEntities, 1).Select(t => t.Name));
+        }
+
+        [Fact]
+        public void Type_counts_count_the_records_of_the_selection()
+        {
+            var rows = EntityBrowser.Build(Fixture());
+            var wolf = rows.Single(r => r.Name == "wolf-eurasian-adult-male");
+            var chicken = EntityBrowser.Build(Fixture()).Single(r => r.Name == "chicken-hen");
+            chicken.Entity!.Species = wolf.Entity!.Species; // a second record of the wolf's type
+            var all = rows.Concat(new[] { chicken }).ToList();
+
+            var facet = EntityBrowser.TypeCounts(EntityBrowser.Filter(all, EntityCategory.All, "wolf"),
+                EntityCategory.All, 12);
+            Assert.Single(facet);
+            Assert.Equal(2, facet[0].Count); // the number on the button is the number of rows of that type
+        }
+
+        [Fact]
         public void List_text_lists_every_shown_row()
         {
             var all = EntityBrowser.Build(Fixture());

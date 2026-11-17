@@ -112,6 +112,8 @@ Selecting a row opens the chunk. The card shows coordinates, version, block stat
 
 The **Entities** list contains creatures and block entities. Filter by name, species, code, field value or mod domain, or use **All / Entities / Block entities** to narrow the category.
 
+The row of names above the list is a shortcut to what the selection contains: each button is one of the most frequent types in the current selection, with how many records of that type are on the list. The row follows the filter and the category — a type without a single record in the selection is not offered, and the row is empty when nothing matches — and it stays short: at most twelve buttons, six creatures plus six block entities in **All**. A click puts that name into the filter; with an empty filter the row shows the most frequent types of the whole save.
+
 Selecting a row opens a card with the real position and recognized fields. **Show chunk on map** opens the chunk, and **Edit fields** opens the field editor.
 
 Nested values such as `health.currenthealth`, `hunger.saturation`, arrays, booleans and `pos.x/y/z` are shown as separate fields. Bytes the editor cannot interpret are preserved and can be changed through **Raw payload (hex)**.
@@ -154,6 +156,16 @@ Use **Find blocks** to clean up blocks from a removed mod or replace one block c
    the status line says how many matches were left out and the buttons still cover only the shown ones.
 3. Choose **Remove selected…** to turn them into air, or **Replace selected…** and pick a target block from the save.
 4. Confirm the operation.
+
+**The operation stays inside the scope.** With a scope chosen in **Search in:** (an area, several areas, a
+rectangle or one chunk), only the chunks of that scope are rewritten, and the list you are ticking from was built
+from the same scope — so an action never reaches cells the list did not show. The confirmation says which region it
+covers and how many cells are there, and names the ones outside that stay as they are; the status line afterwards
+says the same, e.g. `Erased 406 palette entr(ies) (415,744 block cell(s)) across 406 of 3,248 chunk(s) in area 2 of
+4; the rest of the working copy is untouched` — a palette entry is what the file stores, a block cell is what the list
+counted, and the chunk count is the number of chunk records (every Y level) the pass looked at. On the whole save nothing changes from the earlier behaviour. A scope that holds no
+chunk at all (`playerdata`, or a rectangle over the void between areas) is refused with the reason instead of
+silently falling back to the whole save.
 
 Only the palette changes; the rest of the chunk data stays byte-for-byte intact. The operation edits the working copy and is recorded in History. Removing a block does not remove its block entity, and the in-game map may keep the old colours until that chunk is saved again.
 

@@ -161,6 +161,12 @@ internal static class Harness
             return;
         }
 
+        if (mode == "entitychips")
+        {
+            EntityChips(save);
+            return;
+        }
+
         if (mode == "itemfind")
         {
             ItemFind(save);
@@ -385,6 +391,12 @@ internal static class Harness
         if (mode == "replaceblocks")
         {
             ReplaceBlocks(save);
+            return;
+        }
+
+        if (mode == "blockscope")
+        {
+            BlockScope(save);
             return;
         }
 
@@ -1956,6 +1968,187 @@ internal static class Harness
             .Where(sp => sp.Children.Count == 2 && sp.Children[0] is TextBlock && sp.Children[1] is TextBox)
             .Select(sp => (((TextBlock)sp.Children[0]).Text ?? "", (TextBox)sp.Children[1]))
             .ToList();
+
+    /// <summary>
+    ///     The type hint above the entity list ("common names"): it must describe the current selection, not the whole
+    ///     save. Each state prints the rows the ListBox shows, the buttons drawn over it and the buttons recomputed
+    ///     from those rows, so a button offering a type the selection no longer has shows up as outside>0.
+    ///     States: no filter, one type, a term shared by several types, block entities only, no matches; then a click
+    ///     on a button, which has to move the filter and leave the hint describing that one type.
+    /// </summary>
+    private static void EntityChips(string save)
+    {
+        Console.WriteLine($"=== entitychips probe: {System.IO.Path.GetFileName(save)} ===");
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        if (!WaitLoaded(w, SaveToken(save), "Scan complete", 900)) { Console.WriteLine("FAILED: load"); return; }
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "Entities");
+
+        var list = w.FindNamed<ListBox>("EntityList")!;
+        var chips = w.FindNamed<WrapPanel>("EntityChipsPanel")!;
+        var filter = w.FindNamed<TextBox>("EntityFilterBox")!;
+        var cat = w.FindNamed<ComboBox>("EntityCategoryPick")!;
+        var tab = w.FindNamed<EntitiesTab>("EntitiesView")!;
+
+        var all = list.Items.Cast<EntityRow>().ToList();
+        var bySize = all.Where(r => r.Name.Length > 0)
+            .GroupBy(r => r.Name, System.StringComparer.OrdinalIgnoreCase)
+            .Select(g => (Name: g.Key, Count: g.Count()))
+            .OrderByDescending(t => t.Count).ThenBy(t => t.Name, System.StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        Console.WriteLine($"[save] rows={all.Count} (creatures={all.Count(r => !r.IsBlockEntity)},"
+                          + $" block entities={all.Count(r => r.IsBlockEntity)}) types={bySize.Count}");
+
+        var ok = true;
+
+        // 1) empty filter: the hint is the top of the whole index - the wanted behaviour for a fresh tab
+        ok &= ChipState("no filter", list, chips, EntityCategory.All);
+
+        // 2) a single type: the selection holds one type, so exactly one button
+        var singleName = bySize.Count > 0 ? bySize[0].Name : "";
+        filter.Text = singleName;
+        Pump(2.0);
+        ok &= ChipState($"filter '{Cut(singleName)}' (one type)", list, chips, EntityCategory.All);
+
+        // 3) a term several types share but not all of them: the buttons must list exactly those types
+        var sharedTerm = PartialTerm(all) ?? "";
+        if (sharedTerm.Length > 0)
+        {
+            filter.Text = sharedTerm;
+            Pump(2.0);
+            ok &= ChipState($"filter '{Cut(sharedTerm)}' (shared by several types)", list, chips, EntityCategory.All);
+        }
+        else
+        {
+            Console.WriteLine("[chips filter 'shared term'] skipped: no term covers more than one type here");
+        }
+
+        // 4) block entities only, plus a filter: the creatures must not survive in the hint
+        var blockRows = all.Where(r => r.IsBlockEntity).ToList();
+        var blockTerm = PartialTerm(blockRows) ?? blockRows.GroupBy(r => r.Name, System.StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault() ?? "";
+        filter.Text = blockTerm;
+        cat.SelectedIndex = 2; // Block entities
+        Pump(2.5);
+        ok &= ChipState($"block entities + filter '{Cut(blockTerm)}'", list, chips, EntityCategory.BlockEntities);
+
+        // 5) a filter that leaves nothing: no rows and therefore no buttons at all
+        filter.Text = "zzz-no-such-entity";
+        cat.SelectedIndex = 0; // All
+        Pump(2.5);
+        ok &= ChipState("filter with no matches", list, chips, EntityCategory.All);
+
+        // 6) a click on a button puts the name into the filter, and the hint collapses to that type
+        ClickButtonIn(tab, "Clear");
+        Pump(1.5);
+        var firstChip = chips.Children.OfType<Button>().FirstOrDefault();
+        var clickOk = false;
+        if (firstChip is not null)
+        {
+            var firstName = ToolTip.GetTip(firstChip) as string ?? "";
+            firstChip.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(2.5);
+            var after = list.Items.Cast<EntityRow>().ToList();
+            clickOk = filter.Text == firstName && after.Count > 0 && after.All(r => r.Matches(firstName))
+                      && ChipState($"after clicking chip '{Cut(firstName)}'", list, chips, EntityCategory.All);
+            Console.WriteLine($"[chip click] name='{Cut(firstName)}' filter='{Cut(filter.Text)}' rows={after.Count}"
+                              + $" allMatch={after.All(r => r.Matches(firstName))} ok={clickOk}");
+        }
+
+        ok &= clickOk;
+        Console.WriteLine(ok
+            ? "RESULT: OK - the type buttons describe the current selection in every state"
+            : "RESULT: FAIL - see the state lines above");
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
+
+    /// <summary>
+    ///     Prints one state of the type hint and returns whether the drawn buttons are exactly the ones the shown rows
+    ///     imply. The expected buttons are recomputed here from <c>list.Items</c>, not taken from the service, so the
+    ///     check does not repeat the code it checks.
+    /// </summary>
+    private static bool ChipState(string header, ListBox list, WrapPanel chips, EntityCategory category)
+    {
+        var rows = list.Items.Cast<EntityRow>().ToList();
+        var expected = ExpectedChips(rows, category);
+        var drawn = chips.Children.OfType<Button>()
+            .Select(b => (Name: ToolTip.GetTip(b) as string ?? "", Count: ChipCount(b.Content as string)))
+            .ToList();
+        var countByName = rows.Where(r => r.Name.Length > 0)
+            .GroupBy(r => r.Name, System.StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Count(), System.StringComparer.OrdinalIgnoreCase);
+        var outside = drawn.Where(d => !countByName.ContainsKey(d.Name)).ToList();
+        var wrongCount = drawn.Where(d => countByName.TryGetValue(d.Name, out var n) && n != d.Count).ToList();
+        var match = drawn.Count == expected.Count
+                    && drawn.Zip(expected).All(p =>
+                        string.Equals(p.First.Name, p.Second.Name, System.StringComparison.OrdinalIgnoreCase)
+                        && p.First.Count == p.Second.Count);
+        // errors is the measure the criteria speak about: a button that names a type the selection does not have,
+        // or that shows a number other than the number of shown rows of that type.
+        var errors = outside.Count + wrongCount.Count;
+        Console.WriteLine($"[chips {header}] rows={rows.Count} chips={drawn.Count} expected={expected.Count}"
+                          + $" outside={outside.Count} wrongCount={wrongCount.Count} errors={errors} match={match}");
+        Console.WriteLine("    drawn:    " + JoinChips(drawn));
+        Console.WriteLine("    expected: " + JoinChips(expected));
+        return outside.Count == 0 && wrongCount.Count == 0 && match;
+    }
+
+    /// <summary>Every button, not a sample: the whole list is what <c>match</c> compares.</summary>
+    private static string JoinChips(List<(string Name, int Count)> chips)
+        => chips.Count == 0 ? "(none)" : string.Join(", ", chips.Select(c => $"{c.Name}x{c.Count}"));
+
+    /// <summary>The buttons the shown rows imply: the top of each kind in "All" mode, the top overall otherwise.</summary>
+    private static List<(string Name, int Count)> ExpectedChips(List<EntityRow> rows, EntityCategory category)
+    {
+        static List<(string Name, int Count)> Top(IEnumerable<EntityRow> src, int limit) => src
+            .Where(r => r.Name.Length > 0)
+            .GroupBy(r => r.Name, System.StringComparer.OrdinalIgnoreCase)
+            .Select(g => (Name: g.Key, Count: g.Count()))
+            .OrderByDescending(t => t.Count).ThenBy(t => t.Name, System.StringComparer.OrdinalIgnoreCase)
+            .Take(limit)
+            .ToList();
+
+        return category == EntityCategory.All
+            ? Top(rows.Where(r => !r.IsBlockEntity), 6).Concat(Top(rows.Where(r => r.IsBlockEntity), 6)).ToList()
+            : Top(rows, 12);
+    }
+
+    /// <summary>The number on a type button: its content is "name ×count", and the name may be trimmed.</summary>
+    private static int ChipCount(string? content)
+    {
+        var s = content ?? "";
+        var at = s.LastIndexOf('×');
+        return at >= 0 && int.TryParse(s[(at + 1)..].Trim(), out var n) ? n : -1;
+    }
+
+    /// <summary>
+    ///     A term several record types share but not all of them: the interesting case for a facet list. Returns null
+    ///     when every name is unique enough that no shared segment exists.
+    /// </summary>
+    private static string? PartialTerm(List<EntityRow> rows)
+    {
+        var types = rows.Select(r => r.Name).Where(n => n.Length > 0)
+            .Distinct(System.StringComparer.OrdinalIgnoreCase).ToList();
+        var terms = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var name in types)
+            foreach (var part in name.Split(new[] { '-', ':', '_', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (part.Length < 3) continue;
+                terms.TryGetValue(part, out var n);
+                terms[part] = n + 1;
+            }
+
+        return terms.Where(t => t.Value > 1 && t.Value < types.Count)
+            .OrderByDescending(t => t.Value).ThenBy(t => t.Key, System.StringComparer.OrdinalIgnoreCase)
+            .Select(t => t.Key)
+            .FirstOrDefault();
+    }
 
     private static object? Prop(object? model, string name) => model?.GetType().GetProperty(name)?.GetValue(model);
 
@@ -4170,6 +4363,350 @@ internal static class Harness
         CloseNow(w);
         Pump(0.5);
         Console.WriteLine("DONE");
+    }
+
+    /// <summary>
+    ///     "Find blocks" → "Remove selected…" / "Replace selected…" with a scope chosen in "Search in": both actions
+    ///     must stay inside the scope. The ground truth is counted here, from the chunk palettes of the save itself,
+    ///     and the codes are picked so that each has cells BOTH inside the chosen area and outside it — with a code
+    ///     that lies on one side only, "did the action stay inside" would be unanswerable.
+    ///     A) no scope: the code must disappear everywhere (the behaviour that already worked).
+    ///     B) scope "area=2", another code: inside must fall to 0, outside must keep its exact number.
+    ///     C) scope "area=2", replacement: the target block must appear only inside the area.
+    ///     The dialog text of a phase is printed as-is and the number in it is compared with the two numbers counted
+    ///     here, so "the dialog counts the whole save" is a reading of the log, not an opinion about the code.
+    /// </summary>
+    private static void BlockScope(string save)
+    {
+        Console.WriteLine($"=== blockscope probe: {System.IO.Path.GetFileName(save)} ===");
+
+        // ---- ground truth: the areas, the scope, and the codes that straddle its border ----
+        int areaCount;
+        SearchScope scope;
+        string? codeA = null, codeB = null, codeC = null, targetCode = null;
+        int targetId = 0;
+        long aIn = 0, aOut = 0, bIn = 0, bOut = 0, cIn = 0, cOut = 0;
+        var idsOf = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+
+        using (var src = VSSaveFile.OpenReadOnly(save))
+        {
+            var areas = ChunkAreas.Build(src);
+            areaCount = areas.Areas.Count;
+            if (areaCount < 2)
+            {
+                Console.WriteLine($"FAILED: the save has {areaCount} area(s); the probe needs at least two to choose one");
+                return;
+            }
+
+            scope = SearchScope.ForArea(areas.Areas[1], areaCount);   // the same object the row builds for "area=2"
+            Console.WriteLine($"[truth] scope='{scope.Label}' (cx {scope.MinCx}..{scope.MaxCx}, cz {scope.MinCz}..{scope.MaxCz})");
+
+            var byId = CountCellsById(src, scope);
+            var reg = src.BlockRegistry;
+            var perCode = new List<(string Code, long In, long Out)>();
+            foreach (var code in reg.Codes.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                var ids = reg.IdsOf(code).ToList();
+                if (ids.Count == 0) continue;
+                idsOf[code] = ids;
+                long inside = 0, outside = 0;
+                foreach (var id in ids)
+                    if (byId.TryGetValue(id, out var cell)) { inside += cell.In; outside += cell.Out; }
+                perCode.Add((code, inside, outside));
+            }
+
+            var straddling = perCode.Where(c => c.In > 0 && c.Out > 0)
+                .OrderByDescending(c => Math.Min(c.In, c.Out)).ToList();
+            Console.WriteLine($"[truth] codes whose cells lie on both sides of the border={straddling.Count} of {perCode.Count} with ids");
+            foreach (var t in straddling.Take(3))
+                Console.WriteLine($"[truth]   code='{t.Code}' ids={idsOf[t.Code].Count} inside={t.In:N0} outside={t.Out:N0}");
+            if (straddling.Count < 3)
+            {
+                Console.WriteLine("FAILED: fewer than three codes with cells both inside and outside the area — the phases cannot be told apart");
+                return;
+            }
+
+            (codeA, aIn, aOut) = straddling[0];
+            (codeB, bIn, bOut) = straddling[1];
+            (codeC, cIn, cOut) = straddling[2];
+
+            // a block of this registry that occurs nowhere: the cells it gains during the replacement are exactly the
+            // rewritten ones. Air is such a code too (id 0, every empty cell), but counting the cells of air would
+            // count the whole world, so the search skips it — and any code that carries id 0.
+            var idle = perCode.FirstOrDefault(c => c.In == 0 && c.Out == 0
+                                                   && !c.Code.Equals("air", StringComparison.OrdinalIgnoreCase)
+                                                   && idsOf[c.Code].All(id => id != 0));
+            if (idle.Code is null)
+            {
+                Console.WriteLine("FAILED: this save has no unused block code to replace into");
+                return;
+            }
+
+            targetCode = idle.Code;
+            targetId = idsOf[idle.Code].Min();
+            Console.WriteLine($"[truth] replace target='{targetCode}' id={targetId} (no cells anywhere in this save)");
+        }
+
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        // WaitScan, not WaitLoaded: on a small save the "opened:" line has already become "Map ready: …" by the time
+        // the probe looks, and waiting for the earlier line would burn the whole budget on a window that is loaded.
+        if (!WaitScan(w, 600)) { Console.WriteLine($"FAILED: load (scan status='{Cut(TextOf(w, "ScanStatusText"))}')"); CloseNow(w); Pump(0.5); return; }
+        WaitBlockStats(w, 300);
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "Find blocks");
+        Pump(1.0);
+
+        var findTab = w.FindNamed<FindBlocksTab>("FindBlocksView")!;
+        var bar = findTab.FindNamed<ScopeBar>("Scope")!;
+        var scopeBox = bar.FindControl<TextBox>("ScopeBox")!;
+        var scopeReset = bar.FindControl<Button>("ScopeClearBtn")!;
+        var clearBtn = w.FindNamed<Button>("FilterClearBtn")!;
+        var removeBtn = w.FindNamed<Button>("RemoveBlocksBtn")!;
+        var replaceBtn = w.FindNamed<Button>("ReplaceBlocksBtn")!;
+        var codes = (HashSet<string>)PrivField(w, "_filterCodes")!;
+        var scopeField = typeof(MainWindow).GetField("_filterScope",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        string ScopeNow() => ((SearchScope)scopeField.GetValue(w)!).Label;
+        string ScopeKind() => ((SearchScope)scopeField.GetValue(w)!).Kind.ToString();
+
+        string Header()
+        {
+            var panel = w.FindNamed<StackPanel>("FilterListPanel")!;
+            return string.Join(" | ", Descendants(panel).OfType<TextBlock>().Select(t => t.Text).Take(2));
+        }
+
+        void Reset()
+        {
+            clearBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));   // untick every code
+            Pump(0.6);
+            SetText(w, "FilterSearchBox", "");
+            scopeReset.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); // scope back to the whole save
+            Pump(1.2);
+        }
+
+        void SetScope(string text)
+        {
+            scopeBox.Text = text;
+            scopeBox.RaiseEvent(new KeyEventArgs { RoutedEvent = InputElement.KeyDownEvent, Key = Key.Enter });
+            Pump(1.5);
+        }
+
+        bool TickCode(string code)
+        {
+            SetText(w, "FilterSearchBox", code);
+            Pump(1.2);
+            var panel = w.FindNamed<StackPanel>("FilterListPanel")!;
+            var cb = Descendants(panel).OfType<CheckBox>().FirstOrDefault(x => (x.Tag as string) == code);
+            if (cb is null) { Console.WriteLine($"  FAILED: '{code}' is not in the list (header: {Cut(Header())})"); return false; }
+            cb.IsChecked = true;
+            Pump(1.0);
+            return true;
+        }
+
+        string? PressAndWait(Button btn, string phase)
+        {
+            var sw = Stopwatch.StartNew();
+            btn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var endDialog = DateTime.UtcNow.AddSeconds(30);
+            while (DateTime.UtcNow < endDialog && w.OwnedWindows.Count == 0) Pump(0.3);
+            var dlg = w.OwnedWindows.FirstOrDefault();
+            if (dlg is null) { Console.WriteLine($"  FAILED ({phase}): the confirmation did not open"); return null; }
+            Pump(0.5);
+            Shot(dlg, "blockscope_" + phase + "_dialog");
+            var text = string.Join(" | ", Descendants(dlg).OfType<TextBlock>().Select(t => t.Text));
+            var cells = System.Text.RegularExpressions.Regex.Match(text, @"(\d[\d\s,\.]*?)\s*block cell\(s\)");
+            Console.WriteLine($"  [{phase}] dialog='{dlg.Title}' text='{Cut(text)}'");
+            Console.WriteLine($"  [{phase}] dialog cells={(cells.Success ? cells.Groups[1].Value.Trim() : "?")}"
+                              + $"; names the scope='{text.Contains(scope.Label)}', 'area 2 of {areaCount}'={(text.Contains($"area 2 of {areaCount}"))}");
+            AnswerDialog(w, true);
+            var app = "";
+            var end = DateTime.UtcNow.AddSeconds(600);
+            while (DateTime.UtcNow < end)
+            {
+                app = TextOf(w, "StatusText");
+                if (app.Contains("Original unchanged") || app.Contains("nothing changed") || app.Contains("failed")) break;
+                Pump(0.3);
+            }
+            sw.Stop();
+            Console.WriteLine($"  [{phase}] elapsed(visible, incl. map rebuild + rescan)={sw.ElapsedMilliseconds} ms");
+            Console.WriteLine($"  [{phase}] status='{Cut(app)}'");
+            Console.WriteLine($"  [{phase}] statusFull='{(app.Length > 260 ? app.Substring(0, 260) + "..." : app)}'");
+            return app;
+        }
+
+        // ---- A) no scope: the whole save ----
+        Console.WriteLine("[blockscope] --- A) no scope: the whole save ---");
+        Reset();
+        Console.WriteLine($"  [A] scope='{ScopeNow()}' kind={ScopeKind()} header='{Cut(Header())}'");
+        if (!TickCode(codeA!)) { CloseNow(w); Pump(0.5); return; }
+        Console.WriteLine($"  [A] code='{codeA}' ticked={codes.Count} removeEnabled={removeBtn.IsEnabled}");
+        PressAndWait(removeBtn, "A");
+        var working = (VSSaveFile)PrivField(w, "_save")!;
+        var cellsA = CountIdsIn(working, idsOf[codeA!], scope);
+        Console.WriteLine($"  [A] '{codeA}': inside {aIn:N0} -> {cellsA.In:N0}, outside {aOut:N0} -> {cellsA.Out:N0} (a whole-save run must clear both)");
+
+        // ---- B) scope "area=2", another code ----
+        Console.WriteLine("[blockscope] --- B) scope 'area=2', removal ---");
+        Reset();
+        SetScope("area=2");
+        Console.WriteLine($"  [B] scope='{ScopeNow()}' kind={ScopeKind()} header='{Cut(Header())}'");
+        if (!TickCode(codeB!)) { CloseNow(w); Pump(0.5); return; }
+        Console.WriteLine($"  [B] code='{codeB}' ticked={codes.Count} removeEnabled={removeBtn.IsEnabled}");
+        PressAndWait(removeBtn, "B");
+        var cellsB = CountIdsIn(working, idsOf[codeB!], scope);
+        Console.WriteLine($"  [B] '{codeB}': inside {bIn:N0} -> {cellsB.In:N0} (must be 0), outside {bOut:N0} -> {cellsB.Out:N0} (must stay)");
+
+        // ---- C) scope "area=2", replacement ----
+        Console.WriteLine("[blockscope] --- C) scope 'area=2', replacement ---");
+        Reset();
+        SetScope("area=2");
+        Console.WriteLine($"  [C] scope='{ScopeNow()}' kind={ScopeKind()} header='{Cut(Header())}'");
+        if (!TickCode(codeC!)) { CloseNow(w); Pump(0.5); return; }
+        Console.WriteLine($"  [C] code='{codeC}' ticked={codes.Count} replaceEnabled={replaceBtn.IsEnabled}");
+        replaceBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        var endPick = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < endPick && w.OwnedWindows.Count == 0) Pump(0.3);
+        var pick = w.OwnedWindows.FirstOrDefault();
+        if (pick is null) { Console.WriteLine("  FAILED (C): the replace dialog did not open"); CloseNow(w); Pump(0.5); return; }
+        Pump(0.6);
+        Shot(pick, "blockscope_C_replace");
+        var pickText = string.Join(" | ", Descendants(pick).OfType<TextBlock>().Select(t => t.Text));
+        Console.WriteLine($"  [C] pick dialog='{pick.Title}' text='{Cut(pickText)}'"
+                          + $"; names the scope='{pickText.Contains(scope.Label)}'");
+        var pickSearch = Descendants(pick).OfType<TextBox>().First();
+        pickSearch.Text = targetCode!;
+        Pump(0.9);
+        var pickList = Descendants(pick).OfType<ListBox>().First();
+        Console.WriteLine($"  [C] target='{targetCode}' id={targetId}, rows in dialog={pickList.ItemCount}");
+        pickList.SelectedIndex = 0;
+        Pump(0.5);
+        Console.WriteLine($"  [C] picked='{pickList.SelectedItem}'");
+        ClickButtonIn(pick, "Replace");
+        Pump(0.9);
+
+        var swC = Stopwatch.StartNew();
+        var endConfirm = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < endConfirm && w.OwnedWindows.Count == 0) Pump(0.3);
+        var confirmC = w.OwnedWindows.FirstOrDefault();
+        if (confirmC is null) Console.WriteLine("  FAILED (C): the confirmation did not open");
+        else
+        {
+            Pump(0.5);
+            Shot(confirmC, "blockscope_C_confirm");
+            var ctext = string.Join(" | ", Descendants(confirmC).OfType<TextBlock>().Select(t => t.Text));
+            Console.WriteLine($"  [C] confirm='{confirmC.Title}' text='{Cut(ctext)}'"
+                              + $"; names the scope='{ctext.Contains(scope.Label)}', 'area 2 of {areaCount}'={(ctext.Contains($"area 2 of {areaCount}"))}");
+            AnswerDialog(w, true);
+        }
+        var appC = "";
+        var endC = DateTime.UtcNow.AddSeconds(600);
+        while (DateTime.UtcNow < endC)
+        {
+            appC = TextOf(w, "StatusText");
+            if (appC.Contains("Original unchanged") || appC.Contains("nothing changed") || appC.Contains("failed")) break;
+            Pump(0.3);
+        }
+        swC.Stop();
+        Console.WriteLine($"  [C] elapsed(visible)={swC.ElapsedMilliseconds} ms");
+        Console.WriteLine($"  [C] status='{Cut(appC)}'");
+        Console.WriteLine($"  [C] statusFull='{(appC.Length > 260 ? appC.Substring(0, 260) + "..." : appC)}'");
+
+        var cellsC = CountIdsIn(working, idsOf[codeC!], scope);
+        var cellsT = CountIdsIn(working, new[] { targetId }, scope);
+        Console.WriteLine($"  [C] source '{codeC}': inside {cIn:N0} -> {cellsC.In:N0} (must be 0), outside {cOut:N0} -> {cellsC.Out:N0} (must stay)");
+        Console.WriteLine($"  [C] target '{targetCode}' id={targetId}: inside 0 -> {cellsT.In:N0} (>0 expected), outside 0 -> {cellsT.Out:N0} (0 expected)");
+
+        // ---- D) the pass itself, which is the reading the ontology calls "cost of the pass" ----
+        // The visible time of a phase is dominated by the map rebuild and the rescan, and CopyAndRemoveBlocks would
+        // add the copy of the 24-MB save to the number. Here the session is first promoted to its working copy (that
+        // call pays for the copy) and the stopwatch wraps only the rewrite pass.
+        Console.WriteLine("[blockscope] --- D) cost of the pass itself (rewrite only, working copy already made) ---");
+        long TimePass(bool scoped, HashSet<int> ids)
+        {
+            using var editable = VSSaveFile.OpenForEditing(save);
+            editable.ApplyChanges(Array.Empty<(string, long, byte[])>());   // promote: the copy is not part of the pass
+            var sw = Stopwatch.StartNew();
+            var outcome = scoped ? editable.RemoveBlocks(ids, scope) : editable.RemoveBlocks(ids);
+            sw.Stop();
+            Console.WriteLine($"    [D] pass {(scoped ? "one area" : "whole save")}: rewrote {outcome.ChunksChanged:N0} chunk(s) in {sw.ElapsedMilliseconds} ms");
+            return sw.ElapsedMilliseconds;
+        }
+        var idsForA = new HashSet<int>(idsOf[codeA!]);
+        var idsForB = new HashSet<int>(idsOf[codeB!]);
+        var msWholeCold = TimePass(false, idsForA);   // the first run of each pays for a cold copy and the JIT
+        var msScopedCold = TimePass(true, idsForB);
+        var msWhole = TimePass(false, idsForA);
+        var msScoped = TimePass(true, idsForB);
+        Console.WriteLine($"  [D] pass: whole save {msWholeCold}->{msWhole} ms, one area {msScopedCold}->{msScoped} ms, "
+                          + $"ratio={(double)msScoped / Math.Max(1, msWhole):0.00} (a quarter of the chunks rewritten is not a quarter of the time: the pass reads every row)");
+
+        var okA = cellsA.In == 0 && cellsA.Out == 0;
+        var okB = cellsB.In == 0 && cellsB.Out == bOut;
+        var okC = cellsC.In == 0 && cellsC.Out == cOut && cellsT.In > 0 && cellsT.Out == 0;
+        Console.WriteLine($"  checks: whole-save run cleared both sides={okA}; scoped removal stayed inside={okB}; scoped replacement stayed inside={okC}");
+        Console.WriteLine(okA && okB && okC
+            ? "RESULT: OK — both actions stayed inside the scope, and the whole-save run still cleared the code everywhere"
+            : "RESULT: FAIL — an action reached outside the scope, or the whole-save run no longer clears both sides");
+        Shot(w, "blockscope_after");
+        CloseNow(w);
+        Pump(0.5);
+        Console.WriteLine("DONE");
+    }
+
+    /// <summary>Cells of every block id, split by whether the chunk column is inside the scope; decoded from the
+    /// chunk palettes of the save itself, so it does not lean on the editor's own model of the world.</summary>
+    private static Dictionary<int, (long In, long Out)> CountCellsById(VSSaveFile file, SearchScope scope)
+    {
+        var acc = new Dictionary<int, (long In, long Out)>();
+        foreach (var row in file.ChunkRowsWithData)
+        {
+            var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+            bool inside = scope.ContainsChunk(cx, cz);
+            Tally(ChunkBlockDecoder.DecodeChunkBlocks(row.Data), inside, acc);
+            var liquids = ChunkBlockDecoder.DecodeChunkLiquids(row.Data);
+            if (liquids is not null) Tally(liquids, inside, acc);
+        }
+        return acc;
+
+        static void Tally(ushort[] cells, bool inside, Dictionary<int, (long In, long Out)> acc)
+        {
+            foreach (var id in cells)
+            {
+                if (id == 0) continue;
+                acc.TryGetValue(id, out var cell);
+                acc[id] = inside ? (cell.In + 1, cell.Out) : (cell.In, cell.Out + 1);
+            }
+        }
+    }
+
+    /// <summary>The same split, but only for the given ids — the two numbers a phase is judged by.</summary>
+    private static (long In, long Out) CountIdsIn(VSSaveFile file, IEnumerable<int> ids, SearchScope scope)
+    {
+        var wanted = new HashSet<int>(ids);
+        long inCount = 0, outCount = 0;
+        foreach (var row in file.ChunkRowsWithData)
+        {
+            var (cx, _, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+            bool inside = scope.ContainsChunk(cx, cz);
+            Count(ChunkBlockDecoder.DecodeChunkBlocks(row.Data));
+            var liquids = ChunkBlockDecoder.DecodeChunkLiquids(row.Data);
+            if (liquids is not null) Count(liquids);
+            continue;
+
+            void Count(ushort[] cells)
+            {
+                foreach (var id in cells)
+                {
+                    if (!wanted.Contains(id)) continue;
+                    if (inside) inCount++; else outCount++;
+                }
+            }
+        }
+        return (inCount, outCount);
     }
 
     /// <summary>The "clean a mod domain out of the world" scenario: the search in the "Find blocks" tab narrows the list

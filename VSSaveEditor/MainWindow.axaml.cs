@@ -1252,6 +1252,53 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                       && _save is not null && ScanData is not null;
         RemoveBlocksBtn.IsEnabled = enabled;
         ReplaceBlocksBtn.IsEnabled = enabled;
+        // The region is part of the promise these two buttons make, and it changes while they stay on screen
+        // (a chip, a typed rectangle): a tooltip frozen in the markup would keep naming the whole save afterwards.
+        var where = _filterScope.IsEverything ? "the whole save"
+            : _filterScope.HasRegion ? _filterScope.Label
+            : $"{_filterScope.Label} — no chunk, so there is nothing to act on";
+        ToolTip.SetTip(RemoveBlocksBtn,
+            $"Erase the ticked blocks (their cells become air) in {where} of the working copy; the original save is never touched");
+        ToolTip.SetTip(ReplaceBlocksBtn,
+            $"Replace the ticked blocks with another block of this save's BlockIDs, in {where}; only the palette changes, the original save is never touched");
+    }
+
+    /// <summary>
+    ///     The region a bulk block action must stay inside: null — the whole save. The scope is taken as it is, not
+    ///     "narrowed if it happens to be settable": the block list above the button was built from the same scope, so an
+    ///     action that reached further would change cells the user was never shown.
+    /// </summary>
+    private SearchScope? BlockActionScope()
+    {
+        if (_filterScope.IsEverything || _filterScope.IsEmpty) return null;
+        return _filterScope.HasRegion ? _filterScope : null;
+    }
+
+    /// <summary>" in area 2 of 4" for the edit journal, or "" — an undo entry that does not say where it landed
+    /// reads the same after a scoped run as after a whole-save one.</summary>
+    private static string InScope(SearchScope? scope) => scope is null ? "" : " in " + ShortScope(scope);
+
+    /// <summary>
+    ///     The scope's short name: "area 2 of 4", "areas 1, 3 of 4", and the whole label for a rectangle or a column.
+    ///     The full label also carries the area's column count and its block ranges; repeated behind a count of chunk
+    ///     RECORDS it put two different things called "chunks" in one sentence — "406 chunks" (columns) next to
+    ///     "406 of 3,248 chunk(s)" (rows). The ranges belong to the scope row, which shows them anyway.
+    /// </summary>
+    private static string ShortScope(SearchScope scope)
+    {
+        var dash = scope.Label.IndexOf(" — ", StringComparison.Ordinal);
+        return dash < 0 ? scope.Label : scope.Label[..dash];
+    }
+
+    /// <summary>The reason a bulk action cannot run in the current scope, or null when it can.</summary>
+    private string? BlockActionScopeError()
+    {
+        if (_filterScope.IsEverything) return null;
+        if (_filterScope.IsEmpty) return _filterScope.EmptyReason;
+        if (!_filterScope.HasRegion)
+            return $"{_filterScope.Label} contains no chunk, and Remove/Replace work on blocks — "
+                   + "pick an area, a rectangle or the whole save.";
+        return null;
     }
 
     private void OnFilterSearchChanged(object? sender, TextChangedEventArgs e)
@@ -1302,6 +1349,16 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
+        // Everything below is stated in the scope the action will actually touch: the dialog, the numbers and the
+        // final report. Reading the whole-save counts here is what made the confirmation contradict the list.
+        if (BlockActionScopeError() is { } scopeError)
+        {
+            Status.Set(StatusChannel.Filter, scopeError, priority: AppStatus.PriorityError);
+            return;
+        }
+
+        var scope = BlockActionScope();
+
         // code -> id: usually through the registry; for "id:NNN" (the code was not in BlockIDs) take the number itself
         var reg = _save.BlockRegistry;
         var ids = new SortedSet<int>();
@@ -1332,13 +1389,15 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
-        long cells = 0;
+        var scoped = ScopedBlockCounts();
+        long cells = 0, cellsAnywhere = 0;
         var vanilla = 0;
         var rows = new List<(string Code, long Count)>();
         foreach (var code in _filterCodes)
         {
-            var count = ScanData.WorldBlockCodeCounts.TryGetValue(code, out var c) ? c : 0;
+            var count = scoped.TryGetValue(code, out var c) ? c : 0;
             cells += count;
+            cellsAnywhere += ScanData.WorldBlockCodeCounts.TryGetValue(code, out var all) ? all : 0;
             if (!code.Contains(':')) vanilla++;
             rows.Add((code, count));
         }
@@ -1346,8 +1405,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         rows.Sort((a, b) => b.Count.CompareTo(a.Count));
 
         var msg = new StringBuilder();
+        var where = scope is null ? "this world" : scope.Label;
         msg.AppendLine(
-            $"{_filterCodes.Count} block code(s) → {ids.Count} block id(s), {cells:N0} block cell(s) in this world.");
+            $"{_filterCodes.Count} block code(s) → {ids.Count} block id(s), {cells:N0} block cell(s) in {where}.");
+        if (scope is not null && cellsAnywhere > cells)
+            msg.AppendLine(
+                $"Only chunks inside that scope are rewritten: the other {cellsAnywhere - cells:N0} cell(s) of these codes stay as they are.");
         msg.AppendLine(
             "Their cells become AIR in the working copy; the original save is not touched. "
             + "Use File → Save a copy… to write the result next to it.");
@@ -1384,12 +1447,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 LoadProgress.Value = pct;
                 Status.Set(StatusChannel.Filter, $"Removing blocks in the working copy… {pct}%");
             });
-            var res = await Task.Run(() => save.RemoveBlocks(wanted, progress));
+            var res = await Task.Run(() => save.RemoveBlocks(wanted, scope, progress));
 
             var mapOk = true;
             if (res.ChunksChanged > 0)
             {
-                _edits.RecordApplied($"find blocks · {codeCount} code(s)",
+                _edits.RecordApplied($"find blocks · {codeCount} code(s){InScope(scope)}",
                     $"erased {res.PaletteEntriesCleared:N0} palette entr(ies) in {res.ChunksChanged:N0} chunk(s)");
                 UpdatePendingStrip();
                 // The map was drawn from the previous blobs: without a rebuild it would show the removed blocks.
@@ -1399,9 +1462,11 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 await ScanAsync(save, _loadEpoch);
             }
 
+            var rest = scope is null ? "" : "; the rest of the working copy is untouched";
+            var at = scope is null ? "in the working copy" : "in " + ShortScope(scope);
             Status.Set(StatusChannel.App, res.ChunksChanged == 0
-                ? $"No chunk in this save used the selected block ids — nothing changed (checked {res.ChunksScanned:N0} chunk(s))."
-                : $"Erased {res.PaletteEntriesCleared:N0} palette entr(ies) across {res.ChunksChanged:N0} of {res.ChunksScanned:N0} chunk(s) in the working copy. "
+                ? $"No chunk {(scope is null ? "in this save" : "in " + ShortScope(scope))} used the selected block ids — nothing changed (checked {res.ChunksScanned:N0} chunk(s))."
+                : $"Erased {res.PaletteEntriesCleared:N0} palette entr(ies) ({cells:N0} block cell(s)) across {res.ChunksChanged:N0} of {res.ChunksScanned:N0} chunk(s) {at}{rest}. "
                   + $"Original unchanged: {_selectedSave}. Use File → Save a copy… to keep the cleaned world."
                   + (mapOk ? "" : " The map could not be rebuilt — reopen the save to refresh it."),
                 ttlSeconds: 30, priority: 90);
@@ -1440,6 +1505,14 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
+        if (BlockActionScopeError() is { } scopeError)
+        {
+            Status.Set(StatusChannel.Filter, scopeError, priority: AppStatus.PriorityError);
+            return;
+        }
+
+        var scope = BlockActionScope();
+
         var reg = _save.BlockRegistry;
         var ids = new SortedSet<int>();
         var unresolved = new List<string>();
@@ -1469,9 +1542,15 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             return;
         }
 
-        long cells = 0;
+        var scoped = ScopedBlockCounts();
+        long cells = 0, cellsAnywhere = 0;
         foreach (var code in _filterCodes)
-            cells += ScanData.WorldBlockCodeCounts.TryGetValue(code, out var c) ? c : 0;
+        {
+            cells += scoped.TryGetValue(code, out var c) ? c : 0;
+            cellsAnywhere += ScanData.WorldBlockCodeCounts.TryGetValue(code, out var all) ? all : 0;
+        }
+
+        var where = scope is null ? "this world" : scope.Label;
 
         var choices = new List<BlockReplaceDialog.Choice> { new("air", 0) };
         var seenCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "air" };
@@ -1484,7 +1563,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
 
         var pick = await BlockReplaceDialog.ShowAsync(this, choices,
-            $"{_filterCodes.Count} selected code(s), {cells:N0} block cell(s) in this world.");
+            $"{_filterCodes.Count} selected code(s), {cells:N0} block cell(s) in {where}.");
         if (pick is null) return;
 
         if (ids.All(id => id == pick.Id))
@@ -1495,14 +1574,17 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
 
         var rows = new List<(string Code, long Count)>();
         foreach (var code in _filterCodes)
-            rows.Add((code, ScanData.WorldBlockCodeCounts.TryGetValue(code, out var c) ? c : 0));
+            rows.Add((code, scoped.TryGetValue(code, out var c) ? c : 0));
         rows.Sort((a, b) => b.Count.CompareTo(a.Count));
 
         var msg = new StringBuilder();
         msg.AppendLine(
             $"{_filterCodes.Count} code(s) → {ids.Count} block id(s) will become '{pick.Code}' (id {pick.Id}).");
         msg.AppendLine(
-            $"{cells:N0} cell(s) in this world. Only palette entries change; every other byte of the chunk is kept.");
+            $"{cells:N0} cell(s) in {where}. Only palette entries change; every other byte of the chunk is kept.");
+        if (scope is not null && cellsAnywhere > cells)
+            msg.AppendLine(
+                $"The other {cellsAnywhere - cells:N0} cell(s) of these codes lie outside that scope and stay as they are.");
         msg.AppendLine("The original save is not touched — use File → Save a copy… to write the result.");
         msg.AppendLine();
         foreach (var (code, count) in rows.Take(8)) msg.AppendLine($"  {code} — {count:N0}");
@@ -1529,12 +1611,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 LoadProgress.Value = pct;
                 Status.Set(StatusChannel.Filter, $"Replacing blocks in the working copy… {pct}%");
             });
-            var res = await Task.Run(() => save.ReplaceBlocks(wanted, pick.Id, progress));
+            var res = await Task.Run(() => save.ReplaceBlocks(wanted, pick.Id, scope, progress));
 
             var mapOk = true;
             if (res.ChunksChanged > 0)
             {
-                _edits.RecordApplied($"find blocks · {codeCount} code(s) → {pick.Code}",
+                _edits.RecordApplied($"find blocks · {codeCount} code(s) → {pick.Code}{InScope(scope)}",
                     $"replaced {res.PaletteEntriesReplaced:N0} palette entr(ies) in {res.ChunksChanged:N0} chunk(s)");
                 UpdatePendingStrip();
                 Map.ClearSelection();
@@ -1543,10 +1625,12 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
                 await ScanAsync(save, _loadEpoch);
             }
 
+            var rest = scope is null ? "" : "; the rest of the working copy is untouched";
+            var at = scope is null ? "in the working copy" : "in " + ShortScope(scope);
             Status.Set(StatusChannel.App, res.ChunksChanged == 0
-                ? $"No chunk in this save used the selected block ids — nothing changed (checked {res.ChunksScanned:N0} chunk(s))."
-                : $"Replaced {res.PaletteEntriesReplaced:N0} palette entr(ies) with '{pick.Code}' (id {pick.Id}) "
-                  + $"across {res.ChunksChanged:N0} of {res.ChunksScanned:N0} chunk(s) in the working copy. "
+                ? $"No chunk {(scope is null ? "in this save" : "in " + ShortScope(scope))} used the selected block ids — nothing changed (checked {res.ChunksScanned:N0} chunk(s))."
+                : $"Replaced {res.PaletteEntriesReplaced:N0} palette entr(ies) ({cells:N0} block cell(s)) with '{pick.Code}' (id {pick.Id}) "
+                  + $"across {res.ChunksChanged:N0} of {res.ChunksScanned:N0} chunk(s) {at}{rest}. "
                   + $"Original unchanged: {_selectedSave}. Use File → Save a copy… to keep the edited world."
                   + (mapOk ? "" : " The map could not be rebuilt — reopen the save to refresh it."),
                 ttlSeconds: 30, priority: 90);
