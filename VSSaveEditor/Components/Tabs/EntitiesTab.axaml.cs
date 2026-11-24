@@ -18,6 +18,7 @@ public partial class EntitiesTab : UserControl
         EntityFilterBox.TextChanged += (_, _) => FilterChanged?.Invoke(this, EventArgs.Empty);
         EntityCategoryPick.SelectionChanged += (_, _) => FilterChanged?.Invoke(this, EventArgs.Empty);
         EntityClearBtn.Click += (_, e) => ClearRequested?.Invoke(this, e);
+        EntityDataBtn.Click += (_, e) => EntityDataRequested?.Invoke(this, e);
         CopyListBtn.Click += (_, e) => CopyListRequested?.Invoke(this, e);
         CopyDumpBtn.Click += (_, e) => CopyDumpRequested?.Invoke(this, e);
         EntityList.SelectionChanged += (_, e) => EntityPicked?.Invoke(this, e);
@@ -27,6 +28,7 @@ public partial class EntitiesTab : UserControl
     public event EventHandler? FilterChanged;
 
     public event EventHandler<RoutedEventArgs>? ClearRequested;
+    public event EventHandler<RoutedEventArgs>? EntityDataRequested;
     public event EventHandler<RoutedEventArgs>? CopyListRequested;
     public event EventHandler<RoutedEventArgs>? CopyDumpRequested;
     public event EventHandler<SelectionChangedEventArgs>? EntityPicked;

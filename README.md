@@ -21,8 +21,9 @@ A world inspection and preparation tool for server owners, modpack maintainers a
 - **Find a lost pet.** Filter creatures by name, species or mod, read its coordinates, and open the chunk.
 - **Audit resource and spawn distribution.** Highlight ore blocks and list creatures by type and location to verify worldgen, spawn balance and modded placement.
 - **Remove a mod safely.** Find the block codes left by the mod, remove or replace them, review the diff, and save a copy before uninstalling the mod.
+- **Restock or clean up a trader.** Open a trader as a document (`Entities → Entity data…`), edit a price or the stock, delete an offer or a slot, or cut a mod's leftover fields out of a creature — every change is one reviewable pending edit.
 
-You can also find which chest or player holds an item, edit a player's inventory, or change a creature's health and position.
+You can also find which chest or player holds an item, edit a player's inventory, edit a creature's fields and position, and edit a trader's offers.
 
 ## Editing and safety
 
@@ -30,7 +31,7 @@ Opening a save creates a temporary working copy in the app's data folder (not in
 folder, which is RAM-backed on many Linux systems); the original `.vcdbs` is only read. Every edit goes
 into that copy. `VSSAVEEDITOR_WORK_DIR` overrides the location.
 
-- **Review before write.** “Review & apply…” shows a before/after diff per chunk or player, with undo, redo and history.
+- **Review before write.** “Review & apply…” shows a before/after diff per chunk, player or entity record, with undo, redo and history.
 - **Save a copy.** Writes a new `.vcdbs` next to the original, by default `<name> (edited).vcdbs`. There is no “save over the original” command.
 - **Stop the game or server first.** The editor cannot guarantee a consistent view while the world is still being written.
 - **Back up worlds you care about** before replacing files manually.
@@ -58,7 +59,7 @@ Windows: run the `.exe`. SmartScreen may warn because the binaries are currently
 ## Known limitations
 
 - **No block painting or 3D view.** Blocks can be removed or replaced by code, not painted individually; the map and Y slices are 2D.
-- **Item stacks are read-only.** You can find an item and its owner, but not rewrite the stack contents.
+- **The Items tab is read-only.** It finds an item and its owner; a stack is edited where it belongs to an owner. In `Entities → Entity data…` a slot's item can be opened and its attributes (condition, temperature…) edited, and deleting it takes a trader's offer with it. In `Players → Player data…` an item can be deleted but its attributes are not shown as fields yet.
 - **No whole-region wipe.** Deleting a region would regenerate everything in it, including buildings, so the feature was removed. Chunk-column deletion remains.
 - **No version conversion.** Saves outside the tested 1.22.x range may parse partially.
 - **The game is the final validator.** The editor does not run Vintage Story's own validation; always load a copy before using it on a server.

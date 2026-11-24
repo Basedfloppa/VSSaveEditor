@@ -64,6 +64,30 @@ internal static class Harness
             return;
         }
 
+        if (mode == "entdoc")
+        {
+            EntityDocumentProbe(save);
+            return;
+        }
+
+        if (mode == "entwrite")
+        {
+            EntityWriteProbe(save);
+            return;
+        }
+
+        if (mode == "entprobe")
+        {
+            EntityDataProbe(save);
+            return;
+        }
+
+        if (mode == "traders")
+        {
+            TradersProbe(save);
+            return;
+        }
+
         if (mode == "celldiff")
         {
             CellDiff(save, args.Length > 2 ? args[2] : throw new ArgumentException("celldiff <orig> <copy>"));
@@ -83,6 +107,12 @@ internal static class Harness
 
         Console.WriteLine("=== contrast (theme brushes vs window background) ===");
         ContrastProbe();
+
+        if (mode == "entdata")
+        {
+            EntityDataUiProbe(save);
+            return;
+        }
 
         if (mode == "areaselectblocks")
         {
@@ -122,6 +152,47 @@ internal static class Harness
         {
             AreaListProbe(save, args.Length > 2 ? args[2] : null,
                 Environment.GetEnvironmentVariable("UISNAP_AREA_EXTRA") == "1");
+            return;
+        }
+
+        if (mode == "enttoolbar")
+        {
+            // The layout probe opens the default drawer tab, so the "Entities" toolbar row is never laid out
+            // and its width is not checked anywhere. This opens that tab and measures the row at both probe sizes.
+            foreach (var (width, height) in new[] { (960, 660), (1280, 800) })
+            {
+                var w = new MainWindow { Width = width, Height = height };
+                w.Show();
+                Pump(1.0);
+                w.OpenStartupFile(save);
+                Pump(40.0);
+                // Opening a save leaves the bottom drawer collapsed, so the tab content would never be measured
+                var dp = w.FindNamed<Expander>("DataPanel");
+                if (dp != null) dp.IsExpanded = true;
+                Pump(2.0);
+                var tabs = w.FindNamed<TabControl>("DataTabs");
+                if (tabs != null) tabs.SelectedIndex = 1;
+                Pump(3.0);
+                var filter = w.FindNamed<TextBox>("EntityFilterBox");
+                // Any panel: the row used to be a StackPanel (Spacing gaps), it is a Grid now (the gaps are child margins)
+                var row = filter?.Parent as Panel;
+                if (row == null || row.Bounds.Width < 2)
+                {
+                    // A zero-width row means the tab was never laid out: the number below would be meaningless,
+                    // so that case is reported as a probe failure rather than as "overflows"
+                    Console.WriteLine($"[enttoolbar] {width}x{height}: row not laid out"
+                        + $" (tab={tabs?.SelectedIndex}/{tabs?.ItemCount}, panel={row?.Bounds.Width:0}, drawer={w.FindNamed<Expander>("DataPanel")?.Bounds.Height:0})");
+                    CloseNow(w);
+                    continue;
+                }
+
+                var sum = row.Children.Sum(c => c.Bounds.Width + c.Margin.Left + c.Margin.Right);
+                Console.WriteLine($"[enttoolbar] {width}x{height}: panel={row.Bounds.Width:0} sum={sum:0} over={(sum > row.Bounds.Width + 0.5 ? sum - row.Bounds.Width : 0):0}");
+                Console.WriteLine("    " + string.Join(" | ",
+                    row.Children.Select(c => $"{(c as TextBlock)?.Text ?? (c as Button)?.Content as string ?? c.GetType().Name}={c.Bounds.Width:0}")));
+                CloseNow(w);
+                Pump(0.5);
+            }
             return;
         }
 
@@ -432,6 +503,1005 @@ internal static class Harness
         }
 
         UIFlow(save);
+    }
+
+    // ------------------------------------------------------------------ traders
+    // What the save holds about in-game traders (EntityTrader): the records themselves, their personal
+    // name and personality, the worn outfit, the money they carry, and — the point of the whole thing —
+    // `traderInventory.tradeItems`: item + price + stock + restock rules per offer.
+    // The trader's *type* (`clothing`, `luxuries`, …) is not in the ECX field tree: the class name is
+    // "EntityTrader" and the type code sits as a bare token at the end of the blob, so it is taken from there.
+    private static void TradersProbe(string save)
+    {
+        using var f = VSSaveFile.OpenReadOnly(save);
+        var reg = f.BlockRegistry;
+        var itemReg = f.ItemRegistry;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long last = long.MinValue;
+        long chunkRows = 0;
+        var traders = new List<(int Cx, int Cy, int Cz, int Occ, long Pos, byte[] Payload, EntityRecord Rec)>();
+        var spawners = new List<(int Cx, int Cy, int Cz, byte[] Payload, BlockEntityRecord Be)>();
+
+        while (true)
+        {
+            var page = f.ReadChunkRowsPage(last, 2048);
+            if (page.Count == 0) break;
+            foreach (var row in page)
+            {
+                chunkRows++;
+                var data = row.Data;
+                if (data is not { Length: > 0 } || !HasAscii(data, "trader")) continue;
+                var (cx, cy, cz) = ChunkPosHelper.DecodeIndex((ulong)row.Position);
+                var occ6 = 0;
+                foreach (var fl in VSCore.Format.PbReader.ReadMessage(data, maxDepth: 1, maxFields: 5000))
+                {
+                    if (fl.WireType != 2 || fl.Bytes is not { } payload) continue;
+                    if (fl.Field == 8)
+                    {
+                        var be = ChunkDataParser.ParseBlockEntity(payload);
+                        if (HasAscii(payload, "game:trader")
+                            || be.RootFields.Any(r => HasAscii(Encoding.ASCII.GetBytes(r.ValueText), "game:trader")))
+                            spawners.Add((cx, cy, cz, payload, be));
+                        continue;
+                    }
+
+                    if (fl.Field != 6) continue;
+                    if (!HasAscii(payload, "entitytrader")) continue;
+                    var rec = ChunkDataParser.ParseEntity(payload);
+                    traders.Add((cx, cy, cz, occ6++, row.Position, payload, rec));
+                }
+            }
+
+            last = page[^1].Position;
+        }
+
+        sw.Stop();
+        if (traders.Count > 0 && Environment.GetEnvironmentVariable("UISNAP_TRADER_DUMP") is { Length: > 0 } dumpPath)
+        {
+            System.IO.File.WriteAllBytes(dumpPath, traders[0].Payload);
+            Console.WriteLine("  first trader payload → " + dumpPath);
+        }
+        sw.Stop();
+        Console.WriteLine($"TRADERS {System.IO.Path.GetFileName(save)}: {sw.ElapsedMilliseconds} ms, {chunkRows} chunk rows →"
+                          + $" {traders.Count} trader entities, {spawners.Count} trader spawner block entities");
+
+        // ---------------- per-trader figures
+        var byCode = new Dictionary<string, int>(StringComparer.Ordinal);
+        var names = new Dictionary<string, int>(StringComparer.Ordinal);
+        var personalities = new Dictionary<string, int>(StringComparer.Ordinal);
+        var offerCounts = new List<int>();
+        var prices = new List<double>();
+        var money = new List<long>();
+        var stocks = new List<long>();
+        var restockDelay = new Dictionary<long, int>();
+        var restockQty = new Dictionary<long, int>();
+        var offeredCodes = new Dictionary<string, int>(StringComparer.Ordinal);
+        var refresh = new List<double>();
+        var invSets = new Dictionary<string, int>(StringComparer.Ordinal);
+        var zeroStock = 0;
+        var examples = new List<string>();
+
+        foreach (var t in traders)
+        {
+            var code = TraderCodeOf(t.Payload);
+            byCode[code.Length > 0 ? code : "(no code)"] = byCode.GetValueOrDefault(code.Length > 0 ? code : "(no code)") + 1;
+
+            var name = FieldByPath(t.Rec, "nametag.name");
+            if (name.Length > 0) names[name] = names.GetValueOrDefault(name) + 1;
+            var pers = FieldByPath(t.Rec, "personality");
+            if (pers.Length > 0) personalities[pers] = personalities.GetValueOrDefault(pers) + 1;
+            var lr = FieldByPath(t.Rec, "lastRefreshTotalDays");
+            if (double.TryParse(lr, NumberStyles.Float, CultureInfo.InvariantCulture, out var lrv)) refresh.Add(lrv);
+
+            // offers: `traderInventory.tradeItems.<i>.<field>`
+            var perTrader = new Dictionary<int, (string Code, double Price, long Stock)>();
+            foreach (var fl in t.Rec.Fields)
+            {
+                const string pre = "traderInventory.tradeItems.";
+                var p = fl.DisplayPath;
+                if (!p.StartsWith(pre, StringComparison.Ordinal)) continue;
+                var rest = p[pre.Length..];
+                var dot = rest.IndexOf('.');
+                if (dot <= 0 || !int.TryParse(rest[..dot], NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx)) continue;
+                if (!perTrader.TryGetValue(idx, out var o)) o = ("", 0, 0);
+                switch (rest[(dot + 1)..])
+                {
+                    case "stack":
+                        o.Code = StackCode(fl, reg, itemReg);
+                        break;
+                    case "price":
+                        o.Price = Num(fl);
+                        break;
+                    case "stock":
+                        o.Stock = (long)Num(fl);
+                        break;
+                    case "restockHourDelay":
+                        var d = (long)Num(fl);
+                        restockDelay[d] = restockDelay.GetValueOrDefault(d) + 1;
+                        break;
+                    case "restockQuantity":
+                        var q = (long)Num(fl);
+                        restockQty[q] = restockQty.GetValueOrDefault(q) + 1;
+                        break;
+                }
+
+                perTrader[idx] = o;
+            }
+
+            offerCounts.Add(perTrader.Count);
+            foreach (var o in perTrader.Values)
+            {
+                prices.Add(o.Price);
+                stocks.Add(o.Stock);
+                if (o.Stock == 0) zeroStock++;
+                if (o.Code.Length > 0) offeredCodes[o.Code] = offeredCodes.GetValueOrDefault(o.Code) + 1;
+            }
+
+            // money: the currency item lives in the trader's own inventory
+            long cash = 0;
+            var names2 = new List<string>();
+            foreach (var inv in InventoryParser.ParseEntity(t.Payload, new EntityInfo
+                     {
+                         Species = t.Rec.Species, Kind = t.Rec.Kind, SexAge = t.Rec.SexAge,
+                         ChunkX = t.Cx, ChunkY = t.Cy, ChunkZ = t.Cz, Position = t.Pos, Occurrence = t.Occ,
+                         DataLength = t.Payload.Length
+                     }, reg, itemReg))
+            {
+                names2.Add(inv.Name + "(" + inv.Items.Count + ")");
+                foreach (var it in inv.Items)
+                    if (it.DisplayCode.Contains("gear", StringComparison.OrdinalIgnoreCase)) cash += it.Count;
+            }
+            var set = names2.Count == 0 ? "(none)" : string.Join(" + ", names2);
+            invSets[set] = invSets.GetValueOrDefault(set) + 1;
+            money.Add(cash);
+
+            if (examples.Count < 3 && perTrader.Count > 0)
+            {
+                var top = perTrader.OrderBy(kv => kv.Value.Price).Take(4)
+                    .Select(kv => $"{kv.Value.Code}×{kv.Value.Stock} @{kv.Value.Price:0.##}г");
+                examples.Add($"  {code,-42} {name,-12} chunk {t.Cx}:{t.Cy}:{t.Cz}  offers={perTrader.Count,-3}"
+                             + $" cash={cash,-5} [{string.Join(", ", top)}]");
+            }
+        }
+
+        Console.WriteLine("  types: " + string.Join(", ", byCode.OrderByDescending(kv => kv.Value)
+            .Select(kv => $"{kv.Key}:{kv.Value}")));
+        Console.WriteLine($"  offers per trader: min {Min(offerCounts)}, median {Median(offerCounts.Select(x => (double)x).ToList()):0}, max {Max(offerCounts)};"
+                          + $" total offers {prices.Count}");
+        Console.WriteLine($"  price: min {Min(prices):0.##}, median {Median(prices):0.##}, max {Max(prices):0.##};"
+                          + $" stock: median {Median(stocks):0}, zero-stock offers {zeroStock}");
+        Console.WriteLine("  restock: delay " + Join(restockDelay) + " | qty " + Join(restockQty));
+        Console.WriteLine("  money (gear): total " + money.Sum() + ", per trader median " + Median(money)
+                          + ", traders with none " + money.Count(m => m == 0));
+        Console.WriteLine($"  names: {names.Count} distinct; personalities: " + Join(personalities));
+        Console.WriteLine("  inventories: " + Join(invSets));
+        Console.WriteLine($"  lastRefreshTotalDays: {Min(refresh):0.#} .. {Max(refresh):0.#}");
+        Console.WriteLine("  top offered: " + string.Join(", ", offeredCodes.OrderByDescending(kv => kv.Value).Take(12)
+            .Select(kv => $"{kv.Key}:{kv.Value}")));
+        Console.WriteLine("  samples:");
+        foreach (var e in examples) Console.WriteLine(e);
+
+        // ---------------- spawners
+        var spCodes = new Dictionary<string, int>(StringComparer.Ordinal);
+        var multi = 0;
+        foreach (var s in spawners)
+        {
+            var codes = s.Be.RootFields.SelectMany(r => CodesIn(r.ValueText)).Distinct().ToList();
+            foreach (var c in codes) spCodes[c] = spCodes.GetValueOrDefault(c) + 1;
+            if (codes.Count > 1) multi++;
+        }
+
+        Console.WriteLine($"\nSPAWNERS: {spawners.Count} block entity(ies), {multi} spawning more than one type");
+        Console.WriteLine("  codes: " + string.Join(", ", spCodes.OrderByDescending(kv => kv.Value)
+            .Select(kv => $"{kv.Key}:{kv.Value}")));
+        if (spawners.Count > 0)
+        {
+            var s0 = spawners[0];
+            Console.WriteLine($"  sample @ chunk {s0.Cx}:{s0.Cy}:{s0.Cz} ({s0.Payload.Length} B):");
+            foreach (var fl in s0.Be.Fields) Console.WriteLine($"    {fl.DisplayPath} = {Cut(fl.ValueText, 120)}");
+        }
+
+        // ---------------- gamedata / playerdata
+        var gd = f.ReadGamedata();
+        var uids = f.PlayerRows.Select(p => p.Uid).Where(u => !string.IsNullOrEmpty(u)).Select(u => u!)
+            .ToHashSet(StringComparer.Ordinal);
+        var entries = ModDataStore.Read(gd, uids);
+        var tradKeys = entries.Where(e => e.Key.Contains("trad", StringComparison.OrdinalIgnoreCase)).ToList();
+        Console.WriteLine($"\nGAMEDATA: {entries.Count} key(s), trader-shaped={tradKeys.Count}");
+        var pdHits = f.PlayerRows.Count(p => p.Data is { Length: > 0 } d && HasAscii(d, "trader"));
+        Console.WriteLine($"PLAYERDATA: {f.PlayerRows.Count} player(s), 'trader' bytes in {pdHits}");
+    }
+
+    private static string TraderCodeOf(byte[] payload)
+    {
+        var text = Encoding.Latin1.GetString(payload);
+        var idx = text.LastIndexOf("trader-", StringComparison.Ordinal);
+        if (idx < 0) return "";
+        var end = idx + "trader-".Length;
+        while (end < text.Length && (text[end] is >= 'a' and <= 'z' || text[end] == '-')) end++;
+        var s = text[idx..end];
+        return s.TrimEnd('-');
+    }
+
+// ---------------- entity data probe: round-trip and deletion feasibility ----------------
+
+    private static void DumpTree(IEnumerable<ChunkField> fields, string indent, int depth, int maxRows, ref int shown)
+    {
+        foreach (var f in fields)
+        {
+            if (shown++ >= maxRows)
+            {
+                Console.WriteLine(indent + "…");
+                return;
+            }
+
+            var label = f.Key.Length == 0 ? "(no key)" : f.Key;
+            if (f.Type == ChunkFieldType.Tree)
+            {
+                Console.WriteLine($"{indent}{label} [tree] children={f.Children.Count} raw={f.Raw.Length}B rawtree={f.IsRawTree}");
+                if (depth < 6) DumpTree(f.Children, indent + "  ", depth + 1, maxRows, ref shown);
+                continue;
+            }
+
+            if (f.Type == ChunkFieldType.ItemStack)
+            {
+                Console.WriteLine($"{indent}{label} [item] class={f.ItemClass} id={f.ItemId} size={f.StackSize} "
+                                  + $"children={f.Children.Count} {f.Raw.Length}B");
+                foreach (var c in f.Children) Console.WriteLine($"{indent}  {c.Key} = {c.ValueText} ({c.Type})");
+                continue;
+            }
+
+            var text = f.ValueText;
+            if (text.Length > 60) text = text[..60] + "…";
+            Console.WriteLine($"{indent}{label} [{f.Type}] {text} ({f.Raw.Length}B)");
+        }
+    }
+
+    private static ChunkField? FindNode(List<ChunkField> roots, string path)
+    {
+        var parts = path.Split('.');
+        var list = roots;
+        ChunkField? cur = null;
+        foreach (var part in parts)
+        {
+            cur = list.FirstOrDefault(f => f.Key == part);
+            if (cur is null) return null;
+            list = cur.Children;
+        }
+
+        return cur;
+    }
+
+    private static long CommonPrefix(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        var n = Math.Min(a.Length, b.Length);
+        for (var i = 0; i < n; i++)
+            if (a[i] != b[i]) return i;
+        return n;
+    }
+
+    private static long CommonSuffix(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        var n = Math.Min(a.Length, b.Length);
+        for (var i = 0; i < n; i++)
+            if (a[a.Length - 1 - i] != b[b.Length - 1 - i]) return i;
+        return n;
+    }
+
+    private static void EntityDataProbe(string save)
+    {
+        using var f = VSSaveFile.OpenReadOnly(save);
+        var reg = f.BlockRegistry;
+        var itemReg = f.ItemRegistry;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        long last = long.MinValue;
+        long rows = 0, entities = 0, exact = 0, withInv = 0, withInvParsed = 0;
+        var notExact = new List<string>();
+        (long Pos, int Occ, byte[] Payload, EntityRecord Rec)? firstTrader = null;
+        (long Pos, int Occ, byte[] Payload, EntityRecord Rec)? firstInvEntity = null;
+
+        while (true)
+        {
+            var page = f.ReadChunkRowsPage(last, 2048);
+            if (page.Count == 0) break;
+            foreach (var row in page)
+            {
+                rows++;
+                var data = row.Data;
+                if (data is not { Length: > 0 }) continue;
+                var occ6 = 0;
+                foreach (var fl in VSCore.Format.PbReader.ReadMessage(data, maxDepth: 1, maxFields: 5000))
+                {
+                    if (fl.Field != 6 || fl.WireType != 2 || fl.Bytes is not { } payload) continue;
+                    var occ = occ6++;
+                    EntityRecord rec;
+                    try { rec = ChunkDataParser.ParseEntity(payload); }
+                    catch (Exception ex) { notExact.Add($"parse failed {row.Position}:{occ}: {ex.Message}"); continue; }
+                    entities++;
+
+                    var rebuilt = ChunkDataEditor.SerializeEntity(rec);
+                    if (rebuilt.AsSpan().SequenceEqual(payload)) exact++;
+                    else if (notExact.Count < 12) notExact.Add($"{row.Position}:{occ} {rec.Species}: {payload.Length} → {rebuilt.Length}");
+
+                    var hasInv = InventoryParser.MightContainInventory(payload);
+                    if (hasInv) withInv++;
+                    var invNode = FindNode(rec.RootFields, "traderInventory");
+                    var anyInvTree = rec.RootFields.Any(r => r.Key.Contains("Inventory", StringComparison.OrdinalIgnoreCase)
+                                                             || r.Key is "backpack" or "inventory" or "slots");
+                    if (hasInv && anyInvTree) withInvParsed++;
+
+                    if (firstTrader is null && HasAscii(payload, "entitytrader")) firstTrader = (row.Position, occ, payload, rec);
+                    if (firstInvEntity is null && hasInv && anyInvTree && !HasAscii(payload, "entitytrader"))
+                        firstInvEntity = (row.Position, occ, payload, rec);
+                    _ = invNode;
+                }
+            }
+
+            last = page[^1].Position;
+        }
+
+        sw.Stop();
+        Console.WriteLine($"ENTITIES {System.IO.Path.GetFileName(save)}: {sw.ElapsedMilliseconds} ms, {rows} chunk rows");
+        Console.WriteLine($"  entity records: {entities}");
+        Console.WriteLine($"  round-trip byte-identical: {exact}/{entities}");
+        Console.WriteLine($"  payload mentions an inventory: {withInv}, of which a tree was parsed: {withInvParsed}");
+        foreach (var line in notExact) Console.WriteLine("  not exact: " + line);
+
+        if (firstTrader is { } tr)
+        {
+            Console.WriteLine($"\n--- trader {tr.Pos}:{tr.Occ} payload {tr.Payload.Length} B, fields {tr.Rec.Fields.Count}");
+            Console.WriteLine("  top-level keys: " + string.Join(", ", tr.Rec.RootFields.Select(r => r.Key + ":" + r.Type)));
+            var inv = FindNode(tr.Rec.RootFields, "traderInventory");
+            if (inv is not null)
+            {
+                Console.WriteLine($"\n--- traderInventory tree ({inv.Raw.Length} B) ---");
+                var shown = 0;
+                DumpTree(new[] { inv }, "  ", 0, 90, ref shown);
+
+                var ti = FindNode(tr.Rec.RootFields, "traderInventory.tradeItems");
+                if (ti is not null)
+                {
+                    var keys = ti.Children.Select(c => c.Key).ToList();
+                    var contiguous = keys.Select(k => int.TryParse(k, out var v) ? v : -1).SequenceEqual(Enumerable.Range(0, keys.Count));
+                    Console.WriteLine($"\n  tradeItems: type={ti.Type}, {ti.Children.Count} children, keys 0..{keys.Count - 1} contiguous={contiguous}");
+                    Console.WriteLine($"  first child keys: {string.Join(", ", ti.Children[0].Children.Select(c => c.Key))}");
+                }
+
+                var slots = FindNode(tr.Rec.RootFields, "traderInventory.slots");
+                if (slots is not null)
+                {
+                    Console.WriteLine($"  slots: {slots.Children.Count} children, keys: {string.Join(", ", slots.Children.Take(8).Select(c => c.Key))}");
+                    Console.WriteLine($"  non-empty slots: {slots.Children.Count(c => c.Children.Count > 0 && c.Children.Any(x => x.Type == ChunkFieldType.ItemStack && !x.ItemStackIsNull))}");
+                }
+            }
+
+            // deletion experiment: one trade offer out of the tree
+            var t2 = ChunkDataParser.ParseEntity(tr.Payload);
+            var offer = FindNode(t2.RootFields, "traderInventory.tradeItems.3");
+            if (offer is not null)
+            {
+                offer.Removed = true;
+                var after = ChunkDataEditor.SerializeEntity(t2);
+                var pre = CommonPrefix(tr.Payload, after);
+                var suf = CommonSuffix(tr.Payload, after);
+                Console.WriteLine($"\n  remove tradeItems.3 ({offer.Raw.Length} B): payload {tr.Payload.Length} → {after.Length} B "
+                                  + $"(-{tr.Payload.Length - after.Length}); common prefix {pre}, common suffix {suf}");
+                var back = ChunkDataParser.ParseEntity(after);
+                var ti2 = FindNode(back.RootFields, "traderInventory.tradeItems");
+                Console.WriteLine($"  reparse: {ti2?.Children.Count} offers, keys: {string.Join(",", ti2?.Children.Select(c => c.Key) ?? Array.Empty<string>())}");
+                // the removal has to be exactly one contiguous 180-byte window: nothing else may move
+                var cut = tr.Payload.Length - after.Length;
+                var windowCut = after.AsSpan(0, (int)pre).SequenceEqual(tr.Payload.AsSpan(0, (int)pre))
+                                && after.AsSpan((int)pre)
+                                    .SequenceEqual(tr.Payload.AsSpan((int)(pre + cut), after.Length - (int)pre));
+                Console.WriteLine($"  exactly one {cut}-byte window cut (rest byte-identical): {windowCut}");
+                Console.WriteLine($"  serialized again after re-parse is stable: "
+                                  + ChunkDataEditor.SerializeEntity(back).AsSpan().SequenceEqual(after));
+                Console.WriteLine($"  money/rest of the record unchanged: {FindNode(back.RootFields, "nametag.name")?.StringValue} , "
+                                  + $"lastRefresh={FindNode(back.RootFields, "lastRefreshTotalDays")?.ValueText}");
+            }
+        }
+
+        // ---------------- pairing: tradeItems.k ↔ slots.k across the whole save ----------------
+        {
+            long traders = 0, offers = 0, paired = 0, offerNoSlot = 0, slotNoOffer = 0, mismatched = 0;
+            var shapes = new Dictionary<string, int>(StringComparer.Ordinal);
+            var invKeys = new Dictionary<string, int>(StringComparer.Ordinal);
+            long lastPos2 = long.MinValue;
+            while (true)
+            {
+                var page = f.ReadChunkRowsPage(lastPos2, 4096);
+                if (page.Count == 0) break;
+                foreach (var row in page)
+                {
+                    var data = row.Data;
+                    if (data is not { Length: > 0 } || !HasAscii(data, "trader")) continue;
+                    foreach (var fl in VSCore.Format.PbReader.ReadMessage(data, maxDepth: 1, maxFields: 5000))
+                    {
+                        if (fl.Field != 6 || fl.WireType != 2 || fl.Bytes is not { } payload) continue;
+                        if (!HasAscii(payload, "entitytrader")) continue;
+                        traders++;
+                        var rec = ChunkDataParser.ParseEntity(payload);
+                        var inv = rec.RootFields.FirstOrDefault(r => r.Key == "traderInventory");
+                        if (inv is null) continue;
+                        var ti = inv.Children.FirstOrDefault(c => c.Key == "tradeItems");
+                        var sl = inv.Children.FirstOrDefault(c => c.Key == "slots");
+                        foreach (var topKey in rec.RootFields.Where(r => r.Type == ChunkFieldType.Tree)
+                                     .Select(r => r.Key).Distinct())
+                            invKeys[topKey] = invKeys.GetValueOrDefault(topKey) + 1;
+
+                        if (ti is null || sl is null) continue;
+                        var slotByKey = sl.Children.ToDictionary(c => c.Key, c => c, StringComparer.Ordinal);
+                        var offerKeys = new HashSet<string>(ti.Children.Select(c => c.Key), StringComparer.Ordinal);
+                        foreach (var offer in ti.Children)
+                        {
+                            offers++;
+                            shapes[string.Join("+", offer.Children.Select(c => c.Key))] =
+                                shapes.GetValueOrDefault(string.Join("+", offer.Children.Select(c => c.Key))) + 1;
+                            if (!slotByKey.TryGetValue(offer.Key, out var slot)) { offerNoSlot++; continue; }
+                            paired++;
+                            var stack = offer.Children.FirstOrDefault(c => c.Key == "stack");
+                            if (stack is null || slot.Type != ChunkFieldType.ItemStack
+                                || slot.ItemClass != stack.ItemClass || slot.ItemId != stack.ItemId) mismatched++;
+                        }
+
+                        slotNoOffer += sl.Children.Count(c => !offerKeys.Contains(c.Key));
+                    }
+                }
+
+                lastPos2 = page[^1].Position;
+            }
+
+            Console.WriteLine($"\n--- pairing over the whole save: {traders} traders, {offers} offers");
+            Console.WriteLine($"  offer has a matching slot: {paired}, offer without slot: {offerNoSlot}, "
+                              + $"slot without offer: {slotNoOffer}, slot item != offer stack: {mismatched}");
+            Console.WriteLine("  offer field sets: " + string.Join("; ",
+                shapes.OrderByDescending(kv => kv.Value).Take(4).Select(kv => kv.Value + "×" + kv.Key)));
+            Console.WriteLine("  top-level tree keys near traders: " + string.Join(", ",
+                invKeys.OrderByDescending(kv => kv.Value).Take(14).Select(kv => kv.Key + "=" + kv.Value)));
+        }
+
+        if (firstInvEntity is { } ie)
+        {
+            Console.WriteLine($"\n--- non-trader entity with an inventory {ie.Pos}:{ie.Occ} {ie.Rec.Species}, {ie.Payload.Length} B");
+            Console.WriteLine("  top-level keys: " + string.Join(", ", ie.Rec.RootFields.Select(r => r.Key + ":" + r.Type)));
+            var invs = InventoryParser.ParseEntity(ie.Payload, new EntityInfo(), reg, itemReg);
+            foreach (var inv in invs.Take(4))
+                Console.WriteLine($"  inventory '{inv.Name}': {inv.SlotCount} slots, {inv.Items.Count} items: "
+                                  + string.Join(", ", inv.Items.Take(6).Select(i => i.Slot + "=" + i.DisplayCode + "×" + i.Count)));
+        }
+    }
+
+// ---------------- EntityDataDocument over every trader of a real save ----------------
+
+    private static void EntityDocumentProbe(string save)
+    {
+        using var f = VSSaveFile.OpenReadOnly(save);
+        var reg = f.BlockRegistry;
+        var itemReg = f.ItemRegistry;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long last = long.MinValue, traders = 0, docs = 0, lossless = 0, offersTotal = 0, paysOut = 0;
+        var noInventory = 0;
+        var failures = new List<string>();
+        var firstResult = new List<string>();
+
+        while (true)
+        {
+            var page = f.ReadChunkRowsPage(last, 4096);
+            if (page.Count == 0) break;
+            foreach (var row in page)
+            {
+                var data = row.Data;
+                if (data is not { Length: > 0 } || !HasAscii(data, "trader")) continue;
+                var occ = 0;
+                foreach (var fl in VSCore.Format.PbReader.ReadMessage(data, maxDepth: 1, maxFields: 5000))
+                {
+                    if (fl.Field != 6 || fl.WireType != 2 || !HasAscii(fl.Bytes!, "entitytrader")) continue;
+                    traders++;
+                    var doc = EntityDataDocument.Load(fl.Bytes!, 6, row.Position, occ++, "trader", reg, itemReg);
+                    docs++;
+                    if (doc.Lossless) lossless++;
+                    var inv = doc.Blocks.FirstOrDefault(b => b.Kind == EntityDataKind.Inventory);
+                    if (inv is null) noInventory++;
+                    offersTotal += doc.Offers.Count;
+                    if (doc.Counts().Changed) paysOut++; // nothing may be pending right after load
+                    if (!doc.Lossless && failures.Count < 5) failures.Add($"{row.Position}:{occ - 1}");
+
+                    // a deletion has to be one contiguous window of the payload, nothing else may move
+                    if (firstResult.Count == 0 && doc.Offers.Count > 2)
+                    {
+                        var key = doc.Offers[1].Key;
+                        var before = doc.Raw;
+                        var beforeFields = FieldSnapshot(doc);
+                        var text = doc.RemoveOffer(key);
+                        var counts = doc.Counts();
+                        var build = doc.Build();
+                        var after = build.Payload!;
+                        var cut = before.Length - after.Length;
+                        var back = EntityDataDocument.Load(after, 6, row.Position, 0, "trader", reg, itemReg);
+                        var afterFields = FieldSnapshot(back);
+                        // Everything except the offer and its slot has to be byte-identical field by field.
+                        static bool Under(string path, string root)
+                            => path == root || path.StartsWith(root + ".", StringComparison.Ordinal);
+                        var expects = beforeFields
+                            .Where(kv => !Under(kv.Key, $"traderInventory.tradeItems.{key}")
+                                         && !Under(kv.Key, $"traderInventory.slots.{key}"))
+                            .ToList();
+                        var sameFields = expects.Count == afterFields.Count
+                                         && expects.Zip(afterFields).All(z => z.First.Key == z.Second.Key
+                                                                              && z.First.Value == z.Second.Value);
+                        firstResult.Add($"traders={traders} pos={row.Position} offers {doc.Offers.Count}");
+                        firstResult.Add($"  {text}");
+                        firstResult.Add($"  counts: {build.Summary}; freed {counts.BytesFreed} B, "
+                                        + $"payload {before.Length} → {after.Length} (−{cut})");
+                        firstResult.Add($"  fields before={beforeFields.Count} after={afterFields.Count} "
+                                        + $"(−{beforeFields.Count - afterFields.Count}), every other field byte-identical: {sameFields}");
+                        firstResult.Add($"  reload: {back.Offers.Count} offers, keys "
+                                        + $"{string.Join(",", back.Offers.Select(o => o.Key))}, lossless={back.Lossless}");
+                        var slots = back.Blocks.FirstOrDefault(b => b.Kind == EntityDataKind.Inventory)?.Slots;
+                        firstResult.Add($"  slots after: {string.Join(",", slots?.Children.Select(c => c.Key) ?? Array.Empty<string>())}");
+                    }
+                }
+            }
+
+            last = page[^1].Position;
+        }
+
+        sw.Stop();
+        Console.WriteLine($"ENTDOC {System.IO.Path.GetFileName(save)}: {sw.ElapsedMilliseconds} ms");
+        Console.WriteLine($"  traders={traders} docs={docs} lossless={lossless} without inventory={noInventory}");
+        Console.WriteLine($"  offers read={offersTotal}, documents with pending changes right after load={paysOut}");
+        foreach (var line in failures) Console.WriteLine("  not lossless: " + line);
+        foreach (var line in firstResult) Console.WriteLine(line);
+    }
+
+    /// <summary>Every field of the record with its exact bytes, keyed by path — the snapshot a deletion is checked against.</summary>
+    private static List<KeyValuePair<string, string>> FieldSnapshot(EntityDataDocument doc)
+    {
+        var list = new List<KeyValuePair<string, string>>();
+        void Walk(IEnumerable<ChunkField> fields, string prefix)
+        {
+            foreach (var f in fields)
+            {
+                var path = prefix.Length == 0 ? f.Key : prefix + "." + f.Key;
+                // only leaves: a parent tree is re-emitted when one of its children goes, so its bytes differ
+                // by design — what must not move is every value the deletion did not touch.
+                if (f.Children.Count == 0) list.Add(new KeyValuePair<string, string>(path, Convert.ToHexString(f.Raw)));
+                if (f.Children.Count > 0) Walk(f.Children, path);
+            }
+        }
+
+        Walk(doc.RootFields, "");
+        return list;
+    }
+
+/// <summary>
+    ///     "Entity data" window on a real save: open it from the Entities tab, delete a trade offer of the first
+    ///     trader, apply, and read back the pending payload — the window is only useful if the offer leaves the
+    ///     record together with its inventory slot.
+    /// </summary>
+    private static void EntityDataUiProbe(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 900 };
+        w.Show();
+        Pump(1.0);
+        w.OpenStartupFile(save);
+        if (!WaitScan(w, 1200))
+        {
+            Console.WriteLine($"FAILED: load (status='{Cut(TextOf(w, "ScanStatusText"))}')");
+            CloseNow(w);
+            Pump(0.5);
+            return;
+        }
+
+        WaitBlockStats(w, 900);
+
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "Entities");
+        Pump(1.0);
+
+        var filter = w.FindNamed<TextBox>("EntityFilterBox")!;
+        filter.Text = "trader";
+        Pump(3.0);
+        var list = w.FindNamed<ListBox>("EntityList")!;
+        Console.WriteLine($"[entdata] Entities rows matching 'trader': {list.ItemCount}");
+        Shot(w, "entdata_01_entities");
+
+        ClickButton(w, "Entity data…");
+        var end = DateTime.UtcNow.AddSeconds(60);
+        while (DateTime.UtcNow < end && w.OwnedWindows.Count == 0) Pump(0.5);
+        var dlg = w.OwnedWindows.FirstOrDefault();
+        if (dlg is null)
+        {
+            Console.WriteLine("FAILED: the Entity data window did not open");
+            CloseNow(w);
+            Pump(0.5);
+            return;
+        }
+
+        Pump(1.5);
+        var dlgList = Descendants(dlg).OfType<ListBox>().First();
+        Console.WriteLine($"[entdata] dialog: title='{dlg.Title}', rows={dlgList.ItemCount}, selected={dlgList.SelectedIndex}");
+        Console.WriteLine($"[entdata]   first row: {Cut((string?)dlgList.Items[0] ?? "")}");
+
+        // the first row of the Entities list is a spawner (a block entity): pick a real trader instead
+        var traderIndex = -1;
+        for (var i = 0; i < dlgList.ItemCount; i++)
+            if ((dlgList.Items[i] as string)?.Contains("[trader]") == true) { traderIndex = i; break; }
+        Console.WriteLine($"[entdata] first trader at index {traderIndex}: {Cut((string?)(traderIndex >= 0 ? dlgList.Items[traderIndex] : "") ?? "")}");
+        if (traderIndex >= 0)
+        {
+            dlgList.SelectedIndex = traderIndex;
+            Pump(2.5);
+        }
+
+        // What a user sees on opening a trader: every block is one line with its counts, and the inventory is
+        // NOT the fifth screenful of the record's 258 fields
+        Shot(dlg, "entdata_02b_blocks_closed");
+
+        // Every block starts collapsed (an entity's record holds hundreds of fields and used to push the
+        // inventory below the fold), so the rows only exist once the block is opened — and picking a record
+        // rebuilds the pane, so this must come after the selection.
+        foreach (var exp in Descendants(dlg).OfType<Expander>())
+        {
+            if (exp.Header is TextBlock) exp.IsExpanded = true;
+        }
+
+        Pump(1.5);
+        // A shot of the inventory alone: the record and the offer list closed, so the item rows and the two
+        // boxes that change an item (code, count) are what the picture shows
+        foreach (var exp in Descendants(dlg).OfType<Expander>())
+        {
+            var head = (exp.Header as TextBlock)?.Text ?? "";
+            exp.IsExpanded = head.StartsWith("Inventory — traderInventory", StringComparison.Ordinal);
+        }
+
+        Pump(1.5);
+        var captions = Descendants(dlg).OfType<TextBlock>().Select(t => t.Text ?? "").ToList();
+        Console.WriteLine($"[entdata] column captions: 'item code'={(captions.Contains("item code") ? 1 : 0)}"
+            + $" 'count'={(captions.Count(c => c == "count"))} 'price · stock'={(captions.Contains("price · stock") ? 1 : 0)}"
+            + $" duplicated grey value hints={(captions.Count(c => c.Contains('×')))}");
+        Shot(dlg, "entdata_02c_inventory");
+
+        foreach (var exp in Descendants(dlg).OfType<Expander>())
+        {
+            if (exp.Header is TextBlock) exp.IsExpanded = true;
+        }
+
+        Pump(1.5);
+        var texts = Descendants(dlg).OfType<TextBlock>().Select(t => t.Text ?? "").Where(t => t.Length > 0).ToList();
+        foreach (var line in texts.Where(t => t.StartsWith("Record") || t.StartsWith("Inventory") || t.StartsWith("Trade offers")
+                                              || t.Contains(" field(s)") || t.Contains(" offer(s)") || t.StartsWith("field ")))
+            Console.WriteLine("[entdata]   block: " + Cut(line));
+        Console.WriteLine($"[entdata]   rows: slots={texts.Count(t => t.StartsWith("slot "))}, "
+                          + $"offers={texts.Count(t => t.StartsWith("offer "))}");
+        Shot(dlg, "entdata_02_window");
+
+        Button? RowDelete(string label)
+        {
+            var text = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => (t.Text ?? "") == label);
+            return (text?.Parent as StackPanel)?.Children.OfType<Button>().FirstOrDefault();
+        }
+
+        TextBox? RowBox(string label)
+        {
+            var text = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => (t.Text ?? "") == label);
+            return (text?.Parent as StackPanel)?.Children.OfType<TextBox>().FirstOrDefault();
+        }
+
+        string Note() => Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => t.Name == "EditNote")?.Text
+                          ?? string.Join(" | ", Descendants(dlg).OfType<TextBlock>()
+            .Select(t => t.Text ?? "").Where(t => t.StartsWith("Nothing changed") || t.Contains("freed") ||
+                                                  t.Contains("deleted") || t.Contains("to write") || t.Contains("to delete")
+                                                  || t.Contains("Not applied") || t.Contains("Nothing to apply")
+                                                  || t.Contains("Rebuild failed")));
+
+        // ---- delete one offer: the offer and the slot that holds its item must both go ----
+        var offerBtn = RowDelete("offer 1");
+        if (offerBtn is null) Console.WriteLine("  offer 1 row not found");
+        else
+        {
+            offerBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(0.6);
+            Console.WriteLine($"[entdata] after deleting offer 1: {Cut(Note())}");
+            Console.WriteLine($"[entdata]   offer 1 row button now: {(RowDelete("offer 1")?.Content as string)}");
+            Shot(dlg, "entdata_03_offer_deleted");
+        }
+
+        // ---- edit a price in place: the offer's own fields are editable inside the row ----
+        var offer0 = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => (t.Text ?? "") == "offer 0");
+        var expander = (offer0?.Parent as StackPanel)?.Parent as Expander;
+        Console.WriteLine($"[entdata] offer 0 row found={offer0 is not null}, expander={expander is not null}");
+        if (expander is not null)
+        {
+            expander.IsExpanded = true;
+            Pump(0.8);
+        }
+
+        var priceBox = RowBox("price");
+        Console.WriteLine($"[entdata] price box found={priceBox is not null} (was '{priceBox?.Text}')");
+        if (priceBox is not null)
+        {
+            priceBox.Text = "11";
+            Pump(0.6);
+            Console.WriteLine($"[entdata] after editing price=11: {Cut(Note())}");
+            // A typed value alone must arm the apply button: the window used to count only the model, and a box
+            // is not in the model until apply, so the button stayed dead (RaiseEvent never noticed - it bypasses IsEnabled)
+            var addBtn = Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Tag as string) == "apply");
+            Console.WriteLine($"[entdata] apply armed by a typed value: {addBtn?.IsEnabled} (text '{addBtn?.Content}')");
+        }
+
+        // ---- change what the trader sells: the code and count are the ItemStack header, not tree fields ----
+        // The inventory block starts collapsed; open it the way a user does, then type into the row's boxes
+        foreach (var exp in Descendants(dlg).OfType<Expander>())
+        {
+            var head = (exp.Header as TextBlock)?.Text ?? "";
+            if (head.StartsWith("Inventory — traderInventory", StringComparison.Ordinal)) exp.IsExpanded = true;
+        }
+
+        Pump(1.0);
+        var itemCode = Descendants(dlg).OfType<TextBox>().FirstOrDefault(b => (b.Tag as string) == "item-code");
+        var itemCount = Descendants(dlg).OfType<TextBox>().FirstOrDefault(b => (b.Tag as string) == "item-count");
+        Console.WriteLine($"[entdata] item editor: code box={itemCode is not null} ('{itemCode?.Text}'), "
+                          + $"count box={itemCount is not null} ('{itemCount?.Text}')");
+        if (itemCode is not null && itemCount is not null)
+        {
+            var before = itemCode.Text;
+            itemCode.Text = "item:2394";
+            itemCount.Text = "3";
+            // Enter is what a user presses; the boxes commit on Enter and when they lose focus, not per keystroke
+            foreach (var box in new[] { itemCode, itemCount })
+                box.RaiseEvent(new KeyEventArgs { RoutedEvent = InputElement.KeyDownEvent, Key = Key.Enter });
+            Pump(0.8);
+            Console.WriteLine($"[entdata] after setting item '{before}' -> '{itemCode.Text}' x{itemCount.Text}: {Cut(Note())}");
+        }
+
+        // ---- delete a money slot (no offer behind it) ----
+        var money = texts.FirstOrDefault(t => t.StartsWith("slot ") && t is "slot 40");
+        var slotBtn = money is null ? null : RowDelete(money);
+        if (slotBtn is not null)
+        {
+            slotBtn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(0.6);
+            Console.WriteLine($"[entdata] after deleting {money}: {Cut(Note())}");
+        }
+
+        // ---- delete a whole block: the flag has to reach the bytes, not just the card ----
+        var blockDel = Descendants(dlg).OfType<Button>().FirstOrDefault(
+            b => (b.Tag as string)?.StartsWith("block:Trade offers", StringComparison.Ordinal) == true);
+        Console.WriteLine($"[entdata] offer-block delete button found={blockDel is not null}");
+        // The block deletion takes every offer with it, so a typed price is checked in a run of its own:
+        // UISNAP_SKIP_BLOCK=1 leaves the offers alone and the applied edit is the price only.
+        if (blockDel is not null && Environment.GetEnvironmentVariable("UISNAP_SKIP_BLOCK") != "1")
+        {
+            blockDel.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(0.6);
+            Console.WriteLine($"[entdata] after deleting the offer block: {Cut(Note())}");
+        }
+
+        Shot(dlg, "entdata_04_marked");
+
+        var apply = Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Tag as string) == "apply");
+        if (apply is null || !apply.IsEnabled)
+        {
+            Console.WriteLine("[entdata] FAILED: the apply button is missing or disabled");
+            dlg.Close();
+            CloseNow(w);
+            Pump(0.5);
+            return;
+        }
+
+        apply.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Pump(1.5);
+        Console.WriteLine($"[entdata] dialog closed={w.OwnedWindows.Count == 0}");
+
+        var edits = EditsOf(w);
+        var rowsWithEdits = edits.Snapshot();
+        var chunk = rowsWithEdits.Chunks.FirstOrDefault();
+        Console.WriteLine($"[entdata] pending: chunks={rowsWithEdits.Chunks.Length}, "
+                          + $"field={chunk.Fields.FirstOrDefault().Field}, occ={chunk.Fields.FirstOrDefault().Occ}, "
+                          + $"payload={chunk.Fields.FirstOrDefault().Data?.Length ?? 0} B, label='{Cut(edits.LabelForPayload(chunk.Position, 6, chunk.Fields.FirstOrDefault().Occ))}'");
+
+        if (chunk.Fields.FirstOrDefault().Data is { } payload)
+        {
+            var doc = EntityDataDocument.Load(payload, 6, chunk.Position, chunk.Fields.FirstOrDefault().Occ, "trader",
+                SaveOf(w).BlockRegistry, SaveOf(w).ItemRegistry);
+            Console.WriteLine($"[entdata] reload: offers={doc.Offers.Count}, keys={string.Join(",", doc.Offers.Select(o => o.Key))}, "
+                              + $"lossless={doc.Lossless}, pending-after-load={doc.Counts().Changed}");
+            var slots = doc.Blocks.FirstOrDefault(b => b.Kind == EntityDataKind.Inventory)?.Slots;
+            Console.WriteLine($"[entdata]   slots after: {string.Join(",", slots?.Children.Select(c => c.Key) ?? Array.Empty<string>())}");
+            var price = doc.Offers.FirstOrDefault(o => o.Key == "0");
+            Console.WriteLine($"[entdata]   offer 0 price now: {price?.Price}");
+            var slot0After = doc.Blocks.FirstOrDefault(b => b.Kind == EntityDataKind.Inventory)?.Slots
+                ?.Children.FirstOrDefault(c => c.Key == "0");
+            var offer0After = doc.Offers.FirstOrDefault(o => o.Key == "0");
+            Console.WriteLine($"[entdata]   slot 0 now: {slot0After?.ItemClass}:{slot0After?.ItemId} x{slot0After?.StackSize}, "
+                              + $"offer 0 now: '{offer0After?.ItemCode}' x{offer0After?.Count}");
+            // the two halves of a trader's item must still agree, or the save would sell what it does not hold
+            Console.WriteLine($"[entdata]   slot and offer agree: {slot0After?.StackSize == offer0After?.Count}");
+        }
+
+        Shot(w, "entdata_05_after_apply");
+        CloseNow(w);
+        Pump(0.5);
+    }
+
+/// <summary>
+    ///     Writes an "Entity data" edit into a working copy of the save and reads it back: the payload has to
+    ///     survive the round trip through the database, not just through the serializer.
+    /// </summary>
+    private static void EntityWriteProbe(string save)
+    {
+        using var f = VSSaveFile.OpenReadOnly(save);
+        var reg = f.BlockRegistry;
+        var itemReg = f.ItemRegistry;
+        long last = long.MinValue;
+        (long Pos, int Occ, byte[] Payload)? found = null;
+        var rows = 0L;
+        while (found is null)
+        {
+            var page = f.ReadChunkRowsPage(last, 4096);
+            if (page.Count == 0) break;
+            foreach (var row in page)
+            {
+                rows++;
+                var data = row.Data;
+                if (data is not { Length: > 0 } || !HasAscii(data, "trader")) continue;
+                var occ = 0;
+                foreach (var fl in VSCore.Format.PbReader.ReadMessage(data, maxDepth: 1, maxFields: 5000))
+                    if (fl.Field == 6 && fl.WireType == 2 && HasAscii(fl.Bytes!, "entitytrader"))
+                    {
+                        found = (row.Position, occ, fl.Bytes!);
+                        break;
+                    }
+
+                if (found is not null) break;
+            }
+
+            last = page[^1].Position;
+        }
+
+        if (found is not { } target)
+        {
+            Console.WriteLine("no trader found");
+            return;
+        }
+
+        Console.WriteLine($"chunk rows scanned: {rows}; trader at {target.Pos}:{target.Occ}, {target.Payload.Length} B");
+        var doc = EntityDataDocument.Load(target.Payload, 6, target.Pos, target.Occ, "trader", reg, itemReg);
+        var key = doc.Offers[1].Key;
+        var name = FieldByPath(doc.Entity!, "nametag.name");
+        Console.WriteLine($"  offers={doc.Offers.Count}, deleting offer '{key}', name='{name}'");
+        Console.WriteLine("  " + doc.RemoveOffer(key));
+        var payload = doc.Build().Payload!;
+        Console.WriteLine($"  payload {target.Payload.Length} → {payload.Length} B");
+
+        var blob = f.ReadChunk(target.Pos)!;
+        var newBlob = ChunkDataEditor.SplicePayloads(blob, new[] { (6, target.Occ, payload) });
+        Console.WriteLine($"  chunk blob {blob.Length} → {newBlob.Length} B");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (copy, backup) = VSSaveFile.CopyAndApplyChunkChanges(save, new[] { (target.Pos, newBlob) });
+        sw.Stop();
+        Console.WriteLine($"  copy written in {sw.ElapsedMilliseconds} ms: {copy}");
+        Console.WriteLine($"  original: {new System.IO.FileInfo(save).Length} B (untouched by the copy)");
+
+        try
+        {
+            using var again = VSSaveFile.OpenReadOnly(copy);
+            var back = again.ReadChunk(target.Pos)!;
+            var payloadBack = EntityEditService.ReadPayload(back, 6, target.Occ)!;
+            var docBack = EntityDataDocument.Load(payloadBack, 6, target.Pos, target.Occ, "trader", again.BlockRegistry,
+                again.ItemRegistry);
+            var slots = docBack.Blocks.FirstOrDefault(b => b.Kind == EntityDataKind.Inventory)?.Slots;
+            Console.WriteLine($"  reopen: payload {payloadBack.Length} B (expected {payload.Length}), "
+                              + $"offers={docBack.Offers.Count}, keys={string.Join(",", docBack.Offers.Select(o => o.Key))}");
+            Console.WriteLine($"  reopen: name='{FieldByPath(docBack.Entity!, "nametag.name")}', "
+                              + $"health={FieldByPath(docBack.Entity!, "health.currenthealth")}, "
+                              + $"slots={string.Join(",", slots?.Children.Select(c => c.Key) ?? Array.Empty<string>())}");
+            Console.WriteLine($"  reopen: payload equals the built one: {payloadBack.AsSpan().SequenceEqual(payload)}");
+            var sameChunk = back.AsSpan().SequenceEqual(newBlob);
+            Console.WriteLine($"  reopen: the whole chunk row equals the built blob: {sameChunk}");
+        }
+        finally
+        {
+            // the copy is 12 GB: remove it (and its backup) after the check
+            foreach (var path in new[] { copy, backup })
+                try
+                {
+                    if (System.IO.File.Exists(path)) System.IO.File.Delete(path);
+                }
+                catch (Exception ex) { Console.WriteLine("  cleanup: " + ex.Message); }
+
+            var dir = System.IO.Path.GetDirectoryName(copy);
+            if (dir is not null && dir.Contains("working", StringComparison.Ordinal))
+                try { System.IO.Directory.Delete(dir, true); } catch { }
+        }
+    }
+
+    private static string FieldByPath(EntityRecord rec, string path)
+    {
+        foreach (var fl in rec.Fields)
+            if (string.Equals(fl.DisplayPath, path, StringComparison.Ordinal))
+                return fl.ValueText;
+        return "";
+    }
+
+    private static double Num(ChunkField fl) => fl.Type switch
+    {
+        ChunkFieldType.Int32 or ChunkFieldType.Int64 => fl.IntValue,
+        ChunkFieldType.Float => fl.FloatValue,
+        ChunkFieldType.Double => fl.DoubleValue,
+        _ => 0
+    };
+
+    private static string StackCode(ChunkField fl, BlockRegistry reg, ItemRegistry items)
+    {
+        if (fl.ItemStackIsNull) return "";
+        return (fl.ItemClass == 1 ? items.CodeOf(fl.ItemId) : reg.CodeOf(fl.ItemId)) ?? "";
+    }
+
+    private static IEnumerable<string> CodesIn(string text)
+    {
+        var i = 0;
+        while (i < text.Length)
+        {
+            var idx = text.IndexOf("game:trader", i, StringComparison.Ordinal);
+            if (idx < 0) break;
+            var end = idx + 5;
+            while (end < text.Length && (text[end] is >= 'a' and <= 'z' || text[end] == '-' || text[end] == ':')) end++;
+            yield return text[idx..end].TrimEnd('-');
+            i = end;
+        }
+    }
+
+    private static string Join(Dictionary<long, int> d) =>
+        string.Join(", ", d.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}×{kv.Value}"));
+
+    private static string Join(Dictionary<string, int> d) =>
+        string.Join(", ", d.OrderByDescending(kv => kv.Value).Take(8).Select(kv => $"{kv.Key}:{kv.Value}"));
+
+    private static double Min(List<double> v) => v.Count == 0 ? 0 : v.Min();
+    private static double Max(List<double> v) => v.Count == 0 ? 0 : v.Max();
+
+    private static double Median(List<double> v)
+    {
+        if (v.Count == 0) return 0;
+        var s = v.OrderBy(x => x).ToList();
+        return s.Count % 2 == 1 ? s[s.Count / 2] : (s[s.Count / 2 - 1] + s[s.Count / 2]) / 2;
+    }
+
+    private static int Min(List<int> v) => v.Count == 0 ? 0 : v.Min();
+    private static int Max(List<int> v) => v.Count == 0 ? 0 : v.Max();
+
+    private static long Median(List<long> v)
+    {
+        if (v.Count == 0) return 0;
+        var s = v.OrderBy(x => x).ToList();
+        return s.Count % 2 == 1 ? s[s.Count / 2] : (s[s.Count / 2 - 1] + s[s.Count / 2]) / 2;
+    }
+
+    private static string Cut(string s, int max) => s.Length <= max ? s : s[..max] + "…";
+
+    private static bool HasAscii(ReadOnlySpan<byte> hay, string token)
+    {
+        var t = Encoding.ASCII.GetBytes(token);
+        if (t.Length == 0 || hay.Length < t.Length) return false;
+        for (var i = 0; i + t.Length <= hay.Length; i++)
+        {
+            var j = 0;
+            for (; j < t.Length; j++)
+            {
+                var c = hay[i + j];
+                if (c is >= (byte)'A' and <= (byte)'Z') c += 32;
+                if (c != t[j]) break;
+            }
+
+            if (j == t.Length) return true;
+        }
+
+        return false;
     }
 
     private static void ScanProbe(string save)
@@ -933,7 +2003,9 @@ internal static class Harness
             if (sp.Children.Count < 3 || sp.Bounds.Width < 2) continue;
             double sum = sp.Children.Sum(c => c.Bounds.Width) + (sp.Children.Count - 1) * sp.Spacing;
             if (sum > sp.Bounds.Width + 2)
-                rows.Add($"overflow row(sum={sum:0} panel={sp.Bounds.Width:0}, n={sp.Children.Count}) @{sp.Bounds.Top:0},{sp.Bounds.Left:0}");
+                rows.Add($"overflow row(sum={sum:0} panel={sp.Bounds.Width:0}, n={sp.Children.Count}) @{sp.Bounds.Top:0},{sp.Bounds.Left:0}"
+                         + " [" + string.Join(" | ", sp.Children.Select(c => (c as TextBlock)?.Text
+                             ?? (c as Button)?.Content as string ?? c.GetType().Name)) + "]");
         }
         Console.WriteLine($"  [{phase}] overflowing rows: {(rows.Count == 0 ? "none" : string.Join("; ", rows))}");
     }

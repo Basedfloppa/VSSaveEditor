@@ -13,10 +13,33 @@ namespace VSCore;
 public sealed class ItemRegistry
 {
     private readonly Dictionary<int, string> _idToCode = new();
+    private Dictionary<string, List<int>>? _codeToIds;
 
     public string? CodeOf(int id) => _idToCode.TryGetValue(id, out var c) ? c : null;
     public int Count => _idToCode.Count;
     public IReadOnlyCollection<string> Codes => _idToCode.Values;
+
+    /// <summary>The reverse direction, built on first use: the window lets a user type a code and needs the id
+    /// that code means. Same shape as <see cref="BlockRegistry.IdsOf" /> — a code may be registered twice.</summary>
+    public IReadOnlyList<int> IdsOf(string code)
+    {
+        if (_codeToIds is null)
+        {
+            var map = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            foreach (var (id, c) in _idToCode)
+            {
+                if (!map.TryGetValue(c, out var list)) map[c] = list = new List<int>(1);
+                list.Add(id);
+            }
+
+            foreach (var list in map.Values) list.Sort();
+            _codeToIds = map;
+        }
+
+        return _codeToIds.TryGetValue(code, out var ids) ? ids : (IReadOnlyList<int>)Array.Empty<int>();
+    }
+
+    public bool HasCode(string code) => IdsOf(code).Count > 0;
 
     public static ItemRegistry FromGamedata(byte[]? gamedata)
     {

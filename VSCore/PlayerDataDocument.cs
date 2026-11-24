@@ -79,18 +79,11 @@ public readonly record struct PlayerDataCounts(
     public bool Changed => ValuesEdited > 0 || NodesRemoved > 0 || BlocksRemoved > 0;
 
     /// <summary>The pending-edit label: what will be written, in the words the window uses.</summary>
-    public string Label
-    {
-        get
-        {
-            var parts = new List<string>();
-            if (ValuesEdited > 0) parts.Add($"{ValuesEdited} value(s) changed");
-            if (NodesRemoved > 0) parts.Add($"{NodesRemoved} node(s) deleted");
-            if (KeysRemoved > 0) parts.Add($"{KeysRemoved} mod key(s) deleted");
-            if (InventoriesRemoved > 0) parts.Add($"{InventoriesRemoved} inventor(y/ies) deleted");
-            return parts.Count == 0 ? "nothing to apply" : string.Join(", ", parts);
-        }
-    }
+    public string Label => EditCountsLabel.Of(
+        (ValuesEdited, "value(s) changed"),
+        (NodesRemoved, "node(s) deleted"),
+        (KeysRemoved, "mod key(s) deleted"),
+        (InventoriesRemoved, "inventor(y/ies) deleted"));
 }
 
 /// <summary>What a player-data edit produces: new blobs plus the counted changes for the pending-edit label.</summary>

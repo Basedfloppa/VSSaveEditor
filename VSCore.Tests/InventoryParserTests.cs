@@ -5,6 +5,7 @@ using System.Text;
 using Microsoft.Data.Sqlite;
 using VSCore;
 using Xunit;
+using static VSCore.Tests.TestBytes;
 
 namespace VSCore.Tests
 {
@@ -185,31 +186,6 @@ namespace VSCore.Tests
             var items = ItemRegistry.FromGamedata(gamedata);
             Assert.Equal("soil-medium-normal", blocks.CodeOf(1));
             Assert.Equal("clothes-upperbody-commoner-shirt", items.CodeOf(1));
-        }
-
-        /// <summary>gamedata: marker + tag field2/wire2 + LP payload of messages {field1=id, field2=code}.</summary>
-        private static byte[] Gamedata(params (string Marker, (int Id, string Code)[] Entries)[] sections)
-        {
-            var ms = new MemoryStream();
-            foreach (var (marker, entries) in sections)
-            {
-                var payload = new MemoryStream();
-                foreach (var (id, code) in entries)
-                {
-                    var msg = Cat(new byte[] { 8 }, Varint(id), new byte[] { 18 }, Lp(code));
-                    payload.Write(new byte[] { 18 }, 0, 1);
-                    payload.Write(Varint(msg.Length), 0, Varint(msg.Length).Length);
-                    payload.Write(msg, 0, msg.Length);
-                }
-
-                ms.Write(Lp(marker), 0, Lp(marker).Length);
-                ms.WriteByte(0x12);
-                var len = Varint((int)payload.Length);
-                ms.Write(len, 0, len.Length);
-                payload.WriteTo(ms);
-            }
-
-            return ms.ToArray();
         }
 
         [Fact(DisplayName = "Save scan: entity, block entity and player inventories all make it into the index")]

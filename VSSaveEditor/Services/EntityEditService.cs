@@ -150,19 +150,27 @@ public static class EntityEditService
     ///     it would override the field edit - so we ask and replace it in one history step (as in the chunk card).
     /// </summary>
     public static async Task<bool> CommitAsync(IEntityEditHost host, Target target, byte[] payload, string label)
+        => await CommitPayloadAsync(host, target.Position, target.Field, target.Occurrence, payload, label);
+
+    /// <summary>
+    ///     The commit itself, addressed by the triple — used both by the field editor and by the "Entity data"
+    ///     window, so the conflict with a pending raw-hex edit is resolved in one place and not two.
+    /// </summary>
+    public static async Task<bool> CommitPayloadAsync(IEntityEditHost host, long position, int field, int occurrence,
+        byte[] payload, string label)
     {
         var edits = host.Edits;
-        if (edits.HasWholeChunkEdit(target.Position))
+        if (edits.HasWholeChunkEdit(position))
         {
             var ok = await host.Confirm("Field edit vs raw hex",
-                $"Chunk {EditSession.ChunkScope(target.Position)} already has a pending RAW HEX edit that "
+                $"Chunk {EditSession.ChunkScope(position)} already has a pending RAW HEX edit that "
                 + "replaces the whole chunk.\nApplying the edit will DISCARD that raw hex edit for this chunk.\nContinue?");
             if (!ok) return false;
-            edits.ReplaceWholeChunkWithPayload(target.Position, target.Field, target.Occurrence, payload, label);
+            edits.ReplaceWholeChunkWithPayload(position, field, occurrence, payload, label);
         }
         else
         {
-            edits.PutPayload(target.Position, target.Field, target.Occurrence, payload, label);
+            edits.PutPayload(position, field, occurrence, payload, label);
         }
 
         host.PendingChanged();

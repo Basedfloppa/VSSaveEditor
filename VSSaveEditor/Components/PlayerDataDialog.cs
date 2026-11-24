@@ -45,12 +45,13 @@ public sealed class PlayerDataDialog
     private readonly ListBox _playerList = new() { MinWidth = 240 };
     private readonly StackPanel _detail = new() { Spacing = 4, Margin = new Thickness(10, 0, 0, 0) };
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _note = new() { TextWrapping = TextWrapping.Wrap };
+    // Named so the UI probe reads THIS line, not the static hint in the header (both mention "to delete")
+    private readonly TextBlock _note = new() { TextWrapping = TextWrapping.Wrap, Name = "EditNote" };
 
     private readonly Button _applyBtn = new()
         { Content = "Add to pending edits", Padding = new Thickness(14, 3), IsEnabled = false };
 
-    private readonly List<TextEditRow> _rows = new();
+    private readonly List<EditRow> _rows = new();
     private PlayerDataDocument? _doc;
     private List<PlayerIdentity> _shown = new();
     private Window? _window;
@@ -304,7 +305,7 @@ public sealed class PlayerDataDialog
         var hidden = 0;
         foreach (var f in fields)
         {
-            if (IsHeaderNoise(f))
+            if (f.IsHeaderNoise)
             {
                 hidden++;
                 continue;
@@ -325,48 +326,10 @@ public sealed class PlayerDataDialog
                 + "name this editor understands, so they cannot be edited or deleted here"));
     }
 
-    /// <summary>
-    ///     The bytes in front of the ECX tree of an entity: the parser keeps them byte for byte, but they carry
-    ///     no key and cannot be edited — showing them as a dozen "&lt;1 raw byte&gt;" rows only hides the real data.
-    /// </summary>
-    private static bool IsHeaderNoise(ChunkField f)
-        => f.Type == ChunkFieldType.Opaque && (f.Key.Length == 0 || f.Key.Any(c => char.IsControl(c)));
-
+    // The mod-key tree repeats the same key inside a value, so there the full path is the label
     private Control RenderField(ChunkField f, int depth)
-    {
-        var childrenShown = f.Children.Where(c => !IsHeaderNoise(c)).ToList();
-        var isTree = f.Type == ChunkFieldType.Tree && childrenShown.Count > 0 && !f.IsRawTree;
-        StackPanel? children = null;
-        if (isTree)
-        {
-            children = new StackPanel { Spacing = 1, Margin = new Thickness(8, 0, 0, 0) };
-            foreach (var child in childrenShown) children.Children.Add(RenderField(child, depth + 1));
-        }
-
-        var row = new CardUi.TreeRow
-        {
-            Label = f.Path.Length > 0 ? f.Path : f.Key,
-            Tip = isTree
-                ? "Delete this whole subtree"
-                : "Delete this field from the saved character/inventory",
-            LabelTip = $"{f.DisplayPath} ({f.Type})",
-            Indent = depth * 10,
-            LabelWidth = 250,
-            BoxWidth = 180,
-            Removed = f.Removed,
-            ToggleRemoved = () => f.Removed = !f.Removed,
-            OnChanged = UpdateSummary,
-            EditableText = f.IsEditable ? f.EditText : null,
-            ValueText = f.ValueText,
-            Hint = f.IsEditable ? f.Type.ToString() : isTree ? $"{childrenShown.Count} field(s)" : "",
-            Children = children,
-            Expand = depth == 0 && childrenShown.Count <= 8
-        };
-
-        var control = CardUi.AddTreeRow(_window, row, out var box);
-        if (box is not null) _rows.Add(new TextEditRow(f, box, f.EditText));
-        return control;
-    }
+        => CardUi.AddFieldRow(_window, f, depth, "Delete this field from the saved character/inventory",
+            pathLabel: true, UpdateSummary, (field, box) => _rows.Add(new EditRow(field, box, field.EditText)));
 
     // ------------------------- protobuf tree (mod keys) -------------------------
 
@@ -417,7 +380,7 @@ public sealed class PlayerDataDialog
         };
 
         var control = CardUi.AddTreeRow(_window, row, out var box);
-        if (box is not null) _rows.Add(new TextEditRow(node, box, text));
+        if (box is not null) _rows.Add(new EditRow(node, box, text));
         return control;
     }
 
@@ -431,14 +394,17 @@ public sealed class PlayerDataDialog
             return;
         }
 
-        // Counted on the model, not on the boxes: a redraw recreates the boxes with the already-edited text,
-        // and the "what will be written" line must not fall back to zero because of that.
+        // The model counts deletions; a value still sitting in a box is not in the model until apply (or a redraw),
+        // so a typed value alone would leave the button dead. Both sources, one "to write" per typed box.
         var counts = _doc.Counts();
-        _applyBtn.IsEnabled = counts.Changed;
-        _note.Text = counts.Changed
-            ? $"{counts.ValuesEdited} value(s) to write, {counts.NodesRemoved} node(s) to delete, "
-              + $"{counts.BlocksRemoved} block(s) to delete"
-            : "Nothing changed yet.";
+        var typed = _rows.Count(r => r.IsChanged);
+        var (text, any) = EditCountsLabel.Live(typed,
+            (counts.ValuesEdited, "value(s) changed"),
+            (counts.NodesRemoved, "node(s) deleted"),
+            (counts.KeysRemoved, "mod key(s) deleted"),
+            (counts.InventoriesRemoved, "inventory(ies) deleted"));
+        _applyBtn.IsEnabled = any;
+        _note.Text = any ? text : "Nothing changed yet.";
     }
 
     private bool PushTexts(out string? error)
@@ -459,32 +425,11 @@ public sealed class PlayerDataDialog
             }
 
             var node = row.Node!;
-            var text = (row.Box.Text ?? "").Trim();
-            if (node.WireType == 0)
+            if (!PbTree.TrySetText(node, row.Box.Text, out var nodeError))
             {
-                if (!long.TryParse(text, out var value))
-                {
-                    error = $"{node.Label}: '{text}' is not a whole number";
-                    return false;
-                }
-
-                PbTree.SetInt(node, value);
-                continue;
-            }
-
-            if (node.Text is not null)
-            {
-                PbTree.SetText(node, row.Box.Text ?? "");
-                continue;
-            }
-
-            if (!ChunkFieldText.TryParseHex(text, out var bytes, out var hexError))
-            {
-                error = $"{node.Label}: {hexError}";
+                error = $"{node.Label}: {nodeError}";
                 return false;
             }
-
-            PbTree.SetBytes(node, bytes);
         }
 
         return true;
@@ -524,30 +469,5 @@ public sealed class PlayerDataDialog
 
     // ------------------------- helpers -------------------------
 
-    /// <summary>One editable row: a box, and the text it had when the row was drawn. Only a box whose text
-    /// differs is pushed into the model — otherwise every Apply would "edit" every field it could show, and the
-    /// pending edit would rewrite blobs nobody touched.</summary>
-    private sealed class TextEditRow
-    {
-        public TextEditRow(ChunkField? field, TextBox box, string original)
-        {
-            Field = field;
-            Box = box;
-            Original = original;
-        }
 
-        public TextEditRow(PbNode node, TextBox box, string original)
-        {
-            Node = node;
-            Box = box;
-            Original = original;
-        }
-
-        public ChunkField? Field { get; }
-        public PbNode? Node { get; }
-        public TextBox Box { get; }
-        public string Original { get; }
-
-        public bool IsChanged => (Box.Text ?? "") != Original;
-    }
 }

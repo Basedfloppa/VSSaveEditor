@@ -91,12 +91,29 @@ public sealed class ChunkField
     /// <summary>Label in lists and cards: the full path if the field is nested.</summary>
     public string DisplayPath => Path.Length > 0 ? Path : Key;
 
+    /// <summary>
+    ///     A byte the parser kept but could not name: the position doubles and behaviour blobs an entity writes
+    ///     before its fields. Showing a dozen "&lt;1 raw byte&gt;" rows only hides the real data, and such a byte
+    ///     cannot be edited or deleted on its own.
+    /// </summary>
+    public bool IsHeaderNoise => Type == ChunkFieldType.Opaque && (Key.Length == 0 || Key.Any(char.IsControl));
+
     /// <summary>Whether the value can be edited as a string. Tree and ItemStack are edited through their leaves.</summary>
     public bool IsEditable => Type is ChunkFieldType.Int32 or ChunkFieldType.Int64 or ChunkFieldType.Float
         or ChunkFieldType.Double or ChunkFieldType.String or ChunkFieldType.Bool
         or ChunkFieldType.ByteArray or ChunkFieldType.StringArray or ChunkFieldType.IntArray
         or ChunkFieldType.FloatArray or ChunkFieldType.DoubleArray or ChunkFieldType.LongArray
         or ChunkFieldType.BoolArray;
+
+    /// <summary>The field as a number, whatever numeric type the game wrote it as (0 for anything else).
+    /// Cards and offer rows read a value they do not control the type of; each used to switch on it itself.</summary>
+    public double AsDouble => Type switch
+    {
+        ChunkFieldType.Int32 or ChunkFieldType.Int64 => IntValue,
+        ChunkFieldType.Float => FloatValue,
+        ChunkFieldType.Double => DoubleValue,
+        _ => 0
+    };
 
     public string ValueText => Type switch
     {

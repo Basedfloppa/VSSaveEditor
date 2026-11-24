@@ -224,6 +224,44 @@ public static class PbTree
         n.Dirty = true;
     }
 
+    /// <summary>
+    ///     Applies what was typed in a value box: a number for a varint field, text for a len-delimited field the
+    ///     editor shows as text, hex otherwise. The window used to dispatch this itself, with the same three
+    ///     branches in every place that showed a protobuf value.
+    /// </summary>
+    public static bool TrySetText(PbNode n, string? text, out string? error)
+    {
+        error = null;
+        var typed = text ?? "";
+        var trimmed = typed.Trim();
+        if (n.WireType == 0)
+        {
+            if (!long.TryParse(trimmed, out var value))
+            {
+                error = $"'{trimmed}' is not a whole number";
+                return false;
+            }
+
+            SetInt(n, value);
+            return true;
+        }
+
+        if (n.Text is not null)
+        {
+            SetText(n, typed);
+            return true;
+        }
+
+        if (!ChunkFieldText.TryParseHex(trimmed, out var bytes, out var hexError))
+        {
+            error = hexError;
+            return false;
+        }
+
+        SetBytes(n, bytes);
+        return true;
+    }
+
     public static void SetBytes(PbNode n, byte[] payload)
     {
         if (n.WireType != 2 || n.IsMessage) return;

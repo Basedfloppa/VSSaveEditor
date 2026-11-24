@@ -214,4 +214,41 @@ public class PlayerDataDocumentTests
         var shared = Assert.Single(doc.Blocks.Where(b => b.Kind == PlayerDataKind.SharedKey));
         Assert.Equal(1, PlayerDataDocument.CountPlayerEntries(shared, UidA));
     }
+
+    /// <summary>
+    ///     Same invariant as `EntityDataDocumentTests.Counts_and_build_agree_on_a_removed_block`: a block the summary
+    ///     counts as deleted must produce a new blob. The character block is excluded on purpose — a player without a
+    ///     character is not a state the window offers, and `Counts()` skips that flag.
+    /// </summary>
+    [Theory]
+    [InlineData(PlayerDataKind.Inventory)]
+    [InlineData(PlayerDataKind.ModKey)]
+    [InlineData(PlayerDataKind.SharedKey)]
+    public void Counts_and_build_agree_on_a_removed_block(PlayerDataKind kind)
+    {
+        var doc = Load();
+        doc.Blocks.First(b => b.Kind == kind).Removed = true;
+        var counts = doc.Counts();
+        var build = doc.Build();
+
+        Assert.True(counts.Changed, $"{kind}: the summary announces the deletion");
+        if (kind == PlayerDataKind.Inventory)
+        {
+            Assert.NotNull(build.NewPlayerdata);
+        }
+        else
+        {
+            Assert.NotNull(build.NewGamedata);
+            Assert.Null(build.NewPlayerdata);
+        }
+    }
+
+    [Fact]
+    public void An_untouched_player_says_nothing_and_builds_nothing()
+    {
+        var doc = Load();
+        Assert.False(doc.Counts().Changed);
+        Assert.Null(doc.Build().NewPlayerdata);
+        Assert.Null(doc.Build().NewGamedata);
+    }
 }

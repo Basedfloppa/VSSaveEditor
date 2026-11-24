@@ -89,6 +89,7 @@ public partial class MainWindow
         EntitiesView.FilterChanged += OnEntityFilterChanged;
         EntitiesView.EntityPicked += OnEntityPicked;
         EntitiesView.ClearRequested += OnEntityClearFilter;
+        EntitiesView.EntityDataRequested += OnEntityData;
         EntitiesView.CopyListRequested += OnCopyEntityList;
         EntitiesView.CopyDumpRequested += OnCopyScanDump;
 

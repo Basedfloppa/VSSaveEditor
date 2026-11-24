@@ -6,27 +6,31 @@
     <!-- The "Entities" tab: a flat list of all creatures and block entities in the save instead of the text dump.
          Matches on the left, the card of the selected record on the right, with the same field editor as in a chunk. -->
     <DockPanel>
-        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Spacing="6" Margin="6">
-            <TextBlock Text="Find:" FontWeight="Bold" />
-            <TextBox x:Name="EntityFilterBox" Width="260"
+        <!-- Grid, not StackPanel: the summary is the only cell allowed to shrink, so the buttons stay inside
+             the drawer at its narrowest checked width (`uisnap enttoolbar` measures this row at 960 and 1280). -->
+        <Grid DockPanel.Dock="Top" Margin="6" ColumnDefinitions="Auto,Auto,Auto,Auto,*,Auto,Auto,Auto">
+            <TextBlock Grid.Column="0" Text="Find:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <TextBox Grid.Column="1" x:Name="EntityFilterBox" Width="260" Margin="0,0,6,0"
                      Watermark="wolf, chest, onHurt, maxhealth…"
                      ToolTip.Tip="Matches the species/type, the kind and sex-age, the code list, the parsed field names and values" />
-            <ComboBox x:Name="EntityCategoryPick" Width="150" SelectedIndex="0"
+            <ComboBox Grid.Column="2" x:Name="EntityCategoryPick" Width="150" SelectedIndex="0" Margin="0,0,6,0"
                       ToolTip.Tip="Which records to list: everything, only creatures (field 6) or only block entities (field 8)">
                 <ComboBoxItem Content="All" />
                 <ComboBoxItem Content="Entities" />
                 <ComboBoxItem Content="Block entities" />
             </ComboBox>
-            <Button x:Name="EntityClearBtn" Content="Clear" Padding="8,2" />
-            <!-- Width and trimming are fixed: there is one toolbar row, and a long summary would push
-                 the buttons past the right edge of the window (the layout probe catches this via "overflowing rows"). -->
-            <TextBlock x:Name="EntitySummaryLabel" MaxWidth="360" TextTrimming="CharacterEllipsis"
+            <Button Grid.Column="3" x:Name="EntityClearBtn" Content="Clear" Padding="8,2" Margin="0,0,6,0" />
+            <!-- Trimming keeps a long summary from pushing the buttons out; MaxWidth keeps it from swallowing the row -->
+            <TextBlock Grid.Column="4" x:Name="EntitySummaryLabel" MaxWidth="360" TextTrimming="CharacterEllipsis"
+                       VerticalAlignment="Center" Margin="0,0,6,0"
                        Foreground="{DynamicResource TextAccentBrush}" />
-            <Button x:Name="CopyListBtn" Content="Copy list" Padding="8,2"
+            <Button Grid.Column="5" x:Name="EntityDataBtn" Content="Entity data…" Padding="8,2" Margin="0,0,6,0"
+                    ToolTip.Tip="Everything saved for one record — its fields, its inventories and a trader's trade offers: edit values, delete items and offers" />
+            <Button Grid.Column="6" x:Name="CopyListBtn" Content="Copy list" Padding="8,2" Margin="0,0,6,0"
                     ToolTip.Tip="Copy the rows currently shown" />
-            <Button x:Name="CopyDumpBtn" Content="Copy raw dump" Padding="8,2"
+            <Button Grid.Column="7" x:Name="CopyDumpBtn" Content="Copy raw dump" Padding="8,2"
                     ToolTip.Tip="Copy the full text dump of the save (same as before: tables, histograms, regions, raw blobs)" />
-        </StackPanel>
+        </Grid>
         <components:ScopeBar x:Name="Scope" DockPanel.Dock="Top" />
         <!-- Common names: you see at a glance what exists in the world, and one click sends it to the filter -->
         <WrapPanel x:Name="EntityChipsPanel" DockPanel.Dock="Top" Margin="6,0,6,4" />

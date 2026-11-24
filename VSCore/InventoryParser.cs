@@ -23,7 +23,7 @@ public static class InventoryParser
     /// <summary>Quick check: without the `slots` string there can be no inventory in the blob.
     /// Saves parsing the tree for most block entities (lights, flowers, mechanisms).</summary>
     public static bool MightContainInventory(ReadOnlySpan<byte> payload)
-        => payload.IndexOf("slots"u8) >= 0;
+        => payload.IndexOf(InventoryShape.SlotsUtf8) >= 0;
 
     /// <summary>Inventories of an entity (field 6): `backpack`, `wearablesInv`, `harvestableInv`, …</summary>
     public static List<InventoryInfo> ParseEntity(byte[] payload, EntityInfo owner, BlockRegistry? blocks, ItemRegistry? items)
@@ -110,7 +110,8 @@ public static class InventoryParser
             int p = i + 1;
             if (!TryReadString(payload, ref p, out var key)) continue;
             if (key.Length is < 2 or > 48 || !IsPrintableKey(key)) continue;
-            if (key is "slots" or "qslots") continue; // parts of an inventory, not separate containers
+            if (key is InventoryShape.Slots or InventoryShape.SlotCount)
+                continue; // parts of an inventory, not separate containers
 
             try
             {
@@ -166,9 +167,10 @@ public static class InventoryParser
     {
         slots = null!;
         slotCount = 0;
-        if (!tree.TryGetValue("slots", out var raw) || raw is not Dictionary<string, object?> map) return false;
-        if (tree.TryGetValue("qslots", out var q) && q is long ql)
-            slotCount = ql is < 0 or > 100_000 ? map.Count : (int)ql;
+        if (!tree.TryGetValue(InventoryShape.Slots, out var raw) || raw is not Dictionary<string, object?> map)
+            return false;
+        if (tree.TryGetValue(InventoryShape.SlotCount, out var q) && q is long ql)
+            slotCount = InventoryShape.IsSaneSlotCount(ql) ? (int)ql : map.Count;
         else slotCount = map.Count;
         slots = map;
         return true;
@@ -240,16 +242,21 @@ public static class InventoryParser
         }
     }
 
+    /// <summary>
+    ///     The code for the (class, id) pair exactly as the game writes it. One place, because a second copy
+    ///     drifts as soon as a save has no ItemIDs section: then only BlockIDs knows the code of a block item,
+    ///     and that beats showing `item:<id>`.
+    /// </summary>
+    public static string CodeOf(int itemClass, int id, BlockRegistry? blocks, ItemRegistry? items)
+        => itemClass == 0
+            ? blocks?.CodeOf(id) ?? items?.CodeOf(id) ?? ""
+            : items?.CodeOf(id) ?? blocks?.CodeOf(id) ?? "";
+
     private static void ResolveCodes(List<InventoryContents> inventories, BlockRegistry? blocks, ItemRegistry? items)
     {
         foreach (var inv in inventories)
             foreach (var stack in inv.Items)
-                // Old/server saves may have no ItemIDs section at all. Then the only
-                // available registry is BlockIDs: for block items (and some
-                // modded ones) the code is found there, and that beats `item:<id>`.
-                stack.Code = stack.IsBlock
-                    ? blocks?.CodeOf(stack.Id) ?? items?.CodeOf(stack.Id) ?? ""
-                    : items?.CodeOf(stack.Id) ?? blocks?.CodeOf(stack.Id) ?? "";
+                stack.Code = CodeOf(stack.Class, stack.Id, blocks, items);
     }
 
     private sealed record OwnerContext(InventoryOwnerKind Kind, string Label, string Code, long Position, int Field,

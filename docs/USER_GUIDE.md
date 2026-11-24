@@ -118,6 +118,22 @@ Selecting a row opens a card with the real position and recognized fields. **Sho
 
 Nested values such as `health.currenthealth`, `hunger.saturation`, arrays, booleans and `pos.x/y/z` are shown as separate fields. Bytes the editor cannot interpret are preserved and can be changed through **Raw payload (hex)**.
 
+### Entity data (everything saved for one record)
+
+Press **Entities → Entity data…** to open one record as a document. The list on the left is what the Entities tab currently shows, so the filter and the category carry over; pick a row and the right side lists, for that record, one **collapsed block per part** — the header of each block carries the numbers, so a trader shows all three at a glance (the record of a creature holds hundreds of fields and would otherwise push the rest below the fold):
+
+- **Record** — its own fields: name, health, personality, outfit, `spawnX/Y/Z`, `lastRefreshTotalDays` and whatever a mod added;
+- **Inventory** — every inventory found inside the record (`traderInventory`, `backpack`, `seraphinventory`, `inventory`): one row per filled slot with **two boxes — the item code and how many** — the item's attributes inside the row, the inventory's own fields below;
+- **Trade offers** — for a trader, its `tradeItems` list: one row per offer with the same two boxes, plus price, stock and restock rules, and the offer's fields editable inside the row.
+
+The item code and count are not tree fields — they are numbers in the `ItemStack` header — so they are edited in the two boxes on the row. Type a code (`clothes-head-minstrel-hat`) or an explicit `item:123` / `block:123`, set the count, and press Enter or leave the box: an unknown code is refused and nothing changes. Changing a trader's item rewrites both halves — the offer and the slot that holds it — because the game keeps them in step.
+
+Any value is edited in place, and ✕ deletes a field, a subtree, an item or a whole offer. A trader's offer and the slot that holds its item are two halves of the same thing — the game keeps `tradeItems.k` and `slots.k` in step — so deleting one deletes the other, and the row's tooltip says so. Money and gear slots have no offer behind them and are removed on their own. **Delete this block** removes a whole inventory or the whole offer list.
+
+**Add to pending edits** turns the result into ONE pending edit of that record's payload (the note line says what will be written: values changed, offers/items/fields deleted, bytes freed). It then travels the ordinary path: **Review & apply…** shows the diff, **Apply to working copy** writes it, and undo works until the save is written. Only the ranges you touched are rebuilt — the record is serialised once and every field you did not edit keeps its exact bytes.
+
+The position of a creature is written as raw doubles in the payload, not as a field, so it is edited in **Edit fields** (the card), not here.
+
 ### Items
 
 The **Items** tab searches player inventories, entity inventories and block-entity containers such as chests, barrels and crates.
@@ -138,7 +154,7 @@ Terms are combined with AND. A malformed `chunk:` term is reported in the summar
 
 **Show chunk on map** jumps to the stack's chunk. **Open owner** opens the player or container record.
 
-Item stacks are currently **read-only**: you can locate an item, but not rewrite its contents.
+The tab itself is **read-only**: it locates an item, it does not rewrite it. Items are edited where they belong to an owner — **Entities → Entity data…** for a creature's or a container's inventories, **Players → Player data…** for a player's.
 
 ### Players
 

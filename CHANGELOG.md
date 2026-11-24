@@ -17,6 +17,29 @@ The changes of this working session in one screen; the detailed entries are belo
   new gamedata blob) and travels the ordinary Review & apply → Save a copy path with undo. Only the edited
   ranges are rebuilt: every other field of the row, every other key and every other player stay byte-identical.
   The mod-oriented bulk view ("this mod, every player") is one button further: **All players by mod…**.
+- **Entity data is editable per record — including a trader's stock.** **Entities → Entity data…** opens one
+  record as a document: its own fields, every inventory inside it (`traderInventory`, `backpack`, `inventory`)
+  and, for a trader, its `tradeItems` list with price, stock and restock rules. Values are edited in place and
+  ✕ deletes a field, a subtree, an item or a whole offer; deleting a trader's item also deletes its offer,
+  because the game keeps `tradeItems.k` and `slots.k` in step (6 308 of 6 308 offers in a real save are paired
+  with a slot holding the same item). The result is ONE pending edit of that payload, rebuilt in one pass; a
+  record nobody edited is written back byte for byte (68 753 of 68 753 entity records of a 12-GB save
+  round-trip exactly).
+- **A trader's inventory can be changed, not only emptied.** The item code and the count of a slot live in the
+  `ItemStack` header, not in the field tree, so the window could delete an item but never replace it — which is
+  exactly what "edit the traders' inventory" needs. Every slot row now carries two boxes (code, count); the code
+  is resolved through the item and block registries (`gem-quartz`, or `item:2394` / `block:7` when the code is
+  unknown) and an unknown code is refused without touching the record. A trader's offer and its slot hold the
+  same item in two places, so both halves are written together. Blocks also start collapsed now: the record of a
+  creature is hundreds of fields, and while it was expanded the inventory and the offer list sat below the fold
+  and looked absent. Verified on a real 12-GB save: the item was replaced and the count set (slot 0 and offer 0
+  both read `×3` after reload), price edit, offer and block deletion and the money slot all still apply.
+- **The drawer header and the Entities toolbar fit the panel at every checked width.** Both were StackPanels,
+  so a long summary ("8 of 8 record(s) matching …") or a long state label ("original (read-only until the first
+  edit)") pushed the buttons past the drawer edge: the Entities row wanted 933 px in an 872 px panel at 960x660.
+  They are Grids now with exactly one flexible cell, so that text trims instead of moving the buttons. Measured
+  by the new probe mode `uisnap enttoolbar` (872/872 and 1192/1192) and by `uisnap layout`, which reports no
+  overflowing row on either real save at 960x660 and 1280x800.
 - **The areas list lives in `Find blocks` only.** The `Area 1 of 4` buttons are gone from Chunks,
   Entities, Items and Players; the list has a fixed width, pages with `‹ ›` and wraps on a narrow
   window instead of painting over its neighbours.
@@ -60,6 +83,13 @@ The changes of this working session in one screen; the detailed entries are belo
   belong to the player are cut with one button. The result is one pending edit, rebuilt in a single pass per
   blob (`VSCore/PlayerDataDocument.cs`, `VSCore/PbTree.cs`, `VSCore/PlayerDataParser.Rewrite`,
   `VSCore/ModDataStore.Rewrite`, `VSSaveEditor/Components/PlayerDataDialog.cs`).
+- **Entity data** editor: one creature or block entity as a document — the record's own fields, its inventories
+  with one row per filled slot (item code, count, attributes) and a trader's `tradeItems` with price/stock.
+  Deleting an item of a trader removes the offer that sells it, and vice versa; a whole inventory or the whole
+  offer list is deleted as a block. One pending edit per record, built by serialising the parsed ECX tree once
+  (`VSCore/EntityDataDocument.cs`, `VSSaveEditor/Components/EntityDataDialog.cs`,
+  `VSSaveEditor/MainWindow.axaml.cs`: `ShowEntityDataAsync`). The window refuses to build a payload for a record
+  that does not round-trip through the parser (`Lossless`), instead of writing bytes it only guessed at.
 - **Mod data** editor for the world message (`gamedata`): the saved keys of every mod, grouped by mod id,
   with the player each per-player key belongs to and a removal that is a normal pending edit
   (`VSCore/ModData.cs`, `VSSaveEditor/Components/ModDataDialog.cs`). It is now the bulk view, opened from the

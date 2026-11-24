@@ -205,6 +205,14 @@ internal static class CardUi
         public StackPanel? Children { get; init; }
 
         public bool Expand { get; init; }
+
+        /// <summary>Extra controls drawn after the value box (an item's code and count, which live in the
+        /// stack header rather than in the tree).</summary>
+        public Control? Extra { get; init; }
+
+        /// <summary>Receives the hint TextBlock once the row is built, so a caller can keep the row's summary in
+        /// step with a value it edits through <see cref="Extra" />.</summary>
+        public Action<TextBlock>? HintSink { get; init; }
     }
 
     /// <summary>
@@ -285,14 +293,20 @@ internal static class CardUi
             });
         }
 
+        if (row.Extra is not null) strip.Children.Add(row.Extra);
+
         if (row.Hint.Length > 0)
-            strip.Children.Add(new TextBlock
+        {
+            var hint = new TextBlock
             {
                 Text = row.Hint,
                 FontSize = 10,
                 VerticalAlignment = VerticalAlignment.Center,
                 Foreground = Brushes.Gray
-            });
+            };
+            strip.Children.Add(hint);
+            row.HintSink?.Invoke(hint);
+        }
 
         if (row.Children is null) return strip;
 
@@ -305,6 +319,51 @@ internal static class CardUi
             HorizontalContentAlignment = HorizontalAlignment.Stretch
         };
     }
+    /// <summary>
+    ///     One field of a record: the delete/undo row with its own value box, and the children under it when the
+    ///     field is a tree. The player window and the entity window draw exactly this; they differed only in the
+    ///     label (a nested key, or the full path where the same key repeats inside a mod value), the delete
+    ///     tooltip and where the box gets registered, so those three are the parameters.
+    /// </summary>
+    public static Control AddFieldRow(Control? owner, ChunkField f, int depth, string fieldTip, bool pathLabel,
+        Action? onChanged, Action<ChunkField, TextBox>? onBox)
+    {
+        var childrenShown = f.Children.Where(c => !c.IsHeaderNoise).ToList();
+        var isTree = f.Type == ChunkFieldType.Tree && childrenShown.Count > 0 && !f.IsRawTree;
+        StackPanel? children = null;
+        if (isTree)
+        {
+            children = new StackPanel { Spacing = 1, Margin = new Thickness(8, 0, 0, 0) };
+            foreach (var child in childrenShown)
+                children.Children.Add(AddFieldRow(owner, child, depth + 1, fieldTip, pathLabel, onChanged, onBox));
+        }
+
+        var row = new TreeRow
+        {
+            // A nested row already sits inside its parent, so a full path there repeats four ancestors per line;
+            // the full path stays in the label tooltip.
+            Label = pathLabel && f.Path.Length > 0 ? f.Path : f.Key,
+            Tip = isTree ? "Delete this whole subtree" : fieldTip,
+            LabelTip = $"{f.DisplayPath} ({f.Type})",
+            Indent = depth * 10,
+            LabelWidth = 250,
+            BoxWidth = 180,
+            Removed = f.Removed,
+            ToggleRemoved = () => f.Removed = !f.Removed,
+            OnChanged = onChanged,
+            EditableText = f.IsEditable ? f.EditText : null,
+            ValueText = f.ValueText,
+            Hint = f.IsEditable ? f.Type.ToString() : isTree ? $"{childrenShown.Count} field(s)" : "",
+            Children = children,
+            Expand = depth == 0 && childrenShown.Count <= 8
+        };
+
+        var control = AddTreeRow(owner, row, out var box);
+        // Every box of the subtree, not just the root's: a value two levels down is edited like any other
+        if (box is not null) onBox?.Invoke(f, box);
+        return control;
+    }
+
     /// <summary>
     ///     Compact display of the card fields: the first N rows plus a lazily expanded list of the rest.
     ///     It used to print ALL fields: a panel with 36 block entities grew to ~14 700 px and built thousands of controls.

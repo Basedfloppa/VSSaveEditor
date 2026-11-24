@@ -70,6 +70,13 @@ public sealed class EntitiesTabService
     public int ShownCount => _shown.Count;
     public int TotalCount => _all.Count;
 
+    /// <summary>The rows the list currently shows (the tab's filter and scope applied) — the "Entity data"
+    /// window opens with exactly these, so it never lists records the tab would not.</summary>
+    public IReadOnlyList<EntityRow> Shown => _shown;
+
+    /// <summary>The record whose card is open, if any.</summary>
+    public EntityRow? SelectedRow => _selected;
+
     /// <summary>The list index is rebuilt once per scan (and reset when the save is closed).</summary>
     public void SetIndex(SaveScanResult? data) => SetIndex(data, _host.Scope);
 

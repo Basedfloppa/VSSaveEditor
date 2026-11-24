@@ -95,13 +95,18 @@
                       HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"
                       Expanded="OnDataPanelToggled" Collapsed="OnDataPanelToggled">
                 <Expander.Header>
-                    <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Top">
-                        <TextBlock Text="Save data — chunks &amp; entities" />
-                        <Button x:Name="UndoBtn" Content="Undo" Click="OnUndo" IsEnabled="False" Padding="8,1"
+                    <!-- Grid, not StackPanel: the state label is the free-width cell, so a long
+                         "original (read-only until the first edit)" trims instead of widening the row past the
+                         drawer (`uisnap layout` reports that as an overflowing row). -->
+                    <Grid ColumnDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,*" VerticalAlignment="Top">
+                        <TextBlock Grid.Column="0" Text="Save data — chunks &amp; entities" Margin="0,0,10,0" />
+                        <Button Grid.Column="1" x:Name="UndoBtn" Content="Undo" Click="OnUndo" IsEnabled="False" Padding="8,1"
+                                Margin="0,0,10,0"
                                 ToolTip.Tip="Undo the last pending edit (Ctrl+Z)" />
-                        <Button x:Name="RedoBtn" Content="Redo" Click="OnRedo" IsEnabled="False" Padding="8,1"
+                        <Button Grid.Column="2" x:Name="RedoBtn" Content="Redo" Click="OnRedo" IsEnabled="False" Padding="8,1"
+                                Margin="0,0,10,0"
                                 ToolTip.Tip="Redo the last undone edit (Ctrl+Y or Ctrl+Shift+Z)" />
-                        <Button x:Name="HistoryBtn" Click="OnShowHistory" Padding="6,1"
+                        <Button Grid.Column="3" x:Name="HistoryBtn" Click="OnShowHistory" Padding="6,1" Margin="0,0,10,0"
                                 ToolTip.Tip="Pending edit history: newest first, undone entries greyed out">
                             <StackPanel Orientation="Horizontal" Spacing="6">
                                 <Border Background="{DynamicResource TextAccentBrush}" CornerRadius="8" Padding="6,0"
@@ -113,17 +118,17 @@
                                 <TextBlock Text="History" />
                             </StackPanel>
                         </Button>
-                        <Button x:Name="ReviewBtn" Content="Review &amp; apply…" Click="OnReviewAndCommit"
-                                IsEnabled="False" Padding="8,1"
+                        <Button Grid.Column="4" x:Name="ReviewBtn" Content="Review &amp; apply…" Click="OnReviewAndCommit"
+                                IsEnabled="False" Padding="8,1" Margin="0,0,10,0"
                                 ToolTip.Tip="Show every pending change (old → new), then apply it to the loaded working copy" />
-                        <Button x:Name="SaveCopyNowBtn" Content="Save a copy…" Click="OnSaveCopy"
-                                IsEnabled="False" Padding="8,1"
+                        <Button Grid.Column="5" x:Name="SaveCopyNowBtn" Content="Save a copy…" Click="OnSaveCopy"
+                                IsEnabled="False" Padding="8,1" Margin="0,0,10,0"
                                 ToolTip.Tip="Write the working copy to a .vcdbs next to the original (the original is never overwritten)" />
                         <!-- Makes it clear that the working copy is what is open; the tooltip points to the original file -->
-                        <TextBlock x:Name="WorkingCopyLabel" Text="working copy" IsVisible="False"
-                                   VerticalAlignment="Center" FontSize="11"
+                        <TextBlock Grid.Column="6" x:Name="WorkingCopyLabel" Text="working copy" IsVisible="False"
+                                   VerticalAlignment="Center" FontSize="11" TextTrimming="CharacterEllipsis"
                                    Foreground="{DynamicResource TextSecondaryBrush}" />
-                    </StackPanel>
+                    </Grid>
                 </Expander.Header>
                 <TabControl x:Name="DataTabs">
                     <!-- The tab contents live in Components/Tabs: layout and control wiring

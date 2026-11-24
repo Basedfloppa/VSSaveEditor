@@ -797,6 +797,71 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
     }
 
+    // ===================== ENTITY DATA (record + inventories + trade offers) =====================
+
+    private async void OnEntityData(object? sender, RoutedEventArgs e)
+    {
+        await ShowEntityDataAsync();
+    }
+
+    /// <summary>
+    ///     "Entity data…": everything one record holds in a single window — its own fields, every inventory inside
+    ///     it and a trader's `tradeItems`. Values are edited in place and any node can be cut; an item of a trader
+    ///     takes its trade offer with it, because the game keeps `tradeItems.k` and `slots.k` in step.
+    ///
+    ///     The list is the one the Entities tab shows (its filter and scope), so the window never offers a record
+    ///     the tab would not. The result is ONE pending edit of that payload and then travels the ordinary
+    ///     Review &amp; apply path — the diff, the undo step and "the original is never modified" hold for it
+    ///     like for every other edit.
+    /// </summary>
+    private async Task ShowEntityDataAsync()
+    {
+        if (_save is null)
+        {
+            Status.Set(StatusChannel.Chunk, "Open a save first — a record lives in its chunk.", priority: AppStatus.PriorityError);
+            return;
+        }
+
+        var save = _save;
+        var edits = _edits;
+        var rows = _entities.Shown;
+        if (rows.Count == 0)
+        {
+            Status.Set(StatusChannel.Chunk,
+                "No records to edit — open a save and wait for the scan (or clear the Entities filter).");
+            return;
+        }
+
+        byte[]? ReadPayload(EntityRow row)
+        {
+            // The chunk in its current state: with the accumulated edits, so a second edit builds on the first
+            // and not on the bytes that were already replaced in the pending change.
+            var blob = EntityEditService.ReadChunkCurrent(save, edits, row.Position);
+            return blob is null ? null : EntityEditService.ReadPayload(blob, row.Field, row.Occurrence);
+        }
+
+        try
+        {
+            var request = await EntityDataDialog.ShowAsync(this, rows, _entities.SelectedRow, ReadPayload,
+                save.BlockRegistry, save.ItemRegistry);
+            if (request is null) return;
+
+            var committed = await EntityEditService.CommitPayloadAsync(this, request.Position, request.Field,
+                request.Occurrence, request.Payload, request.Label);
+            if (!committed) return;
+
+            _chunkView.UpdateDirtyStatus();
+            Status.Set(StatusChannel.Chunk,
+                $"Pending edit for {request.Label}. Nothing is written yet — "
+                + "Review & apply… → Apply to working copy.",
+                priority: 90);
+        }
+        catch (Exception ex)
+        {
+            Status.Set(StatusChannel.Chunk, "Entity data failed: " + ex.Message, priority: AppStatus.PriorityError);
+        }
+    }
+
     /// <summary>The players tab shows pending marks and edited values: redraw it after an edit from this window.</summary>
     private void RefreshPlayersTab()
     {
