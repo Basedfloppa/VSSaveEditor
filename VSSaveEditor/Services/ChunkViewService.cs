@@ -691,11 +691,12 @@ public sealed class ChunkViewService
     {
         var chunks = _host.Edits.ChunkCount;
         var players = _host.Edits.PlayerCount;
-        _host.SetSaveEnabled(chunks + players > 0);
+        var gamedata = _host.Edits.GamedataCount;
+        _host.SetSaveEnabled(_host.Edits.PendingLocationCount > 0);
         _host.PendingChanged();
         // build from _statusBase rather than "+=", so the text does not accumulate across repeated calls
-        _host.ChunkStatus = chunks + players > 0
-            ? $"{_statusBase}  |  {chunks} chunk(s), {players} player(s) with pending edits — Review & apply…"
+        _host.ChunkStatus = _host.Edits.PendingLocationCount > 0
+            ? $"{_statusBase}  |  {chunks} chunk(s), {players} player(s), {gamedata} gamedata with pending edits — Review & apply…"
             : _statusBase;
     }
 

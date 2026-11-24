@@ -103,6 +103,7 @@ public sealed class PendingChangesDialog
         _kind.Items.Add("Chunk fields");
         _kind.Items.Add("Raw chunk blobs");
         _kind.Items.Add("Players");
+        _kind.Items.Add("World data (gamedata)");
         _kind.SelectedIndex = 0; // after filling: before that there is no selected item
         _kind.SelectionChanged += (_, _) => Render();
         filters.Children.Add(_kind);
@@ -178,9 +179,10 @@ public sealed class PendingChangesDialog
     {
         return _kind.SelectedIndex switch
         {
-            1 => !g.IsPlayer && !r.ByteLevel,
-            2 => !g.IsPlayer && r.ByteLevel,
+            1 => !g.IsPlayer && !g.IsGamedata && !r.ByteLevel,
+            2 => !g.IsPlayer && !g.IsGamedata && r.ByteLevel,
             3 => g.IsPlayer,
+            4 => g.IsGamedata,
             _ => true
         };
     }
@@ -211,7 +213,8 @@ public sealed class PendingChangesDialog
         if (shown.Count == 0) inner.Children.Add(Gray("(no readable differences)"));
         foreach (var r in shown.Take(80))
         {
-            var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("240,*,24,*") };
+            // gamedata rows carry a whole mod-data key, which is longer than any field name
+            var grid = new Grid { ColumnDefinitions = new ColumnDefinitions(g.IsGamedata ? "520,*,24,*" : "240,*,24,*") };
             grid.Children.Add(Cell(r.Field, 0, true));
             grid.Children.Add(Cell(r.OldValue, 1, true, true));
             grid.Children.Add(Cell("→", 2, false, true));

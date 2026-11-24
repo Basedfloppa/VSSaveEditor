@@ -23,6 +23,7 @@ using VSCore;
 using VSSaveEditor;
 using VSSaveEditor.Components;
 using VSSaveEditor.Components.Tabs;
+using VSSaveEditor.Models;
 
 internal static class Harness
 {
@@ -380,6 +381,18 @@ internal static class Harness
         if (mode == "players")
         {
             Players(save);
+            return;
+        }
+
+        if (mode == "playerdata")
+        {
+            PlayerDataProbe(save);
+            return;
+        }
+
+        if (mode == "moddata")
+        {
+            ModDataProbe(save);
             return;
         }
 
@@ -6644,6 +6657,306 @@ internal static class Harness
         CloseNow(w);
         Pump(0.5);
         Console.WriteLine("DONE");
+    }
+
+
+    /// <summary>
+    ///     The per-player data window: everything the save keeps for ONE player (character tree, inventories,
+    ///     per-player mod keys, world keys that name the player), and one end-to-end pass through it —
+    ///     select a player, change a value, delete a mod key, add the pending edit.
+    /// </summary>
+    private static void PlayerDataProbe(string save)
+    {
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source=file:{save}?immutable=1;Mode=ReadOnly");
+        conn.Open();
+        byte[] Blob(string sql)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            using var r = cmd.ExecuteReader();
+            return r.Read() && !r.IsDBNull(0) ? (byte[])r.GetValue(0) : null;
+        }
+
+        var gamedata = Blob("select data from gamedata limit 1");
+        var blobs = new Dictionary<long, byte[]>();
+        var players = new List<PlayerIdentity>();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "select playerid, data from playerdata order by playerid";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var id = r.GetInt64(0);
+                var data = (byte[])r.GetValue(1);
+                blobs[id] = data;
+                var pd = PlayerDataParser.Parse(data, id);
+                players.Add(new PlayerIdentity(id, pd.Uid ?? "", pd.CustomName));
+            }
+        }
+
+        Console.WriteLine($"save={System.IO.Path.GetFileName(save)} players={players.Count} gamedata={gamedata?.Length ?? 0}");
+
+        var owner = new Window { Width = 1100, Height = 760, Title = "playerdata-owner" };
+        owner.Show();
+        Pump(0.4);
+
+        Task<PlayerDataEditRequest> task = null;
+        Dispatcher.UIThread.Post(() =>
+            task = PlayerDataDialog.ShowAsync(owner, players, gamedata, id => blobs.TryGetValue(id, out var b) ? b : null));
+        Pump(0.8);
+
+        var dlg = owner.OwnedWindows.FirstOrDefault();
+        if (dlg == null)
+        {
+            Console.WriteLine("RESULT: FAIL — the player data window did not open");
+            return;
+        }
+
+        dlg.Width = 1200;
+        dlg.Height = 820;
+        Pump(0.4);
+        Shot(dlg, "playerdata_01_window");
+
+        var list = Descendants(dlg).OfType<ListBox>().FirstOrDefault();
+        Console.WriteLine($"players in the list: {(list?.ItemCount ?? -1)}");
+        var index = players.FindIndex(p => p.Name == "zorolin");
+        list!.SelectedIndex = index >= 0 ? index : 0;
+        Pump(0.8);
+        Console.WriteLine($"  selected: {list.SelectedItem}");
+        Shot(dlg, "playerdata_02_tree");
+
+        // ---- what the window shows ----
+        var texts = Descendants(dlg).OfType<TextBlock>().Select(t => t.Text ?? "").Where(t => t.Length > 0).ToList();
+        foreach (var needle in new[]
+                 {
+                     "Character", "Inventory", "Mod key (this player)", "World key naming this player",
+                     "divineascension_playerprogressiondata_", "health.currenthealth", "loreDiscoveriesByPlayerUid"
+                 })
+            Console.WriteLine($"  shown '{needle}': {(texts.Any(t => t.Contains(needle)) ? "yes" : "NO")}");
+        Console.WriteLine($"  value boxes: {Descendants(dlg).OfType<TextBox>().Count()}");
+        Console.WriteLine($"  keys shown: {texts.Count(t => t.StartsWith("divineascension_") || t.StartsWith("oreMapMarkers-"))}");
+
+        // ---- expand a subtree and change a value ----
+        // Collapsed subtree content is not attached to the visual tree: expand the health group only, so the
+        // screenshot stays readable (the character alone has hundreds of fields).
+        foreach (var exp in Descendants(dlg).OfType<Expander>())
+            if (exp.Header is StackPanel h && h.Children.OfType<TextBlock>().Any(t => t.Text == "health"))
+                exp.IsExpanded = true;
+        Pump(0.5);
+
+        Console.WriteLine($"  expanders={Descendants(dlg).OfType<Expander>().Count()} "
+                          + $"boxes={Descendants(dlg).OfType<TextBox>().Count()}");
+
+        // The value box sits next to its label; the raw text is the round-trip form ("23.50999"), which is why
+        // the row is found by label, not by value.
+        var healthLabel = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => t.Text == "health.currenthealth");
+        var healthRow = (healthLabel?.Parent as StackPanel)?.Children.OfType<TextBox>().FirstOrDefault();
+        Console.WriteLine($"  health box found: {healthRow != null}");
+        if (healthRow != null)
+        {
+            healthRow.Text = "20";
+            Pump(0.4);
+        }
+
+        // ---- cut this player's entries out of a shared world key ----
+        var sharedMark = Descendants(dlg).OfType<Button>()
+            .FirstOrDefault(b => (b.Tag as string) == "mark:loreDiscoveriesByPlayerUid");
+        Console.WriteLine($"  'remove entries' for loreDiscoveriesByPlayerUid: {sharedMark?.Content}");
+        sharedMark?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Pump(0.6);
+
+        // ---- delete this player's Divine Ascension key ----
+        var daButton = Descendants(dlg).OfType<Button>()
+            .FirstOrDefault(b => (b.Tag as string)?.StartsWith("block:divineascension_playerprogressiondata_") == true);
+        Console.WriteLine($"  'delete block' for the DA key: {daButton != null}");
+        daButton?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Pump(0.5);
+        daButton?.BringIntoView();
+        Pump(0.5);
+        foreach (var t in Descendants(dlg).OfType<TextBlock>().Where(t => (t.Text ?? "").Contains("value(s) to write")))
+            Console.WriteLine("  summary line: " + t.Text);
+        Shot(dlg, "playerdata_03_marked");
+
+        var apply = Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Tag as string) == "apply");
+        Console.WriteLine($"  apply enabled: {apply?.IsEnabled}");
+        if (apply is { IsEnabled: true })
+        {
+            apply.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.0);
+        }
+
+        if (task == null || !task.IsCompletedSuccessfully)
+        {
+            Console.WriteLine("RESULT: FAIL — the window did not return an edit");
+            return;
+        }
+
+        var request = task.Result;
+        if (request == null)
+        {
+            Console.WriteLine("RESULT: FAIL — null request (nothing applied)");
+            return;
+        }
+
+        var entriesBefore = ModDataStore.Read(gamedata);
+        var entriesAfter = ModDataStore.Read(request.NewGamedata);
+        var keyGone = entriesBefore.Count(e => e.Key.StartsWith("divineascension_playerprogressiondata_")) ==
+                      entriesAfter.Count(e => e.Key.StartsWith("divineascension_playerprogressiondata_")) + 1;
+        var rowBytes = request.NewPlayerdata ?? blobs[request.PlayerId];
+        var newPd = PlayerDataParser.Parse(rowBytes, request.PlayerId);
+        var newEntity = PlayerDataParser.ParseEntityRecord(rowBytes);
+        var health = newEntity?.Fields.FirstOrDefault(f => f.DisplayPath == "health.currenthealth");
+        var othersSame = entriesBefore
+            .Where(e => !e.Key.StartsWith("divineascension_playerprogressiondata_") && e.Key != "loreDiscoveriesByPlayerUid")
+            .All(e => entriesAfter.First(x => x.Key == e.Key).Value.SequenceEqual(e.Value));
+
+        Console.WriteLine($"  request: label='{request.Label}'");
+        Console.WriteLine($"  playerdata {blobs[request.PlayerId].Length} -> {rowBytes.Length} B, "
+                          + $"inventories {newPd.Inventories.Count}, health.currenthealth={health?.ValueText}");
+        Console.WriteLine($"  gamedata {gamedata.Length} -> {request.NewGamedata.Length} B, DA key removed={keyGone}, "
+                          + $"other keys byte-identical={othersSame}");
+        var healthEdited = healthRow == null || health?.ValueText == "20";
+        var lore = entriesAfter.First(e => e.Key == "loreDiscoveriesByPlayerUid").Value;
+        var uidBytes = System.Text.Encoding.UTF8.GetBytes(request.PlayerUid ?? "");
+        Console.WriteLine($"  loreDiscoveriesByPlayerUid: player entry removed={!ContainsSeq(lore, uidBytes)}, "
+                          + $"others kept={entriesBefore.First(e => e.Key == "loreDiscoveriesByPlayerUid").Value.Length > lore.Length}");
+        var ok = healthEdited && keyGone && othersSame && newPd.Inventories.Count > 0 && !ContainsSeq(lore, uidBytes);
+        Console.WriteLine(ok
+            ? "RESULT: OK — the window edits values and deletes keys in one pending edit"
+            : "RESULT: FAIL — the collected edit does not match what was asked");
+
+        CloseNow(dlg);
+        CloseNow(owner);
+        Pump(0.3);
+        Console.WriteLine("DONE");
+    }
+
+
+    /// <summary>
+    ///     The "Mod data" window: the bulk view ("this mod, every player"). It shares the frame, the wrapped
+    ///     explanation lines and the byte formatting with the player window, so this probe covers the shared
+    ///     parts as much as the dialog itself.
+    /// </summary>
+    private static void ModDataProbe(string save)
+    {
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source=file:{save}?immutable=1;Mode=ReadOnly");
+        conn.Open();
+        byte[] Blob(string sql)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            using var r = cmd.ExecuteReader();
+            return r.Read() && !r.IsDBNull(0) ? (byte[])r.GetValue(0) : null;
+        }
+
+        var gamedata = Blob("select data from gamedata limit 1");
+        var players = new List<PlayerIdentity>();
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "select playerid, data from playerdata order by playerid";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var id = r.GetInt64(0);
+                var pd = PlayerDataParser.Parse((byte[])r.GetValue(1), id);
+                players.Add(new PlayerIdentity(id, pd.Uid ?? "", pd.CustomName));
+            }
+        }
+
+        Console.WriteLine($"save={System.IO.Path.GetFileName(save)} players={players.Count} gamedata={gamedata?.Length ?? 0}");
+        if (gamedata is not { Length: > 0 })
+        {
+            Console.WriteLine("RESULT: FAIL — the save has no gamedata row");
+            return;
+        }
+
+        var owner = new Window { Width = 1100, Height = 760, Title = "moddata-owner" };
+        owner.Show();
+        Pump(0.4);
+
+        Task<ModDataRemovalRequest> task = null;
+        Dispatcher.UIThread.Post(() => task = ModDataDialog.ShowAsync(owner, gamedata, players));
+        Pump(0.8);
+
+        var dlg = owner.OwnedWindows.FirstOrDefault();
+        if (dlg == null)
+        {
+            Console.WriteLine("RESULT: FAIL — the mod data window did not open");
+            return;
+        }
+
+        dlg.Width = 1200;
+        dlg.Height = 800;
+        Pump(0.4);
+        Shot(dlg, "moddata_01_window");
+
+        var texts = Descendants(dlg).OfType<TextBlock>().Select(t => t.Text ?? "").Where(t => t.Length > 0).ToList();
+        var explained = texts.Count(t => t.Contains("gamedata") || t.Contains("PENDING"));
+        var summary = texts.FirstOrDefault(t => t.Contains("key(s) in")) ?? "(no summary line)";
+        Console.WriteLine($"  explanation lines: {explained}");
+        Console.WriteLine($"  summary: {summary}");
+
+        var list = Descendants(dlg).OfType<ListBox>().FirstOrDefault();
+        Console.WriteLine($"groups in the list: {(list?.ItemCount ?? -1)}");
+        var items = (list?.ItemsSource as IEnumerable<object>)?.Select(i => i?.ToString() ?? "").ToList() ?? new List<string>();
+        var index = items.FindIndex(i => i.StartsWith("divineascension"));
+        Console.WriteLine($"  divineascension group at {index}: {(index >= 0 ? items[index] : "(not found)")}");
+        list!.SelectedIndex = index >= 0 ? index : 0;
+        Pump(0.8);
+        Shot(dlg, "moddata_02_detail");
+
+        var radios = Descendants(dlg).OfType<RadioButton>().ToList();
+        Console.WriteLine("  scopes: " + string.Join(" | ", radios.Select(r => $"{(r.Content as string)} checked={r.IsChecked}")));
+        var remove = Descendants(dlg).OfType<Button>()
+            .FirstOrDefault(b => (b.Content as string)?.StartsWith("Remove ") == true);
+        Console.WriteLine($"  action button: enabled={remove?.IsEnabled}");
+        Shot(dlg, "moddata_03_scope");
+
+        remove?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Pump(0.6);
+
+        if (task == null || !task.IsCompletedSuccessfully)
+        {
+            Console.WriteLine("RESULT: FAIL — the window did not return a removal");
+            return;
+        }
+
+        var request = task.Result;
+        if (request == null)
+        {
+            Console.WriteLine("RESULT: FAIL — null request (nothing removed)");
+            return;
+        }
+
+        var before = ModDataStore.Read(gamedata);
+        var after = ModDataStore.Read(request.NewGamedata);
+        var keptSame = before.Where(e => request.Removed.All(r => r.Key != e.Key))
+            .All(e => after.First(a => a.Key == e.Key).Value.SequenceEqual(e.Value));
+        Console.WriteLine($"  request: mod={request.ModId} removed={request.Removed.Count} key(s), "
+                          + $"{request.BytesFreed} B, world data={request.IncludesWorldData}");
+        Console.WriteLine($"  gamedata {gamedata.Length} -> {request.NewGamedata.Length} B, "
+                          + $"keys {before.Count} -> {after.Count}, others byte-identical={keptSame}");
+        var ok = request.Removed.Count > 0 && keptSame && after.Count == before.Count - request.Removed.Count;
+        Console.WriteLine(ok
+            ? "RESULT: OK — the bulk view removes the chosen keys of one mod"
+            : "RESULT: FAIL — the removal does not match");
+        CloseNow(dlg);
+        CloseNow(owner);
+        Pump(0.3);
+        Console.WriteLine("DONE");
+    }
+
+    private static bool ContainsSeq(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0) return true;
+        for (var i = 0; i + needle.Length <= haystack.Length; i++)
+        {
+            var j = 0;
+            while (j < needle.Length && haystack[i + j] == needle[j]) j++;
+            if (j == needle.Length) return true;
+        }
+
+        return false;
     }
 
     private static void Pump(double seconds)

@@ -145,6 +145,166 @@ internal static class CardUi
         return sb.ToString();
     }
 
+    /// <summary>A wrapped explanation line of a dialog. The same three lines were written in every dialog.</summary>
+    public static TextBlock Wrap(Control? owner, string text, bool bold = false)
+    {
+        var t = new TextBlock
+        {
+            Text = text,
+            TextWrapping = TextWrapping.Wrap,
+            FontWeight = bold ? FontWeight.Bold : FontWeight.Normal
+        };
+        if (owner is not null) BindTheme(owner, t, TextBlock.ForegroundProperty, "TextPrimaryBrush");
+        return t;
+    }
+
+    /// <summary>A wrapped warning line: bold, in the accent colour.</summary>
+    public static TextBlock Warn(Control? owner, string text)
+    {
+        var t = new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, FontWeight = FontWeight.Bold };
+        if (owner is not null) BindTheme(owner, t, TextBlock.ForegroundProperty, "TextAccentBrush");
+        return t;
+    }
+
+    /// <summary>A byte count as the dialogs print it.</summary>
+    public static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:0.0} KB";
+        return $"{bytes / (1024.0 * 1024.0):0.0} MB";
+    }
+
+    /// <summary>What one tree row of the player-data window shows. The ECX tree (character, inventories) and the
+    /// protobuf tree (mod keys) differ only in these values — the row itself is one implementation.</summary>
+    public sealed class TreeRow
+    {
+        public required string Label { get; init; }
+        public string? Tip { get; init; }
+
+        /// <summary>Tooltip of the label alone when it says more than the action's one (the full field path).</summary>
+        public string? LabelTip { get; init; }
+
+        public int Indent { get; init; }
+        public double LabelWidth { get; init; } = UiStyle.FieldLabelWidth;
+        public double BoxWidth { get; init; } = UiStyle.FieldBoxWidth;
+        public string ValueText { get; init; } = "";
+        public string Hint { get; init; } = "";
+        public bool Removed { get; init; }
+
+        /// <summary>Editable value: the text the box starts with (null — the row shows the value read-only).</summary>
+        public string? EditableText { get; init; }
+
+        /// <summary>Flips the model's "removed" flag and returns the new state; null — the row cannot be deleted.</summary>
+        public Func<bool>? ToggleRemoved { get; init; }
+
+        /// <summary>Called when the box text changes and after a delete/undo, so the dialog can recount.</summary>
+        public Action? OnChanged { get; init; }
+
+        /// <summary>Already-built children; non-null — the row becomes an expander. The caller fills it by
+        /// recursing into this method, so a tree is built from its root outwards.</summary>
+        public StackPanel? Children { get; init; }
+
+        public bool Expand { get; init; }
+    }
+
+    /// <summary>
+    ///     One row of a data tree: the delete/undo button, the label, the value box (or the read-only value) and
+    ///     a small grey hint. Returns the box, when the row has one. The two trees of the player window drew this
+    ///     twice with different widths, and the chunks cards a third time.
+    /// </summary>
+    public static Control AddTreeRow(Control? owner, TreeRow row, out TextBox? box)
+    {
+        box = null;
+        var strip = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            Margin = new Thickness(row.Indent, 0, 0, 0),
+            Opacity = row.Removed ? 0.45 : 1
+        };
+
+        var mark = new Button
+        {
+            Content = row.Removed ? "undo" : "✕",
+            Padding = new Thickness(4, 0),
+            FontSize = 10,
+            VerticalAlignment = VerticalAlignment.Center,
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            IsVisible = row.ToggleRemoved is not null
+        };
+        if (row.Tip is { Length: > 0 }) ToolTip.SetTip(mark, row.Tip);
+        strip.Children.Add(mark);
+
+        var label = new TextBlock
+        {
+            Text = row.Label,
+            Width = row.LabelWidth,
+            FontFamily = UiStyle.Mono,
+            FontSize = UiStyle.MonoFontSize,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.NoWrap,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            TextDecorations = row.Removed ? TextDecorations.Strikethrough : null
+        };
+        ToolTip.SetTip(label, row.LabelTip ?? row.Tip ?? row.Label);
+        strip.Children.Add(label);
+
+        mark.Click += (_, _) =>
+        {
+            if (row.ToggleRemoved is null) return;
+            var removed = row.ToggleRemoved();
+            mark.Content = removed ? "undo" : "✕";
+            strip.Opacity = removed ? 0.45 : 1;
+            label.TextDecorations = removed ? TextDecorations.Strikethrough : null;
+            row.OnChanged?.Invoke();
+        };
+
+        if (row.EditableText is not null)
+        {
+            box = new TextBox
+            {
+                Text = row.EditableText,
+                Width = row.BoxWidth,
+                FontFamily = UiStyle.Mono,
+                FontSize = UiStyle.MonoFontSize,
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            if (row.OnChanged is not null) box.TextChanged += (_, _) => row.OnChanged();
+            strip.Children.Add(box);
+        }
+        else if (row.Children is null)
+        {
+            strip.Children.Add(new TextBlock
+            {
+                Text = row.ValueText,
+                FontFamily = UiStyle.Mono,
+                FontSize = UiStyle.MonoFontSize,
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = Brushes.Gray
+            });
+        }
+
+        if (row.Hint.Length > 0)
+            strip.Children.Add(new TextBlock
+            {
+                Text = row.Hint,
+                FontSize = 10,
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = Brushes.Gray
+            });
+
+        if (row.Children is null) return strip;
+
+        return new Expander
+        {
+            Header = strip,
+            Content = row.Children,
+            Padding = new Thickness(0),
+            IsExpanded = row.Expand,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch
+        };
+    }
     /// <summary>
     ///     Compact display of the card fields: the first N rows plus a lazily expanded list of the rest.
     ///     It used to print ALL fields: a panel with 36 block entities grew to ~14 700 px and built thousands of controls.

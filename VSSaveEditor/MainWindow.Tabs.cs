@@ -105,6 +105,7 @@ public partial class MainWindow
         PlayersView.PendingOnlyChanged += OnPlayerFilterChanged;
         PlayersView.PlayerPicked += OnPlayerPicked;
         PlayersView.ReviewRequested += OnReviewAndCommit;
+        PlayersView.PlayerDataRequested += OnPlayerData;
 
         FindBlocksView.SearchChanged += OnFilterSearchChanged;
         FindBlocksView.ClearRequested += OnFilterClear;

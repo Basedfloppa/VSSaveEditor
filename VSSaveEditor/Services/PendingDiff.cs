@@ -3,12 +3,15 @@ using VSCore;
 
 namespace VSSaveEditor;
 
-/// <summary>Differences in one edit area: a chunk (all of its y columns) or a player.</summary>
+/// <summary>Differences in one edit area: a chunk (all of its y columns), a player or the world message (gamedata).</summary>
 public sealed class DiffGroup
 {
     public string Title { get; init; } = "";
     public long Key { get; init; }
     public bool IsPlayer { get; init; }
+
+    /// <summary>The `gamedata` row: mod data and other world-level keys rather than a chunk or a player.</summary>
+    public bool IsGamedata { get; init; }
     public string? Note { get; set; }
     public List<FieldChange> Rows { get; } = new();
     public int OldBytes { get; set; }
@@ -29,16 +32,20 @@ public sealed class DiffReport
 
     public int PlayerCount { get; set; }
 
+    /// <summary>1 when the world message (gamedata) carries an edit, 0 otherwise.</summary>
+    public int GamedataEdits { get; set; }
+
     public int ChangedValues => Groups.Sum(g => g.Rows.Count);
     public int ByteDelta => Groups.Sum(g => g.ByteDelta);
-    public bool IsEmpty => ChunkCount + PlayerCount == 0;
+    public bool IsEmpty => ChunkCount + PlayerCount + GamedataEdits == 0;
 
     public string Summary
     {
         get
         {
             if (IsEmpty) return "Nothing pending — there is nothing to apply.";
-            var s = $"{ChunkCount} chunk(s) and {PlayerCount} player(s) will be applied to the WORKING COPY; " +
+            var s = $"{ChunkCount} chunk(s), {PlayerCount} player(s) and {GamedataEdits} gamedata edit(s) " +
+                    "will be applied to the WORKING COPY; " +
                     $"the original file stays untouched. {ChangedValues} difference(s) shown";
             var delta = ByteDelta;
             if (delta != 0) s += $", {delta:+#;-#;0} bytes in total";
@@ -55,7 +62,7 @@ public sealed class DiffReport
         sb.AppendLine();
         foreach (var g in Groups)
         {
-            sb.AppendLine($"[{(g.IsPlayer ? "player" : "chunk")}] {g.Title}" +
+            sb.AppendLine($"[{(g.IsPlayer ? "player" : g.IsGamedata ? "gamedata" : "chunk")}] {g.Title}" +
                           (g.Note is { Length: > 0 } ? $"  ({g.Note})" : ""));
             foreach (var r in g.Rows)
                 sb.AppendLine($"    {r.Field}: {r.OldValue}  ->  {r.NewValue}");
@@ -104,6 +111,23 @@ public static class PendingDiff
             }
 
             if (original is null) group.Note = "original blob unavailable";
+            report.Groups.Add(group);
+        }
+
+        if (edits.TryGetGamedata(out var newGamedata) && newGamedata is not null)
+        {
+            report.GamedataEdits = 1;
+            var oldGamedata = save?.ReadGamedata();
+            var group = new DiffGroup
+            {
+                Title = "gamedata — world message (mod data)",
+                Key = EditSession.GamedataKey,
+                IsGamedata = true,
+                OldBytes = oldGamedata?.Length ?? 0,
+                NewBytes = newGamedata.Length
+            };
+            group.Rows.AddRange(BlobDiff.ModData("gamedata", oldGamedata, newGamedata));
+            if (oldGamedata is null) group.Note = "original blob unavailable";
             report.Groups.Add(group);
         }
 

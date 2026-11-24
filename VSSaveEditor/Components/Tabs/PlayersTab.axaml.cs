@@ -17,12 +17,16 @@ public partial class PlayersTab : UserControl
         PlayerPendingOnlyCheck.IsCheckedChanged += (_, e) => PendingOnlyChanged?.Invoke(this, e);
         PlayerList.SelectionChanged += (_, e) => PlayerPicked?.Invoke(this, e);
         ReviewBtn.Click += (_, e) => ReviewRequested?.Invoke(this, e);
+        PlayerDataBtn.Click += (_, e) => PlayerDataRequested?.Invoke(this, e);
     }
 
     public event EventHandler<TextChangedEventArgs>? FilterChanged;
     public event EventHandler<RoutedEventArgs>? PendingOnlyChanged;
     public event EventHandler<SelectionChangedEventArgs>? PlayerPicked;
     public event EventHandler<RoutedEventArgs>? ReviewRequested;
+
+    /// <summary>The "Player data…" action: the per-player editor (character, inventories, mod keys, world keys).</summary>
+    public event EventHandler<RoutedEventArgs>? PlayerDataRequested;
 
     /// <summary>The scope requested by the "Search in:" row: a column, a rectangle, an area; empty means the whole save.</summary>
     public event EventHandler<string>? ScopeRequested;

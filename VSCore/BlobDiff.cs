@@ -90,6 +90,50 @@ public static class BlobDiff
         return res;
     }
 
+    /// <summary>
+    ///     Differences in the world's mod data (`gamedata`): the keys that were cut out, added, or whose value
+    ///     changed size. Keys are compared as a set — the order inside the dictionary carries no meaning.
+    /// </summary>
+    public static List<FieldChange> ModData(string label, byte[]? oldB, byte[] newB)
+    {
+        var oldEntries = oldB is null ? null : SafeModData(oldB);
+        var newEntries = SafeModData(newB);
+        if (oldEntries is null || newEntries is null) return new List<FieldChange> { Bytes(label, oldB, newB) };
+
+        var newByKey = new Dictionary<string, ModDataEntry>(StringComparer.Ordinal);
+        foreach (var e in newEntries) newByKey[e.Key] = e;
+        var res = new List<FieldChange>();
+        var oldKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var e in oldEntries)
+        {
+            oldKeys.Add(e.Key);
+            if (!newByKey.TryGetValue(e.Key, out var n))
+                res.Add(new FieldChange
+                {
+                    Field = $"mod data '{e.Key}'", OldValue = $"{e.Value.Length} B", NewValue = "(removed)"
+                });
+            else if (n.Value.Length != e.Value.Length)
+                res.Add(new FieldChange
+                {
+                    Field = $"mod data '{e.Key}'", OldValue = $"{e.Value.Length} B", NewValue = $"{n.Value.Length} B"
+                });
+        }
+
+        foreach (var e in newEntries)
+            if (!oldKeys.Contains(e.Key))
+                res.Add(new FieldChange
+                {
+                    Field = $"mod data '{e.Key}'", OldValue = "(absent)", NewValue = $"{e.Value.Length} B"
+                });
+        return res.Count > 0 ? res : new List<FieldChange> { Bytes(label, oldB, newB) };
+    }
+
+    private static List<ModDataEntry>? SafeModData(byte[] blob)
+    {
+        try { return ModDataStore.Read(blob); }
+        catch { return null; }
+    }
+
     /// <summary>Byte-level difference: for the preview what matters is how many bytes, and what size they became.</summary>
     public static FieldChange Bytes(string label, byte[]? oldB, byte[] newB)
     {

@@ -144,6 +144,67 @@ Item stacks are currently **read-only**: you can locate an item, but not rewrite
 
 The **Players** tab lists `playerdata` records. It supports filtering, inventory editing by index and pending-edit markers. When the player's creature exists in the world, **Show on map** jumps to it.
 
+### Player data (everything saved for one player)
+
+Press **Players → Player data…** to open one player as a document. The window lists, for the selected player:
+
+- **Character** — the `EntityPlayer` record kept inside the playerdata row: health, hunger and satiety, oxygen,
+  tiredness, body temperature, stats, skin. It is an ECX tree with names, shown as a tree of fields.
+- **Inventories** — the character's inventories (`hotbar-…`, `backpack-…`, `craftinggrid-…`), each with its own
+  fields.
+- **Mod keys of this player** — `gamedata` keys that end with the player uid
+  (`divineascension_playerprogressiondata_<uid>`, `oreMapMarkers-<uid>`). Mods store these values without a
+  schema, so the window shows them by field number, with nested messages and readable strings.
+- **World keys naming this player** — one `gamedata` key for everybody (`loreDiscoveriesByPlayerUid`,
+  `journalItemsByPlayerUid`, `playerMapMarkers_v2`, …) that mentions the uid inside its value. A key of this kind
+  is listed only when it really holds an entry of this player: a roster of other players is not his data and does
+  not appear here.
+
+What can be done with it:
+
+1. **Edit a value** in place: numbers, text, `true`/`false`, arrays, hex byte strings. Only values whose text
+   actually changed are written; everything else is written back byte for byte.
+2. **Delete a field or a whole subtree** with ✕ next to it (a group such as `hunger`, a single `proteinLevel`, a
+   field of an inventory, one entry of a mod's value). The row is struck through; press **undo** to keep it.
+3. **Delete a whole block** — an inventory or a mod key — with **Delete this block**.
+4. **Delete this player's entries in a shared key** with **Remove entries naming this player (N)**: only the
+   entries whose value contains the uid are cut, the rest of the key stays for the others.
+5. **Add to pending edits.** The window does not write anything: it produces ONE pending edit (a new playerdata
+   row and/or a new gamedata blob). Check it in **Review & apply…**, apply it to the working copy (undoable),
+   then **Save a copy…**.
+
+The bulk view is still there: **All players by mod…** opens the mod-oriented dialog described below.
+
+What this does and does not touch:
+
+- Only the edited ranges are rebuilt. Every other top-level field of the playerdata row (positions, waypoints,
+  the repeated fields the game adds), every other `gamedata` key (the block/item registries included) and every
+  other player's row are copied byte for byte.
+- Some bytes of the character have no name the parser understands (opaque header fields); they are counted at
+  the bottom of the block and are not editable. A value of a mod that cannot be parsed as a message is shown as
+  one opaque entry and is not offered for inline editing.
+- The mod decides what it does with missing data on the next login, and the game is the final validator: load the
+  saved copy before replacing the original.
+
+### Mod data in bulk (a mod's per-player state, all players at once)
+
+Mods keep their saved state in the world message (`gamedata`), not in the player characters: a key like
+`divineascension_playerprogressiondata_<uid>` is one player's progression, while `divineascension_religions`
+is the world's. To clear one mod for everybody:
+
+1. Open **Players → Player data… → All players by mod…**. The dialog reads the world message and groups its keys
+   by mod id. A key is per-player when it ends with a known player uid (after `_`, `-`, `.` or `:`).
+2. Filter or pick a mod. The detail panel lists every key with its size and the player it belongs to, and shows
+   how many keys are world-level (shared by everyone).
+3. Choose the scope: **the per-player keys only**, or **every key of this mod, including the world data**
+   (religions, sites, config…). World keys whose value mentions a player are marked, because removing one
+   erases data for several players at once.
+4. **Remove …** builds one pending edit. Check it in **Review & apply…** — it lists every removed key — then
+   **Apply to working copy**, and **Save a copy…** as usual. **Undo** restores the data while the edit is pending.
+
+For a single player — including their character, inventories and the entries they own in world keys — use the
+per-player window above; it is the same pending-edit path.
+
 ### Find blocks
 
 Use **Find blocks** to clean up blocks from a removed mod or replace one block code with another:
@@ -175,7 +236,7 @@ The **Selection** tab deletes every Y level of the selected chunk columns from t
 
 ## Editing and saving
 
-1. **Edit a record.** Use **Edit fields** on a chunk, entity or block-entity card, or edit a player inventory in the **Players** tab.
+1. **Edit a record.** Use **Edit fields** on a chunk, entity or block-entity card, open **Players → Player data…** to edit one player's character, inventories and mod data (values, subtrees, whole keys), or use **All players by mod…** there to clear one mod's state for everybody.
 2. **Review.** Open **Review & apply…**. The dialog shows a before → after diff for each chunk or player. You can filter the list, copy it as text, or export a text report.
 3. **Apply.** Applying moves the edits into the working copy. The cards and tabs re-read the changed data.
 4. **Save a copy.** Choose **Save a copy…**. The editor writes a new `.vcdbs` next to the original, by default `<name> (edited).vcdbs`.

@@ -15,10 +15,12 @@ namespace VSCore;
 public static class ChunkDataEditor
 {
     // ------------------------- Value setters -------------------------
+    // Every setter leaves the field untouched when the value is already there: the cards apply ALL the boxes
+    // they show, so marking them dirty regardless would rewrite (and report as changed) blobs nobody edited.
 
     public static void SetInt(ChunkField f, long v)
     {
-        if (f.Type is not (ChunkFieldType.Int32 or ChunkFieldType.Int64)) return;
+        if (f.Type is not (ChunkFieldType.Int32 or ChunkFieldType.Int64) || f.IntValue == v) return;
         f.IntValue = v;
         f.Dirty = true;
         f.Raw = Rebuild(f);
@@ -26,7 +28,7 @@ public static class ChunkDataEditor
 
     public static void SetFloat(ChunkField f, float v)
     {
-        if (f.Type != ChunkFieldType.Float) return;
+        if (f.Type != ChunkFieldType.Float || f.FloatValue.Equals(v)) return;
         f.FloatValue = v;
         f.Dirty = true;
         f.Raw = Rebuild(f);
@@ -34,7 +36,7 @@ public static class ChunkDataEditor
 
     public static void SetDouble(ChunkField f, double v)
     {
-        if (f.Type != ChunkFieldType.Double) return;
+        if (f.Type != ChunkFieldType.Double || f.DoubleValue.Equals(v)) return;
         f.DoubleValue = v;
         f.Dirty = true;
         f.Raw = Rebuild(f);
@@ -42,7 +44,7 @@ public static class ChunkDataEditor
 
     public static void SetString(ChunkField f, string v)
     {
-        if (f.Type != ChunkFieldType.String) return;
+        if (f.Type != ChunkFieldType.String || string.Equals(f.StringValue, v, StringComparison.Ordinal)) return;
         f.StringValue = v;
         f.Dirty = true;
         f.Raw = Rebuild(f);
@@ -50,7 +52,7 @@ public static class ChunkDataEditor
 
     public static void SetBool(ChunkField f, bool v)
     {
-        if (f.Type != ChunkFieldType.Bool) return;
+        if (f.Type != ChunkFieldType.Bool || f.BoolValue == v) return;
         f.BoolValue = v;
         f.Dirty = true;
         f.Raw = Rebuild(f);
@@ -60,6 +62,7 @@ public static class ChunkDataEditor
     {
         if (f.Type != ChunkFieldType.ByteArray) return;
         if (v.Length > ushort.MaxValue) throw new ArgumentException("byte array is too long for a save field");
+        if (f.BytesValue.AsSpan().SequenceEqual(v)) return;
         f.BytesValue = v;
         f.Dirty = true;
         f.Raw = Rebuild(f);
@@ -68,7 +71,9 @@ public static class ChunkDataEditor
     public static void SetStringArray(ChunkField f, IEnumerable<string?> values)
     {
         if (f.Type != ChunkFieldType.StringArray) return;
-        f.StringValues = values.ToList();
+        var list = values.ToList();
+        if (f.StringValues.SequenceEqual(list)) return;
+        f.StringValues = list;
         f.Dirty = true;
         f.Raw = Rebuild(f);
     }
@@ -76,7 +81,9 @@ public static class ChunkDataEditor
     public static void SetLongArray(ChunkField f, IEnumerable<long> values)
     {
         if (f.Type is not (ChunkFieldType.IntArray or ChunkFieldType.LongArray)) return;
-        f.LongValues = values.ToArray();
+        var list = values.ToArray();
+        if (f.LongValues.SequenceEqual(list)) return;
+        f.LongValues = list;
         f.Dirty = true;
         f.Raw = Rebuild(f);
     }
@@ -84,7 +91,9 @@ public static class ChunkDataEditor
     public static void SetDoubleArray(ChunkField f, IEnumerable<double> values)
     {
         if (f.Type is not (ChunkFieldType.FloatArray or ChunkFieldType.DoubleArray)) return;
-        f.DoubleValues = values.ToArray();
+        var list = values.ToArray();
+        if (f.DoubleValues.SequenceEqual(list)) return;
+        f.DoubleValues = list;
         f.Dirty = true;
         f.Raw = Rebuild(f);
     }
@@ -92,15 +101,18 @@ public static class ChunkDataEditor
     public static void SetBoolArray(ChunkField f, IEnumerable<bool> values)
     {
         if (f.Type != ChunkFieldType.BoolArray) return;
-        f.BoolValues = values.ToList();
+        var list = values.ToList();
+        if (f.BoolValues.SequenceEqual(list)) return;
+        f.BoolValues = list;
         f.Dirty = true;
         f.Raw = Rebuild(f);
     }
 
-    /// <summary>Rebuilds the exact bytes of a [type][LP-key][value] field from the current values.</summary>
+    /// <summary>Rebuilds the exact bytes of a [type][LP-key][value] field from the current values.
+    /// Fields marked <see cref="ChunkField.Removed" /> below this one are cut out of the result.</summary>
     public static byte[] Rebuild(ChunkField f)
     {
-        if (!f.Dirty && f.Raw.Length > 0 && !AnyChildDirty(f)) return f.Raw;
+        if (!f.Dirty && f.Raw.Length > 0 && !AnyChange(f)) return f.Raw;
         var ms = new MemoryStream();
         ms.WriteByte((byte)f.Type);
         WriteString(ms, f.Key);
@@ -123,7 +135,12 @@ public static class ChunkDataEditor
                 break;
             case ChunkFieldType.Tree:
                 if (f.IsRawTree || (!f.HasTerminator && f.Children.Count == 0)) return f.Raw;
-                foreach (var child in f.Children) ms.Write(Rebuild(child));
+                foreach (var child in f.Children)
+                {
+                    if (child.Removed) continue;
+                    ms.Write(Rebuild(child));
+                }
+
                 ms.WriteByte(0);
                 break;
             case ChunkFieldType.ItemStack:
@@ -134,7 +151,12 @@ public static class ChunkDataEditor
                     WriteI32(ms, f.ItemId);
                     WriteI32(ms, f.StackSize);
                     if (!f.HasTerminator && f.Children.Count == 0) return f.Raw;
-                    foreach (var child in f.Children) ms.Write(Rebuild(child));
+                    foreach (var child in f.Children)
+                    {
+                        if (child.Removed) continue;
+                        ms.Write(Rebuild(child));
+                    }
+
                     ms.WriteByte(0);
                 }
                 break;
@@ -187,10 +209,20 @@ public static class ChunkDataEditor
         return ms.ToArray();
     }
 
-    private static bool AnyChildDirty(ChunkField f)
+    /// <summary>Whether this field or anything below it was edited or removed — the check that decides
+    /// if a player blob (or one inventory body) has to be rewritten at all.</summary>
+    public static bool AnyChange(ChunkField f)
     {
+        if (f.Dirty || f.Removed) return true;
         foreach (var child in f.Children)
-            if (child.Dirty || AnyChildDirty(child)) return true;
+            if (AnyChange(child)) return true;
+        return false;
+    }
+
+    public static bool AnyChange(IEnumerable<ChunkField> fields)
+    {
+        foreach (var f in fields)
+            if (AnyChange(f)) return true;
         return false;
     }
 
@@ -227,13 +259,7 @@ public static class ChunkDataEditor
     private static void WriteString(Stream ms, string s)
     {
         var bytes = Encoding.UTF8.GetBytes(s);
-        uint len = (uint)bytes.Length;
-        while (len >= 0x80)
-        {
-            ms.WriteByte((byte)((len & 0x7F) | 0x80));
-            len >>= 7;
-        }
-        ms.WriteByte((byte)len);
+        PbWriter.Varint(ms, bytes.Length);
         ms.Write(bytes);
     }
 
@@ -253,7 +279,7 @@ public static class ChunkDataEditor
 
     private static byte[] Serialize(byte[] header, IEnumerable<ChunkField> fields)
     {
-        var list = fields.ToList();
+        var list = fields.Where(f => !f.Removed).ToList();
         var ms = new MemoryStream(header.Length + list.Sum(f => Rebuild(f).Length));
         ms.Write(header, 0, header.Length);
         foreach (var f in list) ms.Write(Rebuild(f));
@@ -265,6 +291,7 @@ public static class ChunkDataEditor
     public sealed class ChunkTopField
     {
         public int Field;
+        public int WireType;
         public int Start;
         public int PayloadStart;
         public int PayloadEnd;
@@ -292,23 +319,30 @@ public static class ChunkDataEditor
                 case 0:
                     var (_, vi) = PbReader.ReadVarint(blob, i);
                     if (vi <= i) return res;
-                    res.Add(new ChunkTopField { Field = field, Start = start, PayloadStart = i, PayloadEnd = vi, Occurrence = o });
+                    res.Add(new ChunkTopField
+                        { Field = field, WireType = wt, Start = start, PayloadStart = i, PayloadEnd = vi, Occurrence = o });
                     i = vi;
                     break;
                 case 2:
                     var (ln, li) = PbReader.ReadVarint(blob, i);
                     if (li < i || !PbReader.LengthFits(ln, li, blob.Length)) return res;
-                    res.Add(new ChunkTopField { Field = field, Start = start, PayloadStart = li, PayloadEnd = li + (int)ln, Occurrence = o });
+                    res.Add(new ChunkTopField
+                    {
+                        Field = field, WireType = wt, Start = start, PayloadStart = li,
+                        PayloadEnd = li + (int)ln, Occurrence = o
+                    });
                     i = li + (int)ln;
                     break;
                 case 5:
                     if (i + 4 > blob.Length) return res;
-                    res.Add(new ChunkTopField { Field = field, Start = start, PayloadStart = i, PayloadEnd = i + 4, Occurrence = o });
+                    res.Add(new ChunkTopField
+                        { Field = field, WireType = wt, Start = start, PayloadStart = i, PayloadEnd = i + 4, Occurrence = o });
                     i += 4;
                     break;
                 case 1:
                     if (i + 8 > blob.Length) return res;
-                    res.Add(new ChunkTopField { Field = field, Start = start, PayloadStart = i, PayloadEnd = i + 8, Occurrence = o });
+                    res.Add(new ChunkTopField
+                        { Field = field, WireType = wt, Start = start, PayloadStart = i, PayloadEnd = i + 8, Occurrence = o });
                     i += 8;
                     break;
                 default:
@@ -325,43 +359,16 @@ public static class ChunkDataEditor
     public static byte[] SplicePayloads(byte[] blob, IReadOnlyList<(int Field, int Occurrence, byte[] Payload)> edits)
     {
         if (edits.Count == 0) return blob;
-        var top = WalkTop(blob);
         var byKey = new Dictionary<(int, int), ChunkTopField>();
-        foreach (var t in top) byKey[(t.Field, t.Occurrence)] = t;
+        foreach (var t in WalkTop(blob)) byKey[(t.Field, t.Occurrence)] = t;
 
-        var ranges = new List<(int start, int end, byte[] repl)>();
+        var ranges = new List<ByteSplice.Edit>();
         foreach (var (fld, occ, payload) in edits)
         {
             if (!byKey.TryGetValue((fld, occ), out var t)) continue;
-            var ms = new MemoryStream();
-            WriteVarint(ms, ((long)t.Field << 3) | 2);
-            WriteVarint(ms, payload.Length);
-            ms.Write(payload, 0, payload.Length);
-            ranges.Add((t.Start, t.PayloadEnd, ms.ToArray()));
+            ranges.Add(ByteSplice.Replace(t.Start, t.PayloadEnd, PbWriter.MessageBytes(t.Field, payload)));
         }
-        if (ranges.Count == 0) return blob;
 
-        var sb = new MemoryStream(blob.Length + 64);
-        int pos = 0;
-        foreach (var (start, end, repl) in ranges.OrderBy(r => r.start))
-        {
-            if (start < pos) continue;
-            sb.Write(blob, pos, start - pos);
-            sb.Write(repl, 0, repl.Length);
-            pos = end;
-        }
-        sb.Write(blob, pos, blob.Length - pos);
-        return sb.ToArray();
-    }
-
-    private static void WriteVarint(Stream ms, long v)
-    {
-        ulong u = (ulong)v;
-        while (u >= 0x80)
-        {
-            ms.WriteByte((byte)((u & 0x7F) | 0x80));
-            u >>= 7;
-        }
-        ms.WriteByte((byte)u);
+        return ByteSplice.Apply(blob, ranges);
     }
 }

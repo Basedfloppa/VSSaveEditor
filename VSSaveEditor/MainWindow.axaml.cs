@@ -13,6 +13,7 @@ using Avalonia.Threading;
 using Avalonia.VisualTree;
 using VSCore;
 using VSSaveEditor.Components;
+using VSSaveEditor.Models;
 
 namespace VSSaveEditor;
 
@@ -733,6 +734,155 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         await ReviewAndCommitAsync();
     }
 
+    // ===================== PLAYER DATA (playerdata + gamedata) =====================
+
+    private async void OnPlayerData(object? sender, RoutedEventArgs e)
+    {
+        await ShowPlayerDataAsync();
+    }
+
+    /// <summary>
+    ///     "Player data…": everything saved for one player in a single window — the character record and the
+    ///     inventories of playerdata, plus every `gamedata` key that belongs to that player or names it inside the
+    ///     value. Values are edited in place and any node can be cut; the result is ONE pending edit (a new
+    ///     playerdata row and/or a new gamedata blob) and then travels the ordinary Review &amp; apply path, so
+    ///     the diff, the undo step and "the original is never modified" hold for it as for every other edit.
+    /// </summary>
+    private async Task ShowPlayerDataAsync()
+    {
+        if (_save is null)
+        {
+            Status.Set(StatusChannel.Chunk, "Open a save first — the player's data lives in its playerdata row.",
+                priority: AppStatus.PriorityError);
+            return;
+        }
+
+        var save = _save;
+        var edits = _edits;
+        var scan = ScanData;
+        Status.Set(StatusChannel.Chunk, "Reading the players' data…");
+        try
+        {
+            var players = PlayerIdentities();
+            // Pending gamedata first: a second edit in a row must build on the first, not on the saved blob.
+            var gamedata = await Task.Run(() => edits.TryGetGamedata(out var pending) && pending is { Length: > 0 }
+                ? pending
+                : save.ReadGamedata());
+            byte[]? ReadPlayer(long playerId)
+            {
+                // the same order as the Players tab: pending edit, then the row of the working copy
+                if (edits.TryGetPlayerBlob(playerId, out var blob) && blob is { Length: > 0 }) return blob;
+                return save.PlayerRows.FirstOrDefault(r => r.Id == playerId).Data;
+            }
+
+            var request = await PlayerDataDialog.ShowAsync(this, players, gamedata, ReadPlayer, ShowModDataAsync);
+            Status.Set(StatusChannel.Chunk, "");
+            if (request is null) return;
+
+            if (request.NewPlayerdata is { Length: > 0 })
+                edits.PutPlayer(request.PlayerId, request.NewPlayerdata, $"player data: {request.Summary}");
+            if (request.NewGamedata is { Length: > 0 })
+                edits.PutGamedata(request.NewGamedata, $"player data: {request.Summary}");
+
+            _chunkView.UpdateDirtyStatus();
+            RefreshPlayersTab();
+            Status.Set(StatusChannel.Chunk,
+                $"Pending edit for {request.Label}: {request.Summary}. Nothing is written yet — "
+                + "Review & apply… → Apply to working copy.",
+                priority: 90);
+        }
+        catch (Exception ex)
+        {
+            Status.Set(StatusChannel.Chunk, "Player data failed: " + ex.Message, priority: AppStatus.PriorityError);
+        }
+    }
+
+    /// <summary>The players tab shows pending marks and edited values: redraw it after an edit from this window.</summary>
+    private void RefreshPlayersTab()
+    {
+        try
+        {
+            _players.Refresh();
+        }
+        catch
+        {
+            // the tab is a view: an exception here must not swallow the edit that has already been recorded
+        }
+    }
+
+    /// <summary>
+    ///     "Mod data…": the world message keeps the mods' saved state, and the per-player keys of it are the only
+    ///     place where "data of this player" lives outside playerdata (mods store progression, religions and the
+    ///     like as `&lt;modid&gt;_&lt;key&gt;_&lt;uid&gt;`). The dialog cuts the chosen keys out into ONE pending gamedata edit,
+    ///     which then travels the ordinary Review &amp; apply path - so the diff, the undo step and "the original is
+    ///     never modified" all hold for this edit as well.
+    ///     Reachable from the "Player data" window: it is the bulk view ("this mod, every player"), while the
+    ///     per-player window is the main one.
+    /// </summary>
+    private async Task ShowModDataAsync()
+    {
+        if (_save is null)
+        {
+            Status.Set(StatusChannel.Chunk, "Open a save first — mod data lives in its gamedata row.",
+                priority: AppStatus.PriorityError);
+            return;
+        }
+
+        var save = _save;
+        var edits = _edits;
+        Status.Set(StatusChannel.Chunk, "Reading the world's mod data…");
+        try
+        {
+            var players = PlayerIdentities();
+            // the pending blob when there is one: two removals in a row must build on each other
+            var gamedata = await Task.Run(() => edits.TryGetGamedata(out var pending) && pending is { Length: > 0 }
+                ? pending
+                : save.ReadGamedata());
+            if (gamedata is not { Length: > 0 })
+            {
+                Status.Set(StatusChannel.Chunk, "This save has no gamedata row — there is no mod data to edit.");
+                return;
+            }
+
+            var request = await ModDataDialog.ShowAsync(this, gamedata, players);
+            if (request is null)
+            {
+                Status.Set(StatusChannel.Chunk, "");
+                return;
+            }
+
+            var label = $"mod data '{request.ModId}': {request.Removed.Count} key(s) removed"
+                        + (request.IncludesWorldData ? " (world keys included)" : "");
+            edits.PutGamedata(request.NewGamedata, label);
+            _chunkView.UpdateDirtyStatus();
+            Status.Set(StatusChannel.Chunk,
+                $"Pending edit: {request.Removed.Count} key(s) of '{request.ModId}' removed from gamedata "
+                + $"({request.BytesFreed} B). Nothing is written yet — Review & apply… → Apply to working copy.",
+                priority: 90);
+        }
+        catch (Exception ex)
+        {
+            Status.Set(StatusChannel.Chunk, "Mod data failed: " + ex.Message, priority: AppStatus.PriorityError);
+        }
+    }
+
+    /// <summary>The players of the save with their names, when the scan already knows them.</summary>
+    private List<PlayerIdentity> PlayerIdentities()
+    {
+        var res = new List<PlayerIdentity>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        if (ScanData is { } scan)
+            foreach (var p in scan.Players)
+                if (p.PlayerUid is { Length: > 0 } uid && seen.Add(uid))
+                    res.Add(new PlayerIdentity(p.PlayerId, uid, p.CustomName));
+        // a save that has player keys but no readable playerdata row still needs its uids: the keys carry them
+        if (_save is not null)
+            foreach (var row in _save.PlayerRows)
+                if (row.Uid is { Length: > 0 } uid && seen.Add(uid))
+                    res.Add(new PlayerIdentity(row.Id, uid, null));
+        return res;
+    }
+
     private async Task ReviewAndCommitAsync()
     {
         if (_save is null || _selectedSave is null || !_edits.HasPending || _applying) return;
@@ -830,6 +980,10 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         if (record.IsPlayer)
         {
             _players.Refresh();
+        }
+        else if (record.Scope == EditSession.GamedataScope)
+        {
+            // gamedata has no card in a tab: the next Review & apply reads the pending blob live
         }
         else
         {
@@ -2097,7 +2251,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
 
         if (_edits.HasPending)
         {
-            var pending = _edits.ChunkCount + _edits.PlayerCount;
+            var pending = _edits.PendingLocationCount;
             var applyFirst = await ConfirmDialog("Pending edits are not applied",
                 $"{pending} location(s) still have pending edits. Only applied edits are part of the working copy.\n\n" +
                 "Apply them first (Review & apply…) and then save?\n" +
@@ -2750,7 +2904,7 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     /// </summary>
     private void ResetPendingStateFor(string path)
     {
-        var (chunks, players) = _edits.Reset();
+        var (chunks, players, gamedata) = _edits.Reset();
         _chunkView.EndEditing();
         _players.EndEditing();
         _scan.Reset();
@@ -2772,9 +2926,9 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         Map.SetFilterOverlay(null, null, true);
         Status.Set(StatusChannel.Filter, "");
         _chunkView.UpdateDirtyStatus();
-        if (chunks + players > 0)
+        if (chunks + players + gamedata > 0)
             Status.Set(StatusChannel.Chunk,
-                $"Opened {Path.GetFileName(path)} — {chunks} chunk(s) / {players} player(s) of unsaved edits were dropped (they belonged to the previous save).");
+                $"Opened {Path.GetFileName(path)} — {chunks} chunk(s) / {players} player(s) / {gamedata} gamedata edit(s) of unsaved edits were dropped (they belonged to the previous save).");
     }
 
     // ===================== SAVE DATA SCAN (background) =====================

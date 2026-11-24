@@ -9,6 +9,14 @@ All notable changes to VS Save Editor are recorded here. The format follows
 
 The changes of this working session in one screen; the detailed entries are below.
 
+- **Player data is editable per player: values, subtrees and whole keys.** **Players → Player data…** opens one
+  player as a document: the character (`EntityPlayer`: health, hunger, stats, skin), its inventories, every
+  `gamedata` key that ends with the player uid, and every world key that names it inside the value. Values are
+  edited in place, any field or subtree or whole key is deleted with ✕, and the entries of a shared key that
+  belong to this player are cut with one button. The result is ONE pending edit (a new playerdata row and/or a
+  new gamedata blob) and travels the ordinary Review & apply → Save a copy path with undo. Only the edited
+  ranges are rebuilt: every other field of the row, every other key and every other player stay byte-identical.
+  The mod-oriented bulk view ("this mod, every player") is one button further: **All players by mod…**.
 - **The areas list lives in `Find blocks` only.** The `Area 1 of 4` buttons are gone from Chunks,
   Entities, Items and Players; the list has a fixed width, pages with `‹ ›` and wraps on a narrow
   window instead of painting over its neighbours.
@@ -46,6 +54,16 @@ The changes of this working session in one screen; the detailed entries are belo
 - Item-stack search across players, creatures and containers, with navigation to the owner and
   the chunk.
 - Players tab for `playerdata`, including inventory editing by index.
+- **Player data** editor: one player as a document — the character (`EntityPlayer` of the playerdata row),
+  its inventories, the `gamedata` keys that end with its uid and the world keys that name it inside the value.
+  Values are edited in place; any field, subtree, inventory or key is deleted; the entries of a shared key that
+  belong to the player are cut with one button. The result is one pending edit, rebuilt in a single pass per
+  blob (`VSCore/PlayerDataDocument.cs`, `VSCore/PbTree.cs`, `VSCore/PlayerDataParser.Rewrite`,
+  `VSCore/ModDataStore.Rewrite`, `VSSaveEditor/Components/PlayerDataDialog.cs`).
+- **Mod data** editor for the world message (`gamedata`): the saved keys of every mod, grouped by mod id,
+  with the player each per-player key belongs to and a removal that is a normal pending edit
+  (`VSCore/ModData.cs`, `VSSaveEditor/Components/ModDataDialog.cs`). It is now the bulk view, opened from the
+  player data window as **All players by mod…**.
 - “Search in” scope on the Chunks, Entities, Items, Players and Find-blocks tabs: search the whole
   save, one chunk, a rectangle of chunks, the map selection or one map area.
 - Block overlay and block removal/replacement by code, editing the palette only.
@@ -151,6 +169,19 @@ The changes of this working session in one screen; the detailed entries are belo
   built from an older or edited save is a miss, never stale rendering.
 
 ### Changed
+- **The pending-edit label counts mod values, and every number comes from one walk.** "Player data" counts what an
+  apply would change while the boxes are being typed in, and it used to run three separate traversals (edited
+  leaves, deleted nodes, marked blocks) with a fourth set of counters inside the rebuild. They disagreed: a value
+  edited inside a mod key was counted by the window ("1 value(s) to write") but not by the label of the pending
+  edit, which then read "nothing to apply" although the blob was rebuilt and stored. One `PlayerDataCounts` is now
+  produced by a single walk and drives both, so a deleted subtree counts as one node (its fields are gone, not
+  edited) and a marked block counts as the block instead of its contents.
+- **The two data windows share one frame.** `Player data` and `Mod data` had their own copy of the same shell — a
+  bold title, wrapped explanation lines, a filter row, a list/detail split with a splitter, note lines and a footer
+  with the action and "Close" — and the copies had drifted apart (different splitter width, margins and minimum
+  size). It is one `DialogShell` now, and the repeated pieces around it (wrapped text, the warning line, the byte
+  formatting, the tree row with its delete/undo button) are one implementation each, so the tables and the trees
+  of the two windows cannot look different in the same editor.
 - **The type buttons above the entity list follow the selection.** The “common names” row (a type, and how many
   records of it) was built from the whole save, so it kept offering types the filter had already removed: with a
   horse's name typed, one record was on the list while a dozen unrelated types stayed above it, and a click on one of
@@ -195,6 +226,13 @@ The changes of this working session in one screen; the detailed entries are belo
 - Opening a save now warms the file in the background (`VSSaveFile.StartPrefetch`). The passes that follow read the same bytes, but SQLite pulls 4-KB pages one at a time: on a cold 12-GB save the positions pass took 43.3 s alone and 31.7 s right after a bulk sequential read of the same file (the map phase in the full open path went 15.2 s -> 7.5 s). Best effort: failures are ignored and it stops when the save is disposed.
 
 ### Fixed
+
+- **A world key naming only OTHER players no longer appears in a player's window.** The window lists the `gamedata`
+  keys that mention a player, and it decided that with one question for the whole save ("is any player uid inside
+  this value?") while the button next to it asked another ("is THIS player's entry inside it?"). A dictionary key
+  such as `loreDiscoveriesByPlayerUid` therefore showed up for a player who had no entry in it at all — with a
+  disabled "Remove entries naming this player (0)" and a list of somebody else's ids. A key is now listed only when
+  it really holds an entry of the selected player.
 
 - **"Remove selected…" / "Replace selected…" reached outside the chosen scope.** The block list of **Find blocks**
   is built from the scope (`Blocks in area 2 of 4 …: 2`), but the two bulk actions carried only the ticked codes

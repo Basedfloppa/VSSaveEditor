@@ -20,6 +20,11 @@ public sealed class EditSession
     private readonly Dictionary<long, byte[]> _wholeChunk = new();
     private readonly Dictionary<long, string> _wholeLabels = new();
 
+    // The whole world message (`gamedata`): mod data lives there, and one edit rewrites the whole row,
+    // so it is one pending blob rather than a set of key edits.
+    private byte[]? _gamedata;
+    private string? _gamedataLabel;
+
     // Journal of edits already applied to the working copy. Separate from EditJournal: Undo/Redo cover
     // only not-yet-applied edits, while the history must survive the apply.
     private readonly List<AppliedEdit> _applied = new();
@@ -34,7 +39,7 @@ public sealed class EditSession
 
     public int ChunkCount => _payload.Count + _wholeChunk.Count;
     public int PlayerCount => _players.Count;
-    public bool HasPending => ChunkCount + PlayerCount > 0;
+    public bool HasPending => PendingLocationCount > 0;
 
     /// <summary>Edits already applied to the working copy (in application order).</summary>
     public IReadOnlyList<AppliedEdit> Applied => _applied;
@@ -210,6 +215,47 @@ public sealed class EditSession
         return $"player #{playerId}";
     }
 
+    /// <summary>Scope of a gamedata edit. It is a string, not a position: gamedata has one row and no chunk.</summary>
+    public const string GamedataScope = "gamedata (world data)";
+
+    /// <summary>Stand-in key of the gamedata record (there is no position or player id to point at).</summary>
+    public const long GamedataKey = -1;
+
+    public bool HasGamedataEdit => _gamedata is not null;
+
+    public int GamedataCount => _gamedata is null ? 0 : 1;
+
+    /// <summary>How many locations (chunks, players, gamedata) are waiting to be applied.</summary>
+    public int PendingLocationCount => ChunkCount + PlayerCount + GamedataCount;
+
+    public bool TryGetGamedata(out byte[]? blob)
+    {
+        blob = _gamedata;
+        return blob is not null;
+    }
+
+    /// <summary>Edit of the whole gamedata blob (mod data). Undo restores the previous blob, or drops the edit.</summary>
+    public void PutGamedata(byte[] blob, string? label = null)
+    {
+        var before = _gamedata;
+        var beforeLabel = _gamedataLabel;
+        var lbl = label ?? "gamedata";
+        _gamedata = blob;
+        _gamedataLabel = lbl;
+        Journal.Push(new EditRecord(GamedataKey, false, GamedataScope, lbl,
+            () =>
+            {
+                _gamedata = before;
+                _gamedataLabel = beforeLabel;
+            },
+            () =>
+            {
+                _gamedata = blob;
+                _gamedataLabel = lbl;
+            },
+            "gamedata"));
+    }
+
     /// <summary>Removes the raw hex edit of a position (one history step). false means there was no edit.</summary>
     public bool RemoveWholeChunk(long position)
     {
@@ -327,6 +373,8 @@ public sealed class EditSession
         _payload.Clear();
         _wholeChunk.Clear();
         _players.Clear();
+        _gamedata = null;
+        _gamedataLabel = null;
         _payloadLabels.Clear();
         _wholeLabels.Clear();
         _playerLabels.Clear();
@@ -372,9 +420,9 @@ public sealed class EditSession
     }
 
     /// <summary>Resets everything (including the hex target and the history of applied edits).</summary>
-    public (int chunks, int players) Reset()
+    public (int chunks, int players, int gamedata) Reset()
     {
-        var dropped = (ChunkCount, PlayerCount);
+        var dropped = (ChunkCount, PlayerCount, GamedataCount);
         ClearPending();
         _applied.Clear();
         HexTargetPosition = -1;
@@ -401,7 +449,7 @@ public sealed class EditSession
         }
 
         var players = _players.Select(kv => (kv.Key, kv.Value)).ToArray();
-        return new ChangeSet(chunks, players);
+        return new ChangeSet(chunks, players, _gamedata);
     }
 
     /// <summary>
@@ -410,7 +458,8 @@ public sealed class EditSession
     /// </summary>
     public static List<(string table, long position, byte[] data)> Materialize(VSSaveFile save, ChangeSet set)
     {
-        var changes = new List<(string table, long position, byte[] data)>(set.Chunks.Length + set.Players.Length);
+        var changes = new List<(string table, long position, byte[] data)>(
+            set.Chunks.Length + set.Players.Length + (set.Gamedata is null ? 0 : 1));
         foreach (var (position, whole, fields) in set.Chunks)
         {
             byte[] blob;
@@ -429,6 +478,8 @@ public sealed class EditSession
         }
 
         foreach (var (playerId, blob) in set.Players) changes.Add(("playerdata", playerId, blob));
+        // gamedata is keyed by savegameid: ApplyChanges knows which column each table uses.
+        if (set.Gamedata is { Length: > 0 } gamedata) changes.Add(("gamedata", 1, gamedata));
         return changes;
     }
 
@@ -466,14 +517,19 @@ public sealed class ChangeSet
 {
     public ChangeSet(
         (long Position, byte[]? Whole, (int Field, int Occ, byte[] Data)[] Fields)[] chunks,
-        (long PlayerId, byte[] Blob)[] players)
+        (long PlayerId, byte[] Blob)[] players,
+        byte[]? gamedata = null)
     {
         Chunks = chunks;
         Players = players;
+        Gamedata = gamedata;
     }
 
     public (long Position, byte[]? Whole, (int Field, int Occ, byte[] Data)[] Fields)[] Chunks { get; }
     public (long PlayerId, byte[] Blob)[] Players { get; }
 
-    public int Count => Chunks.Length + Players.Length;
+    /// <summary>The whole gamedata blob with the mod-data edit applied; null — gamedata was not touched.</summary>
+    public byte[]? Gamedata { get; }
+
+    public int Count => Chunks.Length + Players.Length + (Gamedata is null ? 0 : 1);
 }

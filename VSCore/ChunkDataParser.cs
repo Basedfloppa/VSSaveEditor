@@ -84,6 +84,10 @@ public sealed class ChunkField
     /// that way even values the parser only understood approximately are preserved (mod raw trees).</summary>
     public bool Dirty;
 
+    /// <summary>The field is cut out when its tree is serialised. That is how a subtree of a character
+    /// (health, a whole stats group, an inventory slot field) is deleted rather than edited.</summary>
+    public bool Removed;
+
     /// <summary>Label in lists and cards: the full path if the field is nested.</summary>
     public string DisplayPath => Path.Length > 0 ? Path : Key;
 

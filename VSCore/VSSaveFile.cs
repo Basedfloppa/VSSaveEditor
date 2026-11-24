@@ -242,7 +242,7 @@ public sealed class VSSaveFile : IDisposable
         var applied = 0;
         foreach (var (table, pos, data) in list)
         {
-            var key = table == "playerdata" ? "playerid" : "position";
+            var key = KeyColumn(table);
             up.CommandText = $"UPDATE \"{table}\" SET data=@d WHERE {key}=@p;";
             dp.Value = data;
             pp.Value = pos;
@@ -457,6 +457,15 @@ public sealed class VSSaveFile : IDisposable
             if (ch != '_' && !char.IsAsciiLetterOrDigit(ch))
                 throw new ArgumentException($"unsafe table name: '{table}'", nameof(table));
     }
+
+    /// <summary>Key column of a table in the save schema. `gamedata` holds the whole world in ONE row keyed by
+    /// `savegameid`, so writing it through the chunk/player keys would silently update nothing.</summary>
+    private static string KeyColumn(string table) => table switch
+    {
+        "playerdata" => "playerid",
+        "gamedata" => "savegameid",
+        _ => "position"
+    };
 
     /// <summary>File name of the working copy: the basename of the source save, but only a safe one.
     /// An empty name and `..`/separators would take the copy outside the working-copy directory, hence the fallback.</summary>
@@ -1104,7 +1113,7 @@ public sealed class VSSaveFile : IDisposable
             var pp = up.Parameters.Add("@p", SqliteType.Integer);
             foreach (var (table, pos, data) in list)
             {
-                var key = table == "playerdata" ? "playerid" : "position";
+                var key = KeyColumn(table);
                 up.CommandText = $"UPDATE \"{table}\" SET data=@d WHERE {key}=@p;";
                 dp.Value = data;
                 pp.Value = pos;
