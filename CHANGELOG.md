@@ -17,6 +17,15 @@ The changes of this working session in one screen; the detailed entries are belo
   new gamedata blob) and travels the ordinary Review & apply → Save a copy path with undo. Only the edited
   ranges are rebuilt: every other field of the row, every other key and every other player stay byte-identical.
   The mod-oriented bulk view ("this mod, every player") is one button further: **All players by mod…**.
+- **World settings are editable — the save changes without the game.** **World → Edit…** (or a double-click on a
+  row) edits one entry of the world tree: `gameMode`, `daysPerMonth`, `playerlives`, a mod's config blob. The text
+  is checked against the type the save stores while you type (int32 range, finite float, `true`/`false`, exact
+  string), **Add to pending edits** records ONE pending `gamedata` edit, and the row says `✎ pending`; the change
+  then travels Review & apply → Save a copy with undo, so no file is written before the user asks. Only the edited
+  entry is rewritten — a 53 KB mod blob beside it stays byte-for-byte — and the tree's length prefix is re-emitted
+  when the value changes size. Attributes the game reads only at world creation (`landformScale`,
+  `upheavelCommonness`, `worldWidth`, …) carry a warning: the value is stored, an existing world keeps its already
+  generated terrain. Verified on a 177-entry modded save and a 64-entry vanilla one.
 - **Entity data is editable per record — including a trader's stock.** **Entities → Entity data…** opens one
   record as a document: its own fields, every inventory inside it (`traderInventory`, `backpack`, `inventory`)
   and, for a trader, its `tradeItems` list with price, stock and restock rules. Values are edited in place and
@@ -63,8 +72,31 @@ The changes of this working session in one screen; the detailed entries are belo
   erased the code in all four areas, and the confirmation quoted the whole save's cell count. Both actions
   now rewrite only the chunks of the chosen scope, are counted in it, and say so.
 
+- **The world settings the save carries are listed, not hidden.** The **World** tab parses the world tree out of
+  `gamedata` (field 31) — `gameMode`, `playerlives`, `daysPerMonth`, `landformScale`, `worldWidth` and the rest,
+  with the mod entries stored in the same tree beside them — and shows it as `name = value` with a filter over
+  both name and value, the selected value in full and **Copy value** / **Copy list**. The list is exactly what
+  the save stores: 64 entries in a modless world, 177 in a modded one (63 225 B of the 1 604 685 B blob), where
+  the mods' JSON blobs are cut in the list and whole in the card. Read-only: there is no write path for this
+  tree yet, and a value type the build does not know is reported instead of silently truncating the list.
+
 ### Added
 
+- **World settings list in the `World` tab**: the world tree of the save (`gamedata` field 31) is parsed into
+  `name = value` rows — vanilla settings and the mod entries stored beside them, in file order, with a filter
+  over name and value, the full value in the card and copy buttons. Types read: string, int32, float32, bool;
+  an unknown type stops the walk, keeps what was read and names the type and byte offset
+  (`VSCore/WorldSettings.cs`, `VSSaveEditor/Components/Tabs/WorldTab.axaml`, `MainWindow.axaml.cs`).
+- **World tree editing**: one entry of `gamedata` field 31 is rewritten in place — the entry's own bytes are cut
+  and replaced, the tree is spliced back with a re-emitted LEB128 length, and the result becomes one pending
+  gamedata edit with undo (`VSCore/WorldSettingEdit.cs`, `VSSaveEditor/Components/WorldSettingEditDialog.cs`).
+  `WorldSettings` now carries the offsets an edit needs (`EntryOffset`, `ValuePrefixStart`, `ValueEnd`) and the
+  tree's location in `gamedata` (`TreeOffset`, `TreeHeaderStart`); rows a pending edit changes say `✎ pending`;
+  `WorldSettingNames.CreationOnly` drives the warning for the 15 attributes the game reads only at world
+  creation. 16 new core tests: both string directions (the length prefix has to follow), int/float/bool framing,
+  a second edit applied to offsets the first one moved, an unchanged value that is not an edit, refused inputs
+  (not a number, out of range, NaN/Infinity, not a boolean, NUL byte), and a `gamedata` whose tree cannot be
+  located.
 - 2D terrain map rendered in the in-game map's colours, with render modes, LOD, chunk grid and
   hover readout.
 - Connected-area map building for worlds with distant pregen patches: the map opens on the tile
@@ -199,6 +231,17 @@ The changes of this working session in one screen; the detailed entries are belo
   built from an older or edited save is a miss, never stale rendering.
 
 ### Changed
+- **The `World` tab puts the settings list first.** The tab opened with a four-line block of save metadata and a
+  permanently reserved detail column: in the default drawer the list got ~60 px (two rows), and a third of the row
+  was empty until something was selected, then held a single 140 px box. Now the metadata is one line
+  (`World info — VS 1.22.7 · seed … · 1376×1312 blocks`) that opens the rest, the hint is one line above the list
+  instead of a centred block in the empty column, the value card appears only while a setting is selected (the list
+  keeps the whole row otherwise), and the box fills the card and scrolls, so a 53 444-character mod blob is read
+  there instead of in a 140 px window. List rows are two aligned columns (name, value) instead of one
+  `name = value` string, and Esc (or the ✕ inside the box) clears the filter, which is hidden while the box is
+  empty. Measured on the creative test save (177 settings): list height 60 → 133 px at 1280×800, the value column
+  starts at the same x in every row, the card is 0 px wide until a row is picked and 420 px after
+  (`VSSaveEditor/Components/Tabs/WorldTab.axaml`).
 - **The pending-edit label counts mod values, and every number comes from one walk.** "Player data" counts what an
   apply would change while the boxes are being typed in, and it used to run three separate traversals (edited
   leaves, deleted nodes, marked blocks) with a fourth set of counters inside the rebuild. They disagreed: a value

@@ -23,6 +23,11 @@ A world inspection and preparation tool for server owners, modpack maintainers a
 - **Remove a mod safely.** Find the block codes left by the mod, remove or replace them, review the diff, and save a copy before uninstalling the mod.
 - **Restock or clean up a trader.** Open a trader as a document (`Entities → Entity data…`), edit a price or the stock, delete an offer or a slot, or cut a mod's leftover fields out of a creature — every change is one reviewable pending edit.
 
+- **Read the world settings the save carries.** The **World** tab parses the world tree out of `gamedata`
+  (`gameMode`, `daysPerMonth`, `landformScale`, `worldWidth`, …) and lists every entry beside the mod entries
+  stored in the same tree, with a filter and each value in full. Read-only for now: there is no write path for
+  this tree yet.
+
 You can also find which chest or player holds an item, edit a player's inventory, edit a creature's fields and position, and edit a trader's offers.
 
 ## Editing and safety
@@ -60,6 +65,11 @@ Windows: run the `.exe`. SmartScreen may warn because the binaries are currently
 
 - **No block painting or 3D view.** Blocks can be removed or replaced by code, not painted individually; the map and Y slices are 2D.
 - **The Items tab is read-only.** It finds an item and its owner; a stack is edited where it belongs to an owner. In `Entities → Entity data…` a slot's item can be opened and its attributes (condition, temperature…) edited, and deleting it takes a trader's offer with it. In `Players → Player data…` an item can be deleted but its attributes are not shown as fields yet.
+- **The World tab edits values, not their meaning.** `gameMode`, `daysPerMonth` and the rest are editable
+  (`gamedata` field 31, one pending edit each), but the editor does not know the game's list of accepted values —
+  a mistyped setting is stored as typed and ignored by the game. Attributes the game reads only at world
+  creation (`landformScale`, `upheavelCommonness`, `worldWidth`, …) are written too, with a warning: an existing
+  world keeps its already generated terrain.
 - **No whole-region wipe.** Deleting a region would regenerate everything in it, including buildings, so the feature was removed. Chunk-column deletion remains.
 - **No version conversion.** Saves outside the tested 1.22.x range may parse partially.
 - **The game is the final validator.** The editor does not run Vintage Story's own validation; always load a copy before using it on a server.

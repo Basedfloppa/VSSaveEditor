@@ -50,7 +50,7 @@ The **Settings → Map image export** controls (also **View → Export map image
 | **Selection** | Delete the selected chunk columns from the working copy. |
 | **Players** | Browse `playerdata`, edit player inventory fields, and show a player on the map when their creature exists. |
 | **Find blocks** | Remove or replace block codes across the world. |
-| **World** | Read version, seed, world size, areas and save diagnostics. |
+| **World** | Read version, seed, world size, areas and save diagnostics; browse the world settings the save carries. |
 | **Settings** | Change map, export and display options. |
 
 The **Chunks**, **Entities**, **Items**, **Players** and **Find blocks** tabs have a **Search in:** row that limits the search to one chunk, a rectangle, the map selection or one map area — see [Search scope](#search-scope).
@@ -245,6 +245,49 @@ chunk at all (`playerdata`, or a rectangle over the void between areas) is refus
 silently falling back to the whole save.
 
 Only the palette changes; the rest of the chunk data stays byte-for-byte intact. The operation edits the working copy and is recorded in History. Removing a block does not remove its block entity, and the in-game map may keep the old colours until that chunk is saved again.
+
+### World settings
+
+The **World** tab shows the world tree the save carries: the settings the game itself reads on load
+(`gameMode`, `playerlives`, `daysPerMonth`, `seasons`, `creatureHostility`, `temporalStorms`, `worldWidth`,
+`landformScale`, …) and, in the same list, the entries mods store next to them (`stonequarry:…`,
+whole `…Config.json` blobs).
+
+1. Type in **Find setting** to filter by name or by value — `landform` and `creative` both work. Esc (or the ✕
+   inside the box) clears it.
+2. Select a row to open the card: the value in full, its type and size, **Copy value** for the whole value.
+   The card takes width only while a setting is selected; until then the list uses the whole row.
+3. **Edit…** (or a double-click on the row) opens the value editor: the box checks the text against the type the
+   save stores while you type — a whole number for an `int`, a finite number for a `float`, `true`/`false` for a
+   `bool`, the exact text for a `string` — and **Add to pending edits** stays off until the value is valid and
+   different from the stored one. Nothing is written at that moment: the change becomes ONE pending edit of the
+   `gamedata` row, the row says **✎ pending**, and it travels the ordinary path — **Review & apply…** → apply to
+   the working copy → **Save a copy…**. Undo takes it back.
+4. Long values (a mod's JSON blob can be tens of kilobytes) are cut in the list and whole in the card, which
+   scrolls; they are edited in a multi-line box.
+5. The line above the list (**World info — VS 1.22.7 · seed … · size**) opens the rest of the save metadata:
+   coordinates and areas, relief, gamedata size and the table list.
+
+The list is exactly what the save stores — the editor does not reorder it and does not try to separate "real"
+settings from "mod data", because the save does not mark the difference. An edit rewrites **only that entry**:
+the rest of the tree stays byte-for-byte as it was (a mod's 53 KB JSON blob is not re-serialized because a
+number beside it changed), and the tree's own length is re-emitted when the new value is longer or shorter.
+
+This is the point of the tab: `gameMode`, `daysPerMonth`, `playerlives` and the rest change **without launching
+the game and without re-creating the world**.
+
+Three facts worth knowing before editing:
+
+- Some settings only matter at world creation (`landformScale`, `upheavelCommonness`, `worldWidth`,
+  `worldLength`, `worldClimate`, `startingClimate`, `oceanscale`, `landcover`, `geologicActivity`,
+  `globalTemperature`, …). The editor warns before such a value is changed: the new number goes into the save,
+  but an existing world keeps the terrain it already generated — the change is for a new world.
+- The editor does not know the game's list of accepted values for a setting (that list lives in the game's
+  config schema, not in the save). A string is stored exactly as typed; the game ignores a value it does not
+  accept. `gameMode = survival` and `seasons = enabled` are the spellings the game itself writes.
+- A save with a value type this build does not know says so in the line above the list
+  (`value type 55 of 'x' at byte …`), shows the entries read before it, and does not offer editing — the rest of
+  the tree cannot be walked, so it is not known where the next entry starts.
 
 ### Selection
 

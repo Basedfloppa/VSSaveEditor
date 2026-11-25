@@ -94,6 +94,9 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
     private bool _removingBlocks; // guard against starting block removal twice
     private bool _replacingBlocks; // guard against starting block replacement twice
     private int _renderMode = TerrainView.ModeBlocks; // current render mode (the radio group in Settings)
+    private WorldSettings? _worldTree; // the world tree as the tab shows it (pending edits included)
+    private WorldSettings? _worldBase; // ...and as the save itself has it, to mark edited rows
+    private List<WorldSetting> _worldSettings = new(); // ...its entries, in file order
     private VSSaveFile? _save;
     private string? _selectedSave;
     private bool _settingsLoading = true; // true while saved settings are applied - do not write them back
@@ -1005,6 +1008,18 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             _chunkView.EndEditing();
             _players.EndEditing();
             _chunkView.UpdateDirtyStatus();
+            // The working copy now holds the applied values, so the World tab must re-read them and clear the
+            // markers. A failed refresh must not turn a successful commit into an error: the edits are written.
+            try
+            {
+                ShowWorldSettings(save);
+            }
+            catch (Exception ex)
+            {
+                ScanDiagnostics.Error("world tab refresh after apply", ex);
+                Status.Set(StatusChannel.Chunk, "Edits applied, but the World tab could not be refreshed: " + ex.Message);
+            }
+
             UpdatePendingStrip();
             stage.Report("Refreshing the working copy…");
             await ScanAsync(save, _loadEpoch); // the cards read the already changed blobs
@@ -1048,7 +1063,9 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
         }
         else if (record.Scope == EditSession.GamedataScope)
         {
-            // gamedata has no card in a tab: the next Review & apply reads the pending blob live
+            // the world tree lives in gamedata: after an undo/redo the tab must read the blob the session
+            // holds now, or it would keep showing the value the undone edit removed
+            ReloadWorldSettings();
         }
         else
         {
@@ -2627,11 +2644,15 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
             var g = newSave.GamedataLength;
             Status.Set(StatusChannel.App,
                 $"opened: {Path.GetFileName(path)} | regions: {regions.Count}, chunks: {chunkCount} | editing a working copy — the original is not modified");
-            MetaText.Text = $"VS version: {version ?? "?"} | seed: {seed?.ToString() ?? "?"}\n" +
-                            $"World: {tm.Width}×{tm.Height} blocks (X {tm.MinX}..{tm.MinX + tm.Width - 1}, Z {tm.MinZ}..{tm.MinZ + tm.Height - 1})\n" +
-                            AreasMetaLine(areas, tm) +
-                            $"Relief: Y {tm.MinSurface}..{tm.MaxSurface} | gamedata: {g} B\n" +
-                            $"Tables: {string.Join(", ", newSave.TableNames)}";
+            // The version, the seed and the size are what identifies the save, so they stay on the collapsed
+            // line; the block behind the expander carries the rest (coordinates, relief, tables, gamedata).
+            WorldView.SetInfo(
+                $"World info — VS {version ?? "?"} · seed {seed?.ToString() ?? "?"} · {tm.Width}×{tm.Height} blocks",
+                $"World: {tm.Width}×{tm.Height} blocks (X {tm.MinX}..{tm.MinX + tm.Width - 1}, Z {tm.MinZ}..{tm.MinZ + tm.Height - 1})\n" +
+                AreasMetaLine(areas, tm) +
+                $"Relief: Y {tm.MinSurface}..{tm.MaxSurface} | gamedata: {g} B\n" +
+                $"Tables: {string.Join(", ", newSave.TableNames)}");
+            ShowWorldSettings(newSave);
             SaveCopyItem.IsEnabled = true;
 
             // full scan of the save data in the background (does not block the UI)
@@ -3778,5 +3799,200 @@ public partial class MainWindow : Window, IChunkViewHost, IPlayersTabHost, IEnti
 
             Dispatcher.UIThread.Post(() => _apply(pct));
         }
+    }
+
+    // ---- World tab: the world tree the save carries (settings and the mod entries beside them) ----
+
+    /// <summary>
+    ///     Reads `gamedata` field 31 and fills the World tab. A tree that stops early (an unknown value type)
+    ///     keeps what was read and says so: half a list must not look like the whole list.
+    ///     The unedited tree is kept as well: a row is marked "pending" by comparing it with the value the save
+    ///     still holds, so the marker cannot drift from the session state.
+    /// </summary>
+    private void ShowWorldSettings(VSSaveFile save)
+    {
+        _worldBase = save.ReadWorldSettings();
+        ReloadWorldSettings();
+    }
+
+    /// <summary>
+    ///     Re-reads the tree the tab shows: the pending gamedata when the session holds one, the file otherwise.
+    ///     Every path that changes the pending blob (an edit, an undo, the commit) ends here, because the tab
+    ///     must show what the save will get rather than what it had when it was opened.
+    /// </summary>
+    private void ReloadWorldSettings()
+    {
+        if (_save is null) return;
+        var blob = _edits.TryGetGamedata(out var pending) && pending is { Length: > 0 } ? pending : _save.ReadGamedata();
+        _worldTree = WorldSettings.Parse(blob);
+        _worldSettings = _worldTree.Settings.ToList();
+        MarkPendingWorldEdits();
+        RefreshWorldSettings();
+    }
+
+    /// <summary>A row differs from the save because of a pending edit — that is the marker on the row.</summary>
+    private void MarkPendingWorldEdits()
+    {
+        if (_worldBase is null) return;
+        var stored = new Dictionary<(int Index, string Name), string>();
+        foreach (var s in _worldBase.Settings) stored[(s.Index, s.Name)] = s.Value;
+        foreach (var s in _worldSettings)
+            s.IsEdited = stored.TryGetValue((s.Index, s.Name), out var v) &&
+                         !string.Equals(v, s.Value, StringComparison.Ordinal);
+    }
+
+    private void RefreshWorldSettings()
+    {
+        var query = WorldView.FilterText.Trim();
+        var shown = query.Length == 0
+            ? _worldSettings
+            : _worldSettings
+                .Where(s => s.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                            s.Value.Contains(query, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+        WorldList.ItemsSource = shown;
+        WorldList.SelectedItem = null;
+        RenderWorldSetting(null);
+
+        // One line carries the count and, while nothing is selected, what a click does - so that selecting
+        // changes the text, not the height of the line above the list.
+        var head = _worldSettings.Count == 0
+            ? "This save has no world tree to show."
+            : query.Length == 0
+                ? $"{_worldSettings.Count} setting(s) in {_worldTree?.TotalBytes ?? 0:n0} B"
+                : $"{shown.Count} of {_worldSettings.Count} setting(s)";
+        var warning = _worldTree?.Warning;
+        if (warning is not null && _worldSettings.Count > 0) head += " — partly readable";
+
+        var hint = _worldSettings.Count == 0
+            ? ""
+            : shown.Count == 0
+                ? $"no setting matches '{query}'"
+                : warning is not null
+                    ? $"only part of the world tree could be read: {warning}"
+                    : "click a setting to see its full value";
+        WorldView.SetStatus(head, hint);
+    }
+
+    private void OnWorldFilterChanged(object? sender, EventArgs e) => RefreshWorldSettings();
+
+    private void OnWorldClearFilter(object? sender, RoutedEventArgs e)
+    {
+        WorldView.ClearFilter();
+        RefreshWorldSettings();
+    }
+
+    private void OnWorldSettingPicked(object? sender, SelectionChangedEventArgs e)
+        => RenderWorldSetting(WorldList.SelectedItem as WorldSetting);
+
+    /// <summary>
+    ///     Edits one setting: a dialog asks for the new value, the tree is rebuilt with that one value changed, and
+    ///     the result becomes ONE pending gamedata edit. From there it is the ordinary path — diff, undo step,
+    ///     "Review & apply…" — so nothing touches the file and the change is written offline, without the game.
+    /// </summary>
+    private async void OnWorldEditRequested(object? sender, EventArgs e)
+    {
+        if (_save is null)
+        {
+            Status.Set(StatusChannel.Chunk, "Open a save first — world settings live in its gamedata row.",
+                priority: AppStatus.PriorityError);
+            return;
+        }
+
+        if (WorldList.SelectedItem is not WorldSetting setting)
+        {
+            Status.Set(StatusChannel.Chunk, "Pick a setting in the list first.");
+            return;
+        }
+
+        try
+        {
+            var save = _save;
+            var edits = _edits;
+            var gamedata = edits.TryGetGamedata(out var pending) && pending is { Length: > 0 }
+                ? pending
+                : save.ReadGamedata();
+            if (gamedata is not { Length: > 0 })
+            {
+                Status.Set(StatusChannel.Chunk, "This save has no gamedata row — there is no world tree to edit.");
+                return;
+            }
+
+            var newText = await WorldSettingEditDialog.ShowAsync(this, setting);
+            if (newText is null) return;
+
+            if (!WorldSettingEdit.TrySetValue(gamedata, setting, newText, out var newGamedata, out var changed, out var error))
+            {
+                Status.Set(StatusChannel.Chunk, $"'{setting.Name}' was not changed: {error}",
+                    priority: AppStatus.PriorityError);
+                return;
+            }
+
+            if (!changed)
+            {
+                Status.Set(StatusChannel.Chunk, $"'{setting.Name}' already holds that value — nothing to edit.");
+                return;
+            }
+
+            edits.PutGamedata(newGamedata, $"world setting '{setting.Name}': {Shorten(setting.Value)} → {Shorten(newText)}");
+            _chunkView.UpdateDirtyStatus();
+            ReloadWorldSettings();
+            // the row that was edited stays selected, so its card shows the value the save will get
+            var row = _worldSettings.FirstOrDefault(s => s.Index == setting.Index && s.Name == setting.Name);
+            if (row is not null && ReferenceEquals(WorldList.ItemsSource, _worldSettings))
+            {
+                WorldList.SelectedItem = row;
+                RenderWorldSetting(row);
+            }
+
+            Status.Set(StatusChannel.Chunk,
+                $"Pending edit: '{setting.Name}' {Shorten(setting.Value)} → {Shorten(newText)} in the world tree. "
+                + "Nothing is written yet — Review & apply… → Apply to working copy.",
+                priority: 90);
+        }
+        catch (Exception ex)
+        {
+            Status.Set(StatusChannel.Chunk, "World setting failed: " + ex.Message, priority: AppStatus.PriorityError);
+        }
+    }
+
+    /// <summary>One-line form of a value for status lines and the history label (a mod blob would flood both).</summary>
+    private static string Shorten(string text)
+    {
+        var flat = text.Replace('\r', ' ').Replace('\n', ' ');
+        return flat.Length <= 60 ? flat : flat[..60] + "…";
+    }
+
+    /// <summary>The card of one setting: name, type, size and the value in full (the list cuts long mod blobs).</summary>
+    private void RenderWorldSetting(WorldSetting? setting)
+    {
+        WorldView.ShowDetail(setting is not null);
+        if (setting is not null) WorldView.ShowSetting(setting);
+    }
+
+    /// <summary>Copies the whole value of the selected setting - the list only shows a preview of long blobs.</summary>
+    private void OnWorldCopyValue(object? sender, RoutedEventArgs e)
+    {
+        if (WorldList.SelectedItem is not WorldSetting setting)
+        {
+            Status.Set(StatusChannel.App, "Nothing to copy — pick a setting in the list first.");
+            return;
+        }
+
+        CopyToClipboard(setting.Value, $"'{setting.Name}' copied ({setting.Value.Length:n0} char(s)).");
+    }
+
+    private void OnWorldCopyList(object? sender, RoutedEventArgs e)
+    {
+        var items = WorldList.ItemsSource as IReadOnlyList<WorldSetting> ?? _worldSettings;
+        if (items.Count == 0)
+        {
+            Status.Set(StatusChannel.App, "Nothing to copy — open a save and let the settings list fill.");
+            return;
+        }
+
+        var text = string.Join(Environment.NewLine, items.Select(s => s.Display));
+        CopyToClipboard(text, $"{items.Count} setting(s) copied to clipboard.");
     }
 }

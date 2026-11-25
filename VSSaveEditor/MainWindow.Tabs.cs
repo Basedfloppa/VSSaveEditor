@@ -72,6 +72,7 @@ public partial class MainWindow
 
     // ---- World ----
     private TextBlock MetaText => WorldView.MetaText;
+    private ListBox WorldList => WorldView.List;
 
     /// <summary>
     ///     The window's subscription to the tab actions. The tabs are created by the XAML loader and know nothing
@@ -107,6 +108,13 @@ public partial class MainWindow
         PlayersView.PlayerPicked += OnPlayerPicked;
         PlayersView.ReviewRequested += OnReviewAndCommit;
         PlayersView.PlayerDataRequested += OnPlayerData;
+
+        WorldView.FilterChanged += OnWorldFilterChanged;
+        WorldView.ClearRequested += OnWorldClearFilter;
+        WorldView.CopyListRequested += OnWorldCopyList;
+        WorldView.CopyValueRequested += OnWorldCopyValue;
+        WorldView.SettingPicked += OnWorldSettingPicked;
+        WorldView.EditRequested += OnWorldEditRequested;
 
         FindBlocksView.SearchChanged += OnFilterSearchChanged;
         FindBlocksView.ClearRequested += OnFilterClear;

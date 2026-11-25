@@ -467,6 +467,12 @@ internal static class Harness
             return;
         }
 
+        if (mode == "world")
+        {
+            WorldProbe(save);
+            return;
+        }
+
         if (mode == "removeblocks")
         {
             RemoveBlocks(save);
@@ -8110,5 +8116,425 @@ internal static class Harness
             return;
         }
         btn.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+    }
+
+    /// <summary>
+    ///     The "World" tab: the world tree the save carries — parsed out of `gamedata` field 31 and shown as
+    ///     `name = value`. The probe checks the rows against the save itself, the filter, and the card of the
+    ///     selected setting (a long mod blob is cut in the list and whole in the card), and it measures the
+    ///     layout: the list must own the height, and the card must not reserve width while it is closed.
+    /// </summary>
+    private static void WorldProbe(string save)
+    {
+        var w = new MainWindow { Width = 1280, Height = 800 };
+        w.Show();
+        Pump(1.0);
+        ResetStatus(w);
+        w.OpenStartupFile(save);
+        if (!WaitLoaded(w, SaveToken(save), "Scan complete", 900)) { Console.WriteLine("FAILED: load"); return; }
+        EnsureDataPanelOpen(w);
+        SelectDataTab(w, "World");
+
+        var tab = w.FindNamed<WorldTab>("WorldView")!;
+        var list = tab.List;
+        var summary = tab.StatusLabel;
+        var hint = summary;
+        var info = w.FindNamed<ToggleButton>("WorldInfoToggle")!;
+        var infoHeader = tab.InfoHeader;
+        var metaBlock = w.FindNamed<TextBlock>("MetaText")!;
+        var body = w.FindNamed<Grid>("WorldBody")!;
+        var card = tab.DetailCard;
+
+        List<WorldSetting> Rows() => list.ItemsSource?.Cast<WorldSetting>().ToList() ?? new List<WorldSetting>();
+
+        var rows = Rows();
+        Console.WriteLine($"[meta] {Cut(infoHeader.Text, 160)}");
+        Console.WriteLine($"[list] rows={rows.Count} summary='{Cut(summary.Text, 140)}'");
+        Console.WriteLine($"  first='{Cut(rows.FirstOrDefault()?.Display, 100)}'  last='{Cut(rows.LastOrDefault()?.Display, 100)}'");
+
+        var byName = rows.GroupBy(r => r.Name).ToDictionary(g => g.Key, g => g.First());
+        foreach (var name in new[] { "gameMode", "playerlives", "daysPerMonth", "landformScale", "upheavelCommonness", "worldWidth" })
+            Console.WriteLine($"  {name} = {(byName.TryGetValue(name, out var s) ? $"{s.Value} [{s.KindName}]" : "(not in the list)")}");
+
+        var longOnes = rows.Where(r => r.Value.Length > WorldSetting.PreviewChars)
+            .OrderByDescending(r => r.Value.Length).ToList();
+        Console.WriteLine($"  long values (cut in the list): {longOnes.Count}"
+                          + (longOnes.Count > 0 ? $" e.g. '{longOnes[0].Name}' {longOnes[0].Value.Length:n0} chars" : ""));
+
+        // --- layout: the list owns the height, the card owns width only while it is open -------------
+        Console.WriteLine("[geom] " + $"tab={Fmt(tab)} list={Fmt(list)} info={Fmt(info)} hint={Fmt(hint)} card={Fmt(card)}"
+                          + $" col2={body.ColumnDefinitions[2].Width}");
+
+        // Rows line up: every value column starts at the same x (two fixed Grid columns, not one string).
+        var itemTexts = Descendants(list).OfType<ListBoxItem>().Take(6)
+            .Select(i => Descendants(i).OfType<TextBlock>().Where(t => Grid.GetColumn(t) == 1).Select(t => t.Bounds.Left).FirstOrDefault())
+            .ToList();
+        Console.WriteLine($"[geom] value column x = [{string.Join(", ", itemTexts.Select(x => x.ToString("0")))}]"
+                          + $" distinct={itemTexts.Distinct().Count()}");
+        Shot(w, "world_settings");
+
+        // the metadata line opens the block it summarizes
+        info.IsChecked = true;
+        Pump(1.0);
+        Console.WriteLine($"[info open] header='{Cut(infoHeader.Text, 60)}' metaVisible={metaBlock.IsVisible}"
+                          + $" info={Fmt(info)} list={Fmt(list)}");
+        info.IsChecked = false;
+        Pump(1.0);
+        Console.WriteLine($"[info closed] metaVisible={metaBlock.IsVisible} info={Fmt(info)} list={Fmt(list)}");
+
+        // 1) the filter narrows the list and says how far
+        SetText(w, "WorldFilterBox", "landform");
+        Pump(1.5);
+        var filtered = Rows();
+        Console.WriteLine($"[filter 'landform'] rows={filtered.Count} summary='{Cut(summary.Text, 100)}'"
+                          + $" names=[{string.Join(", ", filtered.Select(r => r.Name))}]");
+
+        // 2) a value filter finds settings by their content, not only by name (the term comes from the save,
+        //    so the check reads the same on a creative and on a survival world)
+        var valueTerm = byName.TryGetValue("gameMode", out var gm) ? gm.Value : "true";
+        SetText(w, "WorldFilterBox", valueTerm);
+        Pump(1.5);
+        var byValue = Rows();
+        Console.WriteLine($"[filter '{valueTerm}'] rows={byValue.Count} first='{Cut(byValue.FirstOrDefault()?.Display, 80)}'");
+        SetText(w, "WorldFilterBox", "zzz-nothing");
+        Pump(1.0);
+        Console.WriteLine($"[filter 'zzz-nothing'] rows={Rows().Count} status='{Cut(hint.Text, 110)}'");
+
+        // 3) Esc clears the filter (the "✕" inside the box does the same)
+        var box = w.FindNamed<TextBox>("WorldFilterBox")!;
+        box.RaiseEvent(new KeyEventArgs { RoutedEvent = InputElement.KeyDownEvent, Key = Key.Escape });
+        Pump(1.5);
+        Console.WriteLine($"[esc] filter='{box.Text}' rows={Rows().Count} clearBtnVisible={w.FindNamed<Button>("WorldClearBtn")!.IsVisible}");
+
+        // 4) the card: name, type and the value in full; it takes width only now
+        void Pick(string name)
+        {
+            var row = Rows().FirstOrDefault(r => r.Name == name);
+            if (row is null) { Console.WriteLine($"  (no '{name}' in the list)"); return; }
+            list.SelectedItem = row;
+            Pump(1.5);
+            var value = tab.ValueBox;
+            Console.WriteLine($"  [card '{name}'] name='{w.FindNamed<TextBlock>("WorldDetailName")!.Text}'"
+                              + $" meta='{Cut(w.FindNamed<TextBlock>("WorldDetailMeta")!.Text, 90)}'"
+                              + $" box={value.Text?.Length ?? 0} chars cardVisible={card.IsVisible}"
+                              + $" card={Fmt(card)} status='{Cut(hint.Text, 80)}'"
+                              + $" col2={body.ColumnDefinitions[2].Width}");
+        }
+
+        Pick("gameMode");
+        Shot(w, "world_settings_card");
+        Pick("daysPerMonth");
+        if (longOnes.Count > 0) Pick(longOnes[0].Name);
+        bool noOverlap;
+        {
+            var st = tab.StatusLabel;
+            var listTop = list.TranslatePoint(new Point(0, 0), w) ?? default;
+            var stTop = st.TranslatePoint(new Point(0, 0), w) ?? default;
+            var firstItem = Descendants(list).OfType<ListBoxItem>().FirstOrDefault();
+            var itemTop = firstItem?.TranslatePoint(new Point(0, 0), w) ?? default;
+            Console.WriteLine($"  [overlap check] status y={stTop.Y:0}..{stTop.Y + st.Bounds.Height:0}"
+                              + $" listTop={listTop.Y:0} listH={list.Bounds.Height:0}"
+                              + $" firstItemTop={itemTop.Y:0} firstItemH={firstItem?.Bounds.Height ?? 0:0}"
+                              + $" itemTextY={Descendants(firstItem!).OfType<TextBlock>().FirstOrDefault()?.TranslatePoint(new Point(0,0), w)?.Y:0}");
+            noOverlap = stTop.Y + st.Bounds.Height <= listTop.Y + 0.5;
+        }
+        Shot(w, "world_settings_long");
+
+        // the whole value is reachable from the card, not only its first 160 characters
+        var copyValue = w.FindNamed<Button>("WorldCopyValueBtn")!;
+        copyValue.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Pump(1.0);
+        Console.WriteLine($"[copy value] status='{Cut(TextOf(w, "StatusText"), 120)}'");
+
+        // 5) closing the selection closes the card and gives the width back
+        list.SelectedItem = null;
+        Pump(1.0);
+        Console.WriteLine($"[no selection] cardVisible={card.IsVisible} col2={body.ColumnDefinitions[2].Width} list={Fmt(list)} status='{Cut(hint.Text, 110)}'");
+
+        // 7) the layout holds at the minimum window size and in the dark theme
+        void Fit(string tag)
+        {
+            var copyBtn = w.FindNamed<Button>("CopyWorldBtn")!;
+            var box = w.FindNamed<TextBox>("WorldFilterBox")!;
+            var right = copyBtn.TranslatePoint(new Point(copyBtn.Bounds.Width, 0), w)?.X ?? 0;
+            Console.WriteLine($"  [{tag}] window={w.Bounds.Width:0}x{w.Bounds.Height:0} filterW={box.Bounds.Width:0}"
+                              + $" copyRight={right:0} list={Fmt(list)} card={Fmt(card)} fits={right <= w.Bounds.Width}");
+        }
+
+        w.Width = 900;
+        w.Height = 600;
+        Pump(1.5);
+        Fit("900x600");
+        Shot(w, "world_settings_900");
+        w.Width = 1280;
+        w.Height = 800;
+        Pump(1.2);
+        w.RequestedThemeVariant = ThemeVariant.Dark;
+        Pump(1.2);
+        Fit("dark 1280x800");
+        Shot(w, "world_settings_dark");
+        w.RequestedThemeVariant = ThemeVariant.Light;
+        Pump(1.0);
+
+        // 6) copying the list gives one line per row
+        ClickButtonIn(tab, "Copy list");
+        Pump(1.0);
+        Console.WriteLine($"[copy] status='{Cut(TextOf(w, "StatusText"), 120)}'");
+
+        // 8) editing a string setting: the dialog, the pending edit, the marker, what would be written, undo,
+        //    and finally a real commit -- the whole point of the tab is that the save changes without the game
+        var edits = EditsOf(w);
+        var sav = SaveOf(w);
+        var modeRow = Rows().FirstOrDefault(r => r.Name == "gameMode");
+        var storedCount = rows.Count;
+        string? target = null;
+        string? before = null;
+        bool dialogOk = false, unchangedRuleOk = false, stringEditOk = false, materializedOk = false, marked = false,
+            undoOk = false, warnOk = false, dblOk = false, numericInvalidOk = false, numericEditOk = false,
+            numericTested = false, applyOk = false, appliedRowOk = false;
+
+        // One dialog round trip: open on the row, type the value, press the action. Returns the value the dialog
+        // handed back (null when it refused to close).
+        bool EditViaDialog(WorldSetting row, string value, out string? why)
+        {
+            why = null;
+            list.SelectedItem = row;
+            Pump(1.0);
+            tab.EditButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var endOpen = DateTime.UtcNow.AddSeconds(20);
+            while (DateTime.UtcNow < endOpen && w.OwnedWindows.Count == 0) Pump(0.25);
+            var dlg = w.OwnedWindows.FirstOrDefault();
+            if (dlg is null) { why = "the editor did not open"; return false; }
+            Pump(1.0);
+            var cell = Descendants(dlg).OfType<TextBox>().FirstOrDefault(t => t.Name == "WorldEditBox");
+            var pick = Descendants(dlg).OfType<ComboBox>().FirstOrDefault(t => t.Name == "WorldEditBoolPick");
+            var act = Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Content as string) == "Add to pending edits");
+            if (act is null) { why = "no action button"; dlg.Close(); return false; }
+            if (cell is not null) cell.Text = value;
+            else if (pick is not null) pick.SelectedIndex = value == "true" ? 0 : 1;
+            Pump(0.8);
+            if (!act.IsEnabled) { why = "the action stayed off"; dlg.Close(); Pump(1.0); return false; }
+            act.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(1.5);
+            return w.OwnedWindows.Count == 0;
+        }
+
+        if (modeRow is not null)
+        {
+            before = modeRow.Value;
+            target = before == "creative" ? "survival" : "creative";
+            list.SelectedItem = modeRow;
+            Pump(1.2);
+
+            // the double-click reaches the same dialog as the card button (real pointer events, not the button)
+            var item = Descendants(list).OfType<ListBoxItem>().FirstOrDefault();
+            if (item is not null)
+            {
+                var at = item.TranslatePoint(new Point(item.Bounds.Width / 2, item.Bounds.Height / 2), w) ?? default;
+                w.MouseDown(at, MouseButton.Left, RawInputModifiers.None);
+                w.MouseUp(at, MouseButton.Left, RawInputModifiers.None);
+                Pump(0.1);
+                w.MouseDown(at, MouseButton.Left, RawInputModifiers.None);
+                w.MouseUp(at, MouseButton.Left, RawInputModifiers.None);
+                var endDbl = DateTime.UtcNow.AddSeconds(10);
+                while (DateTime.UtcNow < endDbl && w.OwnedWindows.Count == 0) Pump(0.25);
+                dblOk = w.OwnedWindows.Count > 0;
+                Console.WriteLine($"[edit] double-click on a row opens the editor: {dblOk}");
+                if (dblOk)
+                {
+                    w.OwnedWindows[0].Close();
+                    Pump(1.0);
+                }
+            }
+
+            tab.EditButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var end = DateTime.UtcNow.AddSeconds(20);
+            while (DateTime.UtcNow < end && w.OwnedWindows.Count == 0) Pump(0.25);
+            var dlg = w.OwnedWindows.FirstOrDefault();
+            if (dlg is null) Console.WriteLine("  FAILED: the setting editor did not open");
+            else
+            {
+                Pump(1.0);
+                dialogOk = true;
+                var editBox = Descendants(dlg).OfType<TextBox>().FirstOrDefault(t => t.Name == "WorldEditBox");
+                var act = Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Content as string) == "Add to pending edits");
+                var err = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => t.Name == "WorldEditError");
+                Console.WriteLine($"  dialog='{dlg.Title}' box='{Cut(editBox?.Text)}' action={(act is null ? "-" : act.IsEnabled ? "on" : "off")}"
+                                  + $" hint='{Cut(Descendants(dlg).OfType<TextBlock>().LastOrDefault(t => (t.Text ?? "").Contains("nothing is written"))?.Text ?? "")}'");
+                Shot(dlg, "world_settings_edit_dialog");
+                if (editBox is not null && act is not null && err is not null)
+                {
+                    // the stored value is in the box, so the action must be off until the text actually differs
+                    unchangedRuleOk = !act.IsEnabled && !err.IsVisible;
+
+                    editBox.Text = target;
+                    Pump(1.0);
+                    Console.WriteLine($"  typed '{target}': action={(act.IsEnabled ? "on" : "off")}");
+                    act.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                    Pump(2.0);
+                }
+
+                Console.WriteLine($"  after the dialog: closed={w.OwnedWindows.Count == 0}"
+                                  + $" status='{Cut(TextOf(w, "ChunkStatusText"), 150)}'");
+            }
+        }
+
+        if (edits.TryGetGamedata(out var pending) && pending is { Length: > 0 })
+        {
+            // the pending blob is checked by PARSING it, not by asking the editor that wrote it
+            var patched = WorldSettings.Parse(pending);
+            var patchedMode = patched.Settings.FirstOrDefault(r => r.Name == "gameMode");
+            stringEditOk = patchedMode?.Value == target && patched.Warning is null && patched.Settings.Count == storedCount;
+            Console.WriteLine($"  pending gamedata: gameMode={patchedMode?.Value} entries={patched.Settings.Count}/{storedCount}"
+                              + $" warning={patched.Warning ?? "-"}");
+
+            var change = EditSession.Materialize(sav, edits.Snapshot()).FirstOrDefault(c => c.table == "gamedata");
+            var written = change.data is { Length: > 0 }
+                ? WorldSettings.Parse(change.data).Settings.FirstOrDefault(r => r.Name == "gameMode")
+                : null;
+            materializedOk = written?.Value == target;
+            Console.WriteLine($"  what would be written: gamedata row {change.data?.Length ?? 0} B, gameMode={written?.Value}");
+
+            var markedRow = Rows().FirstOrDefault(r => r.Name == "gameMode");
+            marked = markedRow?.IsEdited == true;
+            Console.WriteLine($"  row marked pending={marked} card='{Cut(w.FindNamed<TextBlock>("WorldDetailMeta")?.Text ?? "", 80)}'"
+                              + $" cardValue='{Cut(tab.ValueBox.Text)}'");
+            Shot(w, "world_settings_edit_pending");
+        }
+        else Console.WriteLine("  FAILED: the edit did not become a pending gamedata edit");
+
+        // 9) an attribute the game reads only at world creation says so before anything is written
+        var landformRow = Rows().FirstOrDefault(r => r.Name == "landformScale");
+        if (landformRow is not null)
+        {
+            list.SelectedItem = landformRow;
+            Pump(1.0);
+            tab.EditButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var endWarn = DateTime.UtcNow.AddSeconds(20);
+            while (DateTime.UtcNow < endWarn && w.OwnedWindows.Count == 0) Pump(0.25);
+            var dlg = w.OwnedWindows.FirstOrDefault();
+            if (dlg is not null)
+            {
+                Pump(1.0);
+                var warn = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => (t.Text ?? "").Contains("only while a world is created"));
+                warnOk = warn is not null && warn.IsVisible;
+                Console.WriteLine($"  creation-only warning on '{landformRow.Name}': {warnOk}");
+                Shot(dlg, "world_settings_edit_creation");
+                Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Content as string) == "Cancel")
+                    ?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                Pump(1.0);
+            }
+        }
+
+        // 10) undo takes the pending edit back and the row stops being marked
+        if (edits.HasGamedataEdit)
+        {
+            w.FindNamed<Button>("UndoBtn")?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Pump(2.0);
+            var after = Rows().FirstOrDefault(r => r.Name == "gameMode");
+            undoOk = !edits.HasGamedataEdit && after is not null && after.Value == before && after.IsEdited == false;
+            Console.WriteLine($"  after undo: pending={edits.HasGamedataEdit} gameMode={after?.Value} marked={after?.IsEdited} ok={undoOk}");
+        }
+
+        // 11) the edit reaches the WORKING COPY: Review & apply… → Apply to working copy, then read it back.
+        //     This is the whole promise of the tab -- the save changes offline, without the game.
+        var rerow = Rows().FirstOrDefault(r => r.Name == "gameMode");
+        string? why = null;
+        if (rerow is not null && target is not null && EditViaDialog(rerow, target, out why))
+        {
+            ClickButtonIn(w, "Review & apply…");
+            var endReview = DateTime.UtcNow.AddSeconds(30);
+            while (DateTime.UtcNow < endReview && w.OwnedWindows.Count == 0) Pump(0.5);
+            var review = w.OwnedWindows.FirstOrDefault();
+            if (review is null) Console.WriteLine("  FAILED: the review dialog did not open");
+            else
+            {
+                Pump(1.0);
+                var write = Descendants(review).OfType<Button>()
+                    .FirstOrDefault(b => (b.Content as string)?.StartsWith("Apply to working copy") == true);
+                Console.WriteLine($"  review: write='{write?.Content as string}' enabled={write?.IsEnabled}");
+                Shot(review, "world_settings_review");
+                write?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                var endApply = DateTime.UtcNow.AddSeconds(300);
+                while (DateTime.UtcNow < endApply && !TextOf(w, "ChunkStatusText").Contains("Applied")) Pump(1.0);
+                Console.WriteLine($"  apply: '{Cut(TextOf(w, "ChunkStatusText"), 160)}'");
+                if (w.OwnedWindows.Count > 0) w.OwnedWindows[0].Close();
+                Pump(2.0);
+
+                // read the working copy back: this is the row the game would load now
+                var readBack = WorldSettings.Parse(sav.ReadGamedata()).Settings.FirstOrDefault(r => r.Name == "gameMode");
+                applyOk = readBack?.Value == target;
+                var appliedRow = Rows().FirstOrDefault(r => r.Name == "gameMode");
+                appliedRowOk = appliedRow is not null && appliedRow.Value == target && appliedRow.IsEdited == false;
+                Console.WriteLine($"  working copy: gameMode={readBack?.Value} row={appliedRow?.Value}"
+                                  + $" marked={appliedRow?.IsEdited} card='{Cut(w.FindNamed<TextBlock>("WorldDetailMeta")?.Text ?? "", 60)}'");
+                Shot(w, "world_settings_applied");
+            }
+        }
+        else Console.WriteLine($"  FAILED: the second edit did not go through ({why ?? "no gameMode row"})");
+
+        // 12) a NUMERIC setting refuses a value of the wrong shape (a string setting accepts any text, by design);
+        //     most settings of a real save are stored as text, so this runs only when the save has a number.
+        var numeric = Rows().FirstOrDefault(r => r.Kind is WorldSettingKind.Integer or WorldSettingKind.Float);
+        Console.WriteLine($"[edit] numeric settings in this save: {Rows().Count(r => r.Kind is WorldSettingKind.Integer or WorldSettingKind.Float)}");
+        if (numeric is not null)
+        {
+            numericTested = true;
+            list.SelectedItem = numeric;
+            Pump(1.0);
+            tab.EditButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            var endNum = DateTime.UtcNow.AddSeconds(20);
+            while (DateTime.UtcNow < endNum && w.OwnedWindows.Count == 0) Pump(0.25);
+            var dlg = w.OwnedWindows.FirstOrDefault();
+            if (dlg is not null)
+            {
+                Pump(1.0);
+                var editBox = Descendants(dlg).OfType<TextBox>().FirstOrDefault(t => t.Name == "WorldEditBox");
+                var act = Descendants(dlg).OfType<Button>().FirstOrDefault(b => (b.Content as string) == "Add to pending edits");
+                var err = Descendants(dlg).OfType<TextBlock>().FirstOrDefault(t => t.Name == "WorldEditError");
+                if (editBox is not null && act is not null && err is not null)
+                {
+                    editBox.Text = "abc";
+                    Pump(1.0);
+                    numericInvalidOk = !act.IsEnabled && err.IsVisible && (err.Text ?? "").Contains("not a number");
+                    Console.WriteLine($"  numeric '{numeric.Name}' typed 'abc': action={(act.IsEnabled ? "on" : "off")}"
+                                      + $" error='{Cut(err.Text ?? "")}' ok={numericInvalidOk}");
+
+                    var next = numeric.Kind == WorldSettingKind.Integer
+                        ? (int.Parse(numeric.Value, System.Globalization.CultureInfo.InvariantCulture) + 1).ToString()
+                        : (float.Parse(numeric.Value, System.Globalization.CultureInfo.InvariantCulture) + 0.5f)
+                          .ToString("0.#######", System.Globalization.CultureInfo.InvariantCulture);
+                    editBox.Text = next;
+                    Pump(1.0);
+                    Console.WriteLine($"  numeric '{numeric.Name}' typed '{next}': action={(act.IsEnabled ? "on" : "off")}");
+                    act.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                    Pump(2.0);
+
+                    if (edits.TryGetGamedata(out var numPending) && numPending is { Length: > 0 })
+                    {
+                        var numParsed = WorldSettings.Parse(numPending);
+                        var row = numParsed.Settings.FirstOrDefault(r => r.Name == numeric.Name);
+                        numericEditOk = row is not null && row.Value == next && numParsed.Settings.Count == storedCount;
+                        Console.WriteLine($"  numeric pending: {numeric.Name}={row?.Value} entries={numParsed.Settings.Count}");
+                    }
+
+                    w.FindNamed<Button>("UndoBtn")?.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                    Pump(1.5);
+                }
+            }
+        }
+
+        var ok = rows.Count > 0 && byName.ContainsKey("gameMode") && filtered.Count is > 0 and var f &&
+                 f < rows.Count && byValue.Count > 0 && itemTexts.Distinct().Count() == 1 &&
+                 info.IsChecked == false && card.IsVisible == false && noOverlap &&
+                 dialogOk && unchangedRuleOk && stringEditOk && materializedOk && marked && undoOk && warnOk && dblOk &&
+                 applyOk && appliedRowOk && (!numericTested || (numericInvalidOk && numericEditOk));
+        Console.WriteLine(ok
+            ? "RESULT: OK — the world tree is parsed, filtered, shown in full, edited through a pending edit, applied to the working copy, and undone"
+            : $"RESULT: FAIL — dialog={dialogOk} unchangedRule={unchangedRuleOk} edit={stringEditOk}"
+              + $" materialized={materializedOk} marked={marked} undo={undoOk} creationWarning={warnOk}"
+              + $" doubleClick={dblOk} applied={applyOk}/{appliedRowOk}"
+              + $" numeric={(numericTested ? $"{numericInvalidOk}/{numericEditOk}" : "n/a")}");
+        w.Close();
     }
 }

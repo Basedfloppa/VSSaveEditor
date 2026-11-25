@@ -882,6 +882,12 @@ public sealed class VSSaveFile : IDisposable
     }
 
     /// <summary>
+    ///     The world tree from `gamedata` (field 31): the vanilla world settings plus the mod entries stored
+    ///     beside them. Read-only — nothing in the editor writes this tree yet.
+    /// </summary>
+    public WorldSettings ReadWorldSettings() => WorldSettings.Parse(ReadGamedata());
+
+    /// <summary>
     ///     Fraction of the year (0…1) from the save calendar — needed by the seasonal map tinting.
     ///     The game computes `TotalDays = TotalGameSeconds / 3600 / HoursPerDay` (gamedata fields 12 and 25),
     ///     and the days in a year as `daysPerMonth * 12` from WorldConfiguration (30·12=360 in most worlds).
